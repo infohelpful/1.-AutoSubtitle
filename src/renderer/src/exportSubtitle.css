@@ -1,0 +1,55 @@
+/**
+ * 오프스크린 내보내기 창 — 창 크기가 영상 픽셀과 일치할 때 100vw/100vh ≈ 캡처 영역 전체.
+ * App.css `.preview-subtitle-stage` 와 동일한 flex 레이아웃으로 프리뷰·캡처 DOM 정렬을 맞춘다.
+ */
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+}
+
+.export-subtitle-root {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.export-subtitle-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.export-subtitle-stage {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.export-subtitle-plain {
+  margin: 0;
+  text-align: center;
+  box-sizing: border-box;
+}

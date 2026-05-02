@@ -1,0 +1,4 @@
+# Sidecar (Whisper / HF)
+faster-whisper>=1.0.3
+huggingface_hub>=0.26.0
+tqdm>=4.66.0

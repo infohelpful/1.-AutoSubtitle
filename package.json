@@ -1,0 +1,83 @@
+{
+  "name": "autosubtitle",
+  "version": "0.0.1",
+  "license": "Unlicense",
+  "private": true,
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "dev:bundled": "npm run build && npm run dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "bundle:sidecar": "node scripts/bundle-sidecar.cjs",
+    "dist": "npm run build && npm run bundle:sidecar && electron-builder"
+  },
+  "dependencies": {
+    "ffbinaries": "^1.1.6",
+    "react-window": "^2.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/react-window": "^1.8.8",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^35.0.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^4.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  },
+  "build": {
+    "appId": "com.autosubtitle.app",
+    "productName": "AutoSubtitle",
+    "icon": "build/icon.ico",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**"
+    ],
+    "extraResources": [
+      {
+        "from": "python_sidecar",
+        "to": "python_sidecar",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "resources/bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "build",
+        "to": "build",
+        "filter": [
+          "icon.ico",
+          "icon.png"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ]
+    }
+  }
+}

@@ -1,0 +1,17 @@
+node_modules
+out
+release
+dist
+*.log
+.DS_Store
+Thumbs.db
+.env
+models/
+build/
+dist/
+*.spec
+!python_sidecar/main.spec
+__pycache__/      # 파이썬 실행 시 생기는 컴파일 캐시 (불필요)
+node_modules/     # Electron/React 라이브러리 폴더 (용량이 매우 큼)
+resources/bin/*.exe  # 아까 복사해둔 실행 파일 (소스 코드만 관리하기 위함)
+release/

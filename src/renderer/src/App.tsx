@@ -10,6 +10,7 @@ import {
   parseAutosubProjectFile
 } from '../../shared/autosubProject'
 import { removeSilenceWordsFromSubtitleLines } from '../../shared/phase5EditPolicy'
+import { SILENCE_PLACEHOLDER_TEXT } from '../../shared/wordContract'
 import { parseSubtitleLines } from '../../shared/subtitles'
 import { getSubtitleBoxChromeInline } from '../../shared/subtitleBoxChrome'
 import { mergeEmptySubtitleWithPrevious, splitSubtitleLine } from './subtitleEditOps'
@@ -214,7 +215,15 @@ function clampSubtitleBgPaddingPct(p: number): number {
 
 function textFromWords(words: NonNullable<SubtitleLine['words']> | undefined, fallback: string): string {
   if (!words || words.length === 0) return fallback
-  return words.map((w) => w.word).join(' ').trim()
+  const validWords = words.filter(
+    (w) =>
+      !w.isSilence &&
+      w.word !== '??' &&
+      w.word !== '-' &&
+      w.word.trim() !== SILENCE_PLACEHOLDER_TEXT
+  )
+  if (validWords.length === 0) return ''
+  return validWords.map((w) => w.word).join(' ').trim()
 }
 
 type SilenceWorkerRequest = {
@@ -279,7 +288,7 @@ function normalizeWorkerLines(lines: SubtitleLine[]): SubtitleLine[] {
       .map((w) => ({
         start: w.start,
         end: w.end,
-        word: w.isSilence ? '' : w.word,
+        word: w.isSilence ? SILENCE_PLACEHOLDER_TEXT : w.word,
         ...(w.isSilence ? ({ isSilence: true } as const) : {})
       }))
     return {

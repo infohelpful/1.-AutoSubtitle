@@ -211,14 +211,14 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       return vr.map((w) => ({
         start: w.start,
         end: w.end,
-        label: w.isSilence ? '·' : w.text,
+        label: w.isSilence ? (w.text.trim() || '??') : w.text,
         isSilence: w.isSilence
       }))
     }
     return sw.map((w) => ({
       start: w.start,
       end: w.end,
-      label: w.word,
+      label: w.isSilence ? (String(w.word).trim() || '??') : w.word,
       isSilence: w.isSilence
     }))
   }, [waveformEnabled, vrewRows, index, row.words])

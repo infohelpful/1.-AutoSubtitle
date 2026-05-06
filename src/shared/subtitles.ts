@@ -1,3 +1,5 @@
+import { SILENCE_PLACEHOLDER_TEXT } from './wordContract'
+
 /** Python 사이드카(Faster-Whisper) 및 UI 공통 자막 줄 형식 */
 export type SubtitleWord = {
   start: number
@@ -44,7 +46,7 @@ export function parseSubtitleLines(raw: unknown): SubtitleLine[] {
       const entry: SubtitleWord = {
         start: ws,
         end: we,
-        word: isSilence ? '' : tw.length > 0 ? tw : '??'
+        word: isSilence ? SILENCE_PLACEHOLDER_TEXT : tw.length > 0 ? tw : '??'
       }
       if (isSilence) entry.isSilence = true
       words.push(entry)

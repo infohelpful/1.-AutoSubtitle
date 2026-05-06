@@ -248,6 +248,19 @@ function applyDirectionalAdjustResplit(args: {
   leftWord.end = newBoundaryTime
   rightWord.start = newBoundaryTime
 
+  const isLeftSilence =
+    Boolean(leftWord.isSilence) || leftWord.text === '??' || leftWord.text === '-'
+  const isRightSilence =
+    Boolean(rightWord.isSilence) || rightWord.text === '??' || rightWord.text === '-'
+
+  if (isLeftSilence || isRightSilence) {
+    if (!leftWord.originalText) leftWord.originalText = leftWord.text
+    if (!rightWord.originalText) rightWord.originalText = rightWord.text
+    leftWord.text = leftWord.originalText ?? leftWord.text
+    rightWord.text = rightWord.originalText ?? rightWord.text
+    return next
+  }
+
   if (!leftWord.originalText) leftWord.originalText = leftWord.text
   if (!rightWord.originalText) rightWord.originalText = rightWord.text
 

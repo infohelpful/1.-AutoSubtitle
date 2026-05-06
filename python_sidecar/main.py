@@ -25,7 +25,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from processor import export_video_png_overlay
+from processor import _subprocess_creationflags, _which_ffmpeg, export_video_png_overlay
 
 # ---------------------------------------------------------------------------
 # Paths & model configuration
@@ -303,6 +303,178 @@ def _resolve_existing_file(p: str) -> str | None:
     return None
 
 
+# --- Peaks.js용 사전 피크 JSON (BBC audiowaveform CLI + FFmpeg 파이프) -----------------
+
+# 80 → samples_per_pixel≈600 @48kHz — Peaks가 더 ‘줌 아웃’할 수 없어 짧은 자막 줄이 화면 왼쪽에만 몰림.
+# 800 전후면 spp≈60 수준이라 수 초 단위 줄이 뷰 너비를 채울 수 있음(파일 용량은 커짐).
+_PEAKS_PIXELS_PER_SECOND = 800
+_PEAKS_BITS = 8
+# 캐시된 JSON이 이보다 거친 해상도면 자동 재생성(구버전 80pps 파일 무효화)
+_PEAKS_MAX_SAMPLES_PER_PIXEL_STALE = 128
+
+# audiowaveform 입력: MP3/WAV/… — 컨테이너 영상은 FFmpeg로 WAV 스트림만 추출
+_DIRECT_AUDIO_EXTS = frozenset({".mp3", ".wav", ".flac", ".ogg", ".oga", ".opus"})
+
+
+def _should_regenerate_peaks(media: Path, peaks_json: Path) -> bool:
+    if not peaks_json.is_file():
+        return True
+    try:
+        if media.stat().st_mtime > peaks_json.stat().st_mtime:
+            return True
+    except OSError:
+        return True
+    try:
+        with open(peaks_json, encoding="utf-8") as f:
+            d = json.load(f)
+        spp = int(d.get("samples_per_pixel") or 0)
+        if spp <= 0 or spp > _PEAKS_MAX_SAMPLES_PER_PIXEL_STALE:
+            return True
+    except (OSError, ValueError, TypeError):
+        return True
+    return False
+
+
+def _resolve_audiowaveform_exe() -> Path | None:
+    env = os.environ.get("AUTOSUBTITLE_AUDIOWAVEFORM_PATH", "").strip()
+    if env:
+        ep = Path(env)
+        if ep.is_file():
+            return ep
+    name = "audiowaveform.exe" if sys.platform == "win32" else "audiowaveform"
+    here = PROJECT_ROOT / "resources" / "bin" / name
+    if here.is_file():
+        return here
+    return None
+
+
+def _media_uses_ffmpeg_to_wav(path: Path) -> bool:
+    return path.suffix.lower() not in _DIRECT_AUDIO_EXTS
+
+
+def _run_audiowaveform_to_json(
+    media_resolved: str,
+    out_json: Path,
+    ffmpeg_exe: str,
+    aw_exe: Path,
+) -> dict[str, Any]:
+    """
+    Peaks.js / waveform-data 호환 JSON 생성.
+    영상·mkv 등: ffmpeg -f wav - | audiowaveform -i - --input-format wav …
+    """
+    media = Path(media_resolved)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_json.with_suffix(out_json.suffix + ".part")
+    try:
+        if tmp.is_file():
+            tmp.unlink()
+    except OSError:
+        pass
+    cflags = _subprocess_creationflags()
+    if _media_uses_ffmpeg_to_wav(media):
+        ff = subprocess.Popen(
+            [
+                ffmpeg_exe,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(media),
+                "-f",
+                "wav",
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=cflags,
+        )
+        try:
+            r = subprocess.run(
+                [
+                    str(aw_exe),
+                    "-i",
+                    "-",
+                    "--input-format",
+                    "wav",
+                    "-o",
+                    str(tmp),
+                    "--output-format",
+                    "json",
+                    "-b",
+                    str(_PEAKS_BITS),
+                    "--pixels-per-second",
+                    str(_PEAKS_PIXELS_PER_SECOND),
+                ],
+                stdin=ff.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=3 * 60 * 60,
+                creationflags=cflags,
+            )
+        finally:
+            if ff.stdout:
+                ff.stdout.close()
+            ff.wait(timeout=120)
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", errors="replace")
+            return {"ok": False, "path": None, "reason": err.strip() or f"audiowaveform exit {r.returncode}"}
+    else:
+        r = subprocess.run(
+            [
+                str(aw_exe),
+                "-i",
+                str(media),
+                "-o",
+                str(tmp),
+                "--output-format",
+                "json",
+                "-b",
+                str(_PEAKS_BITS),
+                "--pixels-per-second",
+                str(_PEAKS_PIXELS_PER_SECOND),
+            ],
+            capture_output=True,
+            timeout=3 * 60 * 60,
+            creationflags=cflags,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", errors="replace")
+            return {"ok": False, "path": None, "reason": err.strip() or f"audiowaveform exit {r.returncode}"}
+
+    try:
+        tmp.replace(out_json)
+    except OSError as e:
+        return {"ok": False, "path": None, "reason": str(e)}
+    return {"ok": True, "path": str(out_json.resolve()), "reason": None}
+
+
+def _waveform_peaks_impl(
+    audio_path: str,
+    *,
+    ffmpeg_exe: str | None,
+    out_path: Path,
+) -> dict[str, Any]:
+    resolved = _resolve_existing_file(_normalize_input_path(audio_path))
+    if resolved is None:
+        raise ValueError(f"not a file or missing: {audio_path}")
+    aw = _resolve_audiowaveform_exe()
+    if aw is None:
+        return {
+            "ok": False,
+            "path": None,
+            "reason": "audiowaveform binary not found (set AUTOSUBTITLE_AUDIOWAVEFORM_PATH or place under resources/bin)",
+        }
+    dest = out_path
+    if not _should_regenerate_peaks(Path(resolved), dest):
+        return {"ok": True, "path": str(dest.resolve()), "reason": None, "cached": True}
+    try:
+        ff = ffmpeg_exe if (ffmpeg_exe and os.path.isfile(ffmpeg_exe)) else _which_ffmpeg(None)
+    except FileNotFoundError as e:
+        return {"ok": False, "path": None, "reason": str(e)}
+    return _run_audiowaveform_to_json(resolved, dest, ff, aw)
+
+
 def _ensure_stderr_utf8() -> None:
     """진행률 JSON(stderr)만 UTF-8 텍스트 모드로 맞춘다."""
     try:
@@ -576,6 +748,25 @@ def handle(method: str, params: dict[str, Any]) -> Any:
         subtitles = _fill_unvoiced_gaps(subtitles, total_dur)
         _emit_transcribe_progress(100.0)
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        waveform_peaks: dict[str, Any]
+        try:
+            env_ff = os.environ.get("AUTOSUBTITLE_FFMPEG_PATH", "").strip()
+            wf_out = params.get("waveform_out_json_path")
+            if not (isinstance(wf_out, str) and wf_out.strip()):
+                waveform_peaks = {
+                    "ok": False,
+                    "path": None,
+                    "reason": "waveform_out_json_path missing (main process must pass userData cache path)",
+                }
+            else:
+                dest_peaks = Path(_normalize_input_path(str(wf_out).strip()))
+                waveform_peaks = _waveform_peaks_impl(
+                    audio_path,
+                    ffmpeg_exe=env_ff if env_ff else None,
+                    out_path=dest_peaks,
+                )
+        except Exception as e:  # noqa: BLE001
+            waveform_peaks = {"ok": False, "path": None, "reason": str(e)}
         return {
             "subtitles": subtitles,
             "language": getattr(info, "language", None),
@@ -584,7 +775,30 @@ def handle(method: str, params: dict[str, Any]) -> Any:
             "device_before": device_before,
             "fallback_to_cpu": did_fallback_to_cpu,
             "transcribe_ms": elapsed_ms,
+            "waveform_peaks": waveform_peaks,
         }
+    if method == "waveform_peaks":
+        raw_path = params.get("path")
+        if isinstance(raw_path, str) and raw_path.strip():
+            ap = _normalize_input_path(raw_path)
+        elif _current_video_path:
+            ap = _current_video_path
+        else:
+            raise ValueError("no media path; pass path in params or call set_video_path first")
+        ff_raw = params.get("ffmpeg_path")
+        ffmpeg_param: str | None = (
+            str(ff_raw).strip() if isinstance(ff_raw, str) and str(ff_raw).strip() else None
+        )
+        env_ff = os.environ.get("AUTOSUBTITLE_FFMPEG_PATH", "").strip()
+        out_raw = params.get("out_json_path")
+        if not (isinstance(out_raw, str) and str(out_raw).strip()):
+            return {
+                "ok": False,
+                "path": None,
+                "reason": "out_json_path is required (Electron main passes userData/WaveformCache path)",
+            }
+        dest = Path(_normalize_input_path(str(out_raw).strip()))
+        return _waveform_peaks_impl(ap, ffmpeg_exe=ffmpeg_param or (env_ff if env_ff else None), out_path=dest)
     if method == "export_video_png_overlay":
         return export_video_png_overlay(params)
     raise ValueError(f"unknown method: {method}")

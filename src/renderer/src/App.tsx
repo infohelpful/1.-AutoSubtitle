@@ -1,21 +1,52 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent, type CSSProperties, type ReactElement } from 'react'
+import type { JsonWaveformData } from 'peaks.js'
 
 import type { CutRange, DepsStatus, ExportFormat, GpuRuntimeStatus, TranscribeMode } from '../../shared/ipc'
+import type { SubtitleLine, SubtitleWord } from '../../shared/subtitles'
 import {
   AUTOSUB_FILE_FORMAT,
   AUTOSUB_VERSION,
   type AutosubProjectFileV1,
   parseAutosubProjectFile
 } from '../../shared/autosubProject'
-import { parseSubtitleLines, type SubtitleLine } from '../../shared/subtitles'
+import { removeSilenceWordsFromSubtitleLines } from '../../shared/phase5EditPolicy'
+import { parseSubtitleLines } from '../../shared/subtitles'
 import { getSubtitleBoxChromeInline } from '../../shared/subtitleBoxChrome'
 import { mergeEmptySubtitleWithPrevious, splitSubtitleLine } from './subtitleEditOps'
 import { SubtitleVirtualList } from './SubtitleVirtualList'
 import { SubtitleDataProvider } from './subtitleDataContext'
+import {
+  SubtitleWaveformPeaks,
+  type PeaksZoomViewRange,
+  type SubtitleWaveformPeaksHandle
+} from './SubtitleWaveformPeaks'
+import type { SubtitleRow } from './components/vrewPeaksEditor/types'
+import { subtitleLinesToVrewRows, vrewRowsToSubtitleLines } from './vrewSubtitleAdapter'
+import { applyTimeRangeCutToVrewRows } from './waveformCutSync'
+import {
+  mergeCutRanges,
+  mediaToEditTime,
+  editToMediaTime,
+  peaksEditRangeToMediaCut,
+  snapTimelineSec
+} from '../../shared/timelineCollapse'
+import { replayMediaCutsOnDecodedBuffer, spliceAudioBuffer } from './spliceAudioBuffer'
+import { timelineEditLog } from './timelineEditLog'
 
 type OverlayPhase = 'working' | 'success' | 'error'
 
 const VIDEO_EXTENSIONS = ['mp4', 'mkv', 'avi'] as const
+
+/** `python_sidecar/main.py` 의 `_PEAKS_MAX_SAMPLES_PER_PIXEL_STALE` 와 맞출 것 */
+const PEAKS_JSON_MAX_SAMPLES_PER_PIXEL = 128
+
+/** 구버전 전용: 영상 옆 `{stem}.autosub-peaks.json` — 글로벌 캐시 miss 시 한 번만 읽기 */
+function legacyPeaksJsonBesideMedia(absoluteMediaPath: string): string {
+  const t = absoluteMediaPath.trim()
+  const d = t.lastIndexOf('.')
+  const base = d > 0 ? t.slice(0, d) : t
+  return `${base}.autosub-peaks.json`
+}
 const RELEASES_PAGE_URL = 'https://github.com/infohelpful/1.-AutoSubtitle/releases'
 const SUBTITLE_STYLE_STORAGE_KEY = 'autosubtitle:preview-subtitle-style'
 const RECENT_FONTS_STORAGE_KEY = 'autosubtitle:recent-fonts'
@@ -186,33 +217,120 @@ function textFromWords(words: NonNullable<SubtitleLine['words']> | undefined, fa
   return words.map((w) => w.word).join(' ').trim()
 }
 
-function mergeCutRanges(ranges: CutRange[]): CutRange[] {
-  if (ranges.length <= 1) return ranges
-  const sorted = [...ranges]
-    .filter((r) => Number.isFinite(r.start) && Number.isFinite(r.end) && r.end > r.start)
-    .sort((a, b) => a.start - b.start)
-  if (sorted.length <= 1) return sorted
-  const out: CutRange[] = [sorted[0]]
-  for (let i = 1; i < sorted.length; i += 1) {
-    const cur = sorted[i]
-    const last = out[out.length - 1]
-    if (cur.start <= last.end + 0.001) {
-      last.end = Math.max(last.end, cur.end)
-    } else {
-      out.push({ ...cur })
-    }
-  }
-  return out
+type SilenceWorkerRequest = {
+  lines: SubtitleLine[]
+  waveformData: number[]
+  sampleRate: number
 }
+
+type SilenceWorkerResponse = {
+  lines: SubtitleLine[]
+  stats?: {
+    avgAmp: number
+    threshold: number
+    splitWordCount: number
+    createdSilenceBlocks: number
+    scannedWordCount: number
+    longWordCount: number
+  }
+}
+
+function extractWaveformPayload(
+  peaks: JsonWaveformData | null,
+  lines: SubtitleLine[]
+): { waveformData: number[]; sampleRate: number } | null {
+  if (!peaks) return null
+  const raw = peaks as unknown as {
+    data?: unknown
+    channels?: Array<{ data?: unknown }>
+  }
+  const fromRoot = Array.isArray(raw.data) ? raw.data : null
+  const fromChannel = Array.isArray(raw.channels) && Array.isArray(raw.channels[0]?.data) ? raw.channels[0].data : null
+  const source = (fromRoot ?? fromChannel) as unknown[] | null
+  if (!source || source.length === 0) return null
+
+  const waveformData: number[] = []
+  for (const v of source) {
+    const n = typeof v === 'number' ? v : Number(v)
+    if (!Number.isFinite(n)) continue
+    waveformData.push(Math.abs(n))
+  }
+  if (waveformData.length === 0) return null
+
+  const maxSubtitleEndSec = lines.reduce((m, line) => {
+    const words = line.words ?? []
+    if (words.length > 0) {
+      const wordMax = words.reduce((wm, w) => Math.max(wm, w.end), 0)
+      return Math.max(m, wordMax)
+    }
+    return Math.max(m, line.end)
+  }, 0)
+  if (!(maxSubtitleEndSec > 0)) return null
+
+  const sampleRate = waveformData.length / maxSubtitleEndSec
+  if (!Number.isFinite(sampleRate) || sampleRate <= 1) return null
+  return { waveformData, sampleRate }
+}
+
+function normalizeWorkerLines(lines: SubtitleLine[]): SubtitleLine[] {
+  return lines.map((line) => {
+    const words: SubtitleWord[] = (line.words ?? [])
+      .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start)
+      .map((w) => ({
+        start: w.start,
+        end: w.end,
+        word: w.isSilence ? '' : w.word,
+        ...(w.isSilence ? ({ isSilence: true } as const) : {})
+      }))
+    return {
+      ...line,
+      words,
+      text: textFromWords(words, line.text ?? '')
+    }
+  })
+}
+
+/** 삭제 구간 끝에 정확히 맞추면 디코더가 같은 키프레임에 걸려 멈추는 경우가 있어 살짝 건너뜀 */
+const SKIP_CUT_TAIL_SEC = 2e-4
 
 function skipCutRangeAt(timeSec: number, ranges: CutRange[]): number {
-  for (const r of ranges) {
-    if (timeSec >= r.start && timeSec < r.end) return r.end
+  const merged = mergeCutRanges([...ranges])
+  let t = timeSec
+  for (let step = 0; step < 64; step += 1) {
+    let jumped = false
+    for (const r of merged) {
+      if (t >= r.start && t < r.end) {
+        t = r.end + SKIP_CUT_TAIL_SEC
+        jumped = true
+        break
+      }
+    }
+    if (!jumped) break
   }
-  return timeSec
+  return t
 }
 
-export default function App(): JSX.Element {
+function subtitleLinesMeaningfullyChanged(next: SubtitleLine[], prev: SubtitleLine[]): boolean {
+  if (next.length !== prev.length) return true
+  for (let i = 0; i < next.length; i += 1) {
+    const n = next[i]
+    const p = prev[i]
+    if (n.start !== p.start || n.end !== p.end || n.text !== p.text) return true
+    const nw = n.words ?? []
+    const pw = p.words ?? []
+    if (nw.length !== pw.length) return true
+    if (nw.length === 0) continue
+    for (let j = 0; j < nw.length; j += 1) {
+      const a = nw[j]
+      const b = pw[j]
+      if (a.start !== b.start || a.end !== b.end || a.word !== b.word) return true
+      if (Boolean(a.isSilence) !== Boolean(b.isSilence)) return true
+    }
+  }
+  return false
+}
+
+export default function App(): ReactElement {
   const savedSubtitleStyle = readSavedSubtitleStyle()
   const readRecentFonts = (): string[] => {
     try {
@@ -228,17 +346,20 @@ export default function App(): JSX.Element {
       return []
     }
   }
-  const SPLIT_MIN = 40
-  const SPLIT_MAX = 60
+  /** 미리보기(영상) 폭 % — 낮을수록 자막·파형 패널이 넓어져 단어 행 가로 스크롤이 줄어듦 */
+  const SPLIT_MIN = 35
+  const SPLIT_MAX = 65
   const [previewWidthPct, setPreviewWidthPct] = useState(() => {
     const raw = window.localStorage.getItem('autosubtitle:split-preview-width-pct')
     const parsed = Number(raw)
-    if (!Number.isFinite(parsed)) return 60
+    if (!Number.isFinite(parsed)) return 50
     return Math.max(SPLIT_MIN, Math.min(SPLIT_MAX, parsed))
   })
   const [busy, setBusy] = useState(false)
   const [videoPath, setVideoPath] = useState<string | null>(null)
   const [modelReady, setModelReady] = useState(false)
+  /** 초기 IPC로 FFmpeg·모델 존재 여부를 확인한 뒤에만 엔진 게이트 표시(미확인 시 깜빡임 방지) */
+  const [depsResolved, setDepsResolved] = useState(false)
   const [downloadPct, setDownloadPct] = useState(0)
 
   const [engineOverlayOpen, setEngineOverlayOpen] = useState(false)
@@ -272,6 +393,11 @@ export default function App(): JSX.Element {
   const [durationSec, setDurationSec] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
   const [cutRanges, setCutRanges] = useState<CutRange[]>([])
+  const cutRangesRef = useRef<CutRange[]>([])
+  useEffect(() => {
+    cutRangesRef.current = cutRanges
+  }, [cutRanges])
+
   const [subtitleFontFamily, setSubtitleFontFamily] = useState<string>(
     savedSubtitleStyle?.subtitleFontFamily ?? 'Malgun Gothic'
   )
@@ -298,6 +424,8 @@ export default function App(): JSX.Element {
 
   /** Python `transcribe` 결과 등 — `{ start, end, text }[]` */
   const [subtitles, setSubtitles] = useState<SubtitleLine[]>([])
+  const [silenceSplitPending, setSilenceSplitPending] = useState(false)
+  const silenceSplitRunKeyRef = useRef<string | null>(null)
   const undoStackRef = useRef<SubtitleLine[][]>([])
   const redoStackRef = useRef<SubtitleLine[][]>([])
   /** 마지막으로 저장/연 `.autosub` 경로 — 「저장」 덮어쓰기용 */
@@ -314,17 +442,19 @@ export default function App(): JSX.Element {
   const [showBurnEncoderUi, setShowBurnEncoderUi] = useState(false)
   const videoBurnExportRef = useRef(false)
   const [exportFormat, setExportFormat] = useState<ExportFormat>('video')
+  /** false면 subtitleLinesToVrewRows 가 단어 간 gap-fill(무음 더미)을 넣지 않음 — 편집 후 타임라인 덮어쓰기 방지 */
+  const [gapFillWhenBuildingVrew, setGapFillWhenBuildingVrew] = useState(true)
 
   const activeSubtitleIndex = useMemo(
-    () => pickActiveSubtitleIndex(subtitles, playheadSec),
-    [subtitles, playheadSec]
+    () => pickActiveSubtitleIndex(subtitles, mediaToEditTime(playheadSec, cutRanges)),
+    [subtitles, playheadSec, cutRanges]
   )
 
   const seekToSubtitleStart = useCallback(
     (startSec: number) => {
       const el = videoRef.current
       if (!el || !videoPath) return
-      let t = Math.max(0, startSec)
+      let t = Math.max(0, editToMediaTime(startSec, cutRanges))
       t = skipCutRangeAt(t, cutRanges)
       if (Number.isFinite(el.duration) && el.duration > 0) {
         t = Math.min(t, Math.max(0, el.duration - 0.001))
@@ -339,7 +469,7 @@ export default function App(): JSX.Element {
     (startSec: number) => {
       const el = videoRef.current
       if (!el || !videoPath) return
-      let t = Math.max(0, startSec)
+      let t = Math.max(0, editToMediaTime(startSec, cutRanges))
       t = skipCutRangeAt(t, cutRanges)
       if (Number.isFinite(el.duration) && el.duration > 0) {
         t = Math.min(t, Math.max(0, el.duration - 0.001))
@@ -352,10 +482,30 @@ export default function App(): JSX.Element {
   )
 
   const registerDeletedAudioRange = useCallback((startSec: number, endSec: number) => {
-    const s = Math.max(0, Math.min(startSec, endSec))
-    const e = Math.max(0, Math.max(startSec, endSec))
-    if (!(e > s + 0.001)) return
-    setCutRanges((prev) => mergeCutRanges([...prev, { start: s, end: e }]))
+    const s = snapTimelineSec(Math.max(0, Math.min(startSec, endSec)))
+    const e = snapTimelineSec(Math.max(0, Math.max(startSec, endSec)))
+    if (!(e > s + 0.001)) {
+      timelineEditLog('word-delete', 'registerDeletedAudioRange 스킵 — 구간 너무 짧음', { s, e })
+      return
+    }
+    setCutRanges((prev) => {
+      const mapped = peaksEditRangeToMediaCut(s, e, prev)
+      if (!mapped) {
+        timelineEditLog('word-delete', 'registerDeletedAudioRange — peaks→media 맵 실패', {
+          s,
+          e,
+          prevCuts: prev
+        })
+        return prev
+      }
+      const next = mergeCutRanges([...prev, mapped])
+      timelineEditLog('word-delete', 'registerDeletedAudioRange — cutRanges 반영', {
+        inputSec: { start: s, end: e },
+        mediaSec: mapped,
+        mergedCount: next.length
+      })
+      return next
+    })
   }, [])
 
   const onSubtitleCardClick = useCallback(
@@ -373,15 +523,7 @@ export default function App(): JSX.Element {
         const next = updater(prev)
         if (!recordHistory) return next
         if (next === prev) return prev
-        const changed =
-          next.length !== prev.length ||
-          next.some(
-            (n, i) =>
-              n.start !== prev[i]?.start ||
-              n.end !== prev[i]?.end ||
-              n.text !== prev[i]?.text ||
-              (n.words?.length ?? 0) !== (prev[i]?.words?.length ?? 0)
-          )
+        const changed = subtitleLinesMeaningfullyChanged(next, prev)
         if (!changed) return prev
         undoStackRef.current.push(prev)
         if (undoStackRef.current.length > 100) undoStackRef.current.shift()
@@ -391,6 +533,426 @@ export default function App(): JSX.Element {
     },
     []
   )
+
+  const waveformMediaUrl = useMemo(
+    () => (videoPath ? window.api.getMediaFileUrl(videoPath) : undefined),
+    [videoPath]
+  )
+
+  /** Peaks 파형용 — 파일 단 한 번 디코딩(폴백). 사전 피크 JSON이 있으면 사용하지 않음 */
+  const [waveformPrefetchedBuffer, setWaveformPrefetchedBuffer] = useState<AudioBuffer | null>(null)
+  /** Peaks 사전 피크 JSON 절대 경로 — `userData/WaveformCache` 또는 레거시(영상 옆) */
+  const [waveformPeaksJsonPath, setWaveformPeaksJsonPath] = useState<string | null>(null)
+  /** 메인 IPC로 읽은 JSON — `waveformData` 직접 주입 시 file:// XHR 없음(더블클릭 체감 지연 감소) */
+  const [waveformPeaksJsonData, setWaveformPeaksJsonData] = useState<JsonWaveformData | null>(null)
+
+  const waveformPeaksFileUrl = useMemo(
+    () => (waveformPeaksJsonPath ? window.api.getMediaFileUrl(waveformPeaksJsonPath) : null),
+    [waveformPeaksJsonPath]
+  )
+
+  useEffect(() => {
+    if (!videoPath) {
+      setWaveformPrefetchedBuffer(null)
+      setWaveformPeaksJsonPath(null)
+      setWaveformPeaksJsonData(null)
+      silenceSplitRunKeyRef.current = null
+      setSilenceSplitPending(false)
+      return
+    }
+    setWaveformPrefetchedBuffer(null)
+    setWaveformPeaksJsonPath(null)
+    setWaveformPeaksJsonData(null)
+    let cancelled = false
+    void (async () => {
+      const cacheRes = await window.api.getWaveformPeaksCachePath(videoPath)
+      const cachePath = cacheRes.ok ? cacheRes.cachePath : null
+      const legacyPath = legacyPeaksJsonBesideMedia(videoPath)
+      let peaksJsonLoaded = false
+
+      const readPeaksJsonUsable = async (
+        absPath: string
+      ): Promise<{ ok: true; json: JsonWaveformData } | { ok: false; coarse: boolean }> => {
+        try {
+          const disk = await window.api.readLocalPeaksJsonFile(absPath)
+          if (!disk.ok) return { ok: false, coarse: false }
+          const j = disk.json as JsonWaveformData
+          const spp = typeof j.samples_per_pixel === 'number' ? j.samples_per_pixel : Number.NaN
+          const tooCoarse = Number.isFinite(spp) && spp > PEAKS_JSON_MAX_SAMPLES_PER_PIXEL
+          if (tooCoarse) return { ok: false, coarse: true }
+          return { ok: true, json: j }
+        } catch {
+          return { ok: false, coarse: false }
+        }
+      }
+
+      if (cachePath) {
+        const disk = await readPeaksJsonUsable(cachePath)
+        if (cancelled) return
+        if (disk.ok) {
+          setWaveformPeaksJsonPath(cachePath)
+          setWaveformPeaksJsonData(disk.json)
+          peaksJsonLoaded = true
+          void window.api
+            .logWaveformDebug(
+              'waveform',
+              'WaveformCache 로드 — 피크 JSON + CUT용 오디오 버퍼 디코딩 진행',
+              cachePath
+            )
+            .catch(() => {})
+        } else if (disk.coarse) {
+          void window.api
+            .logWaveformDebug(
+              'waveform',
+              'WaveformCache 가 거친 해상도 — audiowaveform 재생성 시도',
+              cachePath
+            )
+            .catch(() => {})
+        }
+      }
+
+      if (!peaksJsonLoaded && legacyPath !== cachePath) {
+        const leg = await readPeaksJsonUsable(legacyPath)
+        if (cancelled) return
+        if (leg.ok) {
+          setWaveformPeaksJsonPath(legacyPath)
+          setWaveformPeaksJsonData(leg.json)
+          peaksJsonLoaded = true
+          void window.api
+            .logWaveformDebug(
+              'waveform',
+              '레거시(영상 옆) .autosub-peaks.json 로드 — 피크 JSON + CUT용 버퍼 디코딩 진행',
+              legacyPath
+            )
+            .catch(() => {})
+        } else if (leg.coarse) {
+          void window.api
+            .logWaveformDebug(
+              'waveform',
+              '레거시 peaks 가 거친 해상도 — audiowaveform 재생성 시도',
+              legacyPath
+            )
+            .catch(() => {})
+        }
+      }
+
+      if (!peaksJsonLoaded) {
+        try {
+          let ffmpegPath: string | undefined
+          try {
+            const caps = await window.api.getFfmpegCapabilities()
+            if (caps.ffmpegPath) ffmpegPath = caps.ffmpegPath
+          } catch {
+            /* FFmpeg 미준비 시 Python env 의 AUTOSUBTITLE_FFMPEG_PATH 로 처리 */
+          }
+          const raw = await window.api.sidecarCall('waveform_peaks', {
+            path: videoPath,
+            ...(ffmpegPath ? { ffmpeg_path: ffmpegPath } : {})
+          })
+          if (cancelled) return
+          const r = raw as { ok?: boolean; path?: string | null; reason?: string }
+          if (r?.ok && r.path) {
+            setWaveformPeaksJsonPath(r.path)
+            try {
+              const jr = await window.api.readLocalPeaksJsonFile(r.path)
+              if (cancelled) return
+              if (jr.ok) {
+                setWaveformPeaksJsonData(jr.json as JsonWaveformData)
+                peaksJsonLoaded = true
+              } else setWaveformPeaksJsonData(null)
+            } catch {
+              if (!cancelled) setWaveformPeaksJsonData(null)
+            }
+            void window.api
+              .logWaveformDebug('waveform', 'waveform_peaks 생성·로드 완료 — 이후 CUT용 버퍼 디코딩', r.path)
+              .catch(() => {})
+          } else {
+            void window.api
+              .logWaveformDebug(
+                'waveform',
+                'waveform_peaks 미사용 (audiowaveform 없음 등)',
+                r?.reason ?? 'ok:false'
+              )
+              .catch(() => {})
+          }
+        } catch (e) {
+          void window.api
+            .logWaveformDebug(
+              'waveform',
+              'waveform_peaks RPC 예외 — 전체 오디오 디코딩 폴백',
+              e instanceof Error ? e.message : String(e)
+            )
+            .catch(() => {})
+        }
+      }
+      if (cancelled) return
+      if (typeof window.api.readLocalMediaFileBuffer !== 'function') {
+        setWaveformPrefetchedBuffer(null)
+        return
+      }
+      try {
+        const res = await window.api.readLocalMediaFileBuffer(videoPath)
+        if (cancelled) return
+        if (!res.ok) {
+          setWaveformPrefetchedBuffer(null)
+          return
+        }
+        const ac = new AudioContext()
+        try {
+          const buf = await ac.decodeAudioData(res.arrayBuffer.slice(0))
+          if (cancelled) return
+          setWaveformPrefetchedBuffer(buf)
+        } finally {
+          void ac.close()
+        }
+      } catch {
+        if (!cancelled) setWaveformPrefetchedBuffer(null)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [videoPath])
+
+  useEffect(() => {
+    if (!silenceSplitPending) return
+    if (!videoPath || subtitles.length === 0) return
+    const payload = extractWaveformPayload(waveformPeaksJsonData, subtitles)
+    if (!payload) return
+
+    const runKey = `${videoPath}|${subtitles.length}|${payload.waveformData.length}`
+    if (silenceSplitRunKeyRef.current === runKey) {
+      setSilenceSplitPending(false)
+      return
+    }
+
+    let cancelled = false
+    const worker = new Worker(new URL('./silenceWorker.ts', import.meta.url), { type: 'module' })
+    worker.onmessage = (event: MessageEvent<SilenceWorkerResponse>) => {
+      if (cancelled) return
+      const next = normalizeWorkerLines(event.data.lines ?? [])
+      setSubtitles(next)
+      setGapFillWhenBuildingVrew(false)
+      setSilenceSplitPending(false)
+      silenceSplitRunKeyRef.current = runKey
+      const stats = event.data.stats
+      if (stats) {
+        void window.api
+          .logWaveformDebug('silence-worker', '초기 무음 분리 완료', {
+            ...stats,
+            sampleRate: payload.sampleRate,
+            waveformPoints: payload.waveformData.length
+          })
+          .catch(() => {})
+      }
+      worker.terminate()
+    }
+    worker.onerror = () => {
+      if (cancelled) return
+      setSilenceSplitPending(false)
+      worker.terminate()
+    }
+    const req: SilenceWorkerRequest = {
+      lines: subtitles,
+      waveformData: payload.waveformData,
+      sampleRate: payload.sampleRate
+    }
+    worker.postMessage(req)
+
+    return () => {
+      cancelled = true
+      worker.terminate()
+    }
+  }, [silenceSplitPending, videoPath, subtitles, waveformPeaksJsonData])
+
+  /**
+   * 피크 JSON이 먼저 오고 디코딩이 늦을 때: CUT 후 `cutRanges`만 있고 버퍼는 풀 길이인 채로 들어오면
+   * 파형을 닫았다 열 때 전체 피크가 부활한다 — 한 번에 스플라이스 재적용.
+   */
+  useEffect(() => {
+    const buf = waveformPrefetchedBuffer
+    if (!buf || cutRanges.length === 0) return
+    const merged = mergeCutRanges(cutRanges)
+    let removed = 0
+    for (const c of merged) removed += c.end - c.start
+    const durFull = durationSec > 0.25 ? durationSec : buf.duration
+    const expectedShort = Math.max(0, durFull - removed)
+    if (expectedShort < 0.2) return
+    if (buf.duration > expectedShort + 0.12) {
+      setWaveformPrefetchedBuffer((cur) => {
+        if (!cur) return cur
+        return replayMediaCutsOnDecodedBuffer(cur, cutRanges)
+      })
+    }
+  }, [waveformPrefetchedBuffer, cutRanges, durationSec])
+
+  const onVrewRowsChange = useCallback(
+    (nextRows: SubtitleRow[]) => {
+      setGapFillWhenBuildingVrew(false)
+      applySubtitleChange(() => vrewRowsToSubtitleLines(nextRows), { recordHistory: true })
+    },
+    [applySubtitleChange]
+  )
+
+  const removeAllSilenceWords = useCallback(() => {
+    applySubtitleChange((prev) => {
+      const hadSilence = prev.some((l) => (l.words ?? []).some((w) => w.isSilence))
+      if (hadSilence) queueMicrotask(() => setGapFillWhenBuildingVrew(false))
+      return removeSilenceWordsFromSubtitleLines(prev)
+    })
+  }, [applySubtitleChange])
+
+  const waveformPeaksRef = useRef<SubtitleWaveformPeaksHandle>(null)
+  /** 행 layout 이펙트가 Peaks ref(useImperativeHandle)보다 먼저 돌 수 있어 맵은 여기서 동기 갱신 */
+  const waveMountByLineRef = useRef<Map<number, HTMLDivElement>>(new Map())
+  const [waveformLineIndex, setWaveformLineIndex] = useState<number | null>(null)
+  const [waveformWordId, setWaveformWordId] = useState<number | null>(null)
+  const [peaksZoomViewRange, setPeaksZoomViewRange] = useState<PeaksZoomViewRange | null>(null)
+
+  /** 파형 CUT 확정 — 재생 스킵 + 전역 타임라인 자막 단어 반영 */
+  const applyTimeRangeCut = useCallback(
+    (startSec: number, endSec: number) => {
+      const s = snapTimelineSec(Math.max(0, Math.min(startSec, endSec)))
+      const e = snapTimelineSec(Math.max(0, Math.max(startSec, endSec)))
+      if (!(e > s + 0.001)) {
+        timelineEditLog('waveform-cut', 'applyTimeRangeCut 스킵 — 구간 너무 짧음', { startSec, endSec })
+        return
+      }
+      setCutRanges((prev) => {
+        const mapped = peaksEditRangeToMediaCut(s, e, prev)
+        if (!mapped) {
+          timelineEditLog('waveform-cut', 'applyTimeRangeCut — peaks→media 맵 실패(cutRanges 미변경)', {
+            peaksEditSec: { start: s, end: e },
+            prevCuts: prev
+          })
+          return prev
+        }
+        const next = mergeCutRanges([...prev, mapped])
+        timelineEditLog('waveform-cut', 'applyTimeRangeCut — cutRanges 갱신', {
+          peaksEditSec: { start: s, end: e },
+          mediaCutSec: mapped,
+          mergedCutCount: next.length,
+          mergedCutsHead: next.slice(0, 5)
+        })
+        return next
+      })
+      setGapFillWhenBuildingVrew(false)
+      setWaveformPrefetchedBuffer((prev) => (prev ? spliceAudioBuffer(prev, s, e) : prev))
+      applySubtitleChange((prev) => {
+        const rows = subtitleLinesToVrewRows(prev, { gapFill: false })
+        const nextRows = applyTimeRangeCutToVrewRows(rows, s, e)
+        return vrewRowsToSubtitleLines(nextRows)
+      })
+    },
+    [applySubtitleChange]
+  )
+
+  /**
+   * 파형(Peaks)은 gap-fill 무음 더미 단어마다 세그먼트가 생기는데, 자막 카드 칩은 원본 단어만 있어 개수·경계가 어긋남.
+   * 한 줄이라도 파형 편집이 열려 있으면 gap-fill 을 끄고 vrew 단어 배열을 자막과 1:1로 맞춘다.
+   */
+  const vrewRows = useMemo(
+    () =>
+      subtitleLinesToVrewRows(subtitles, {
+        gapFill: gapFillWhenBuildingVrew && waveformLineIndex === null
+      }),
+    [subtitles, gapFillWhenBuildingVrew, waveformLineIndex]
+  )
+
+  /** Peaks 줌·단어 칹 %배치와 동일 소스 — 헤더 줄 시각만 쓰면 단어 타임코드와 어긋날 수 있음 */
+  const waveformLineZoomBounds = useMemo(() => {
+    if (waveformLineIndex == null) return null
+    const row = vrewRows[waveformLineIndex]
+    if (row?.words?.length) {
+      const ws = row.words
+      return {
+        start: Math.min(...ws.map((w) => w.start)),
+        end: Math.max(...ws.map((w) => w.end))
+      }
+    }
+    const line = subtitles[waveformLineIndex]
+    return line ? { start: line.start, end: line.end } : null
+  }, [waveformLineIndex, vrewRows, subtitles])
+
+  const registerWaveMount = useCallback((lineIndex: number, el: HTMLDivElement | null) => {
+    if (el) waveMountByLineRef.current.set(lineIndex, el)
+    else waveMountByLineRef.current.delete(lineIndex)
+    const dirty = waveformPeaksRef.current?.onWaveMountDirty
+    if (dirty) {
+      dirty()
+    } else {
+      queueMicrotask(() => waveformPeaksRef.current?.onWaveMountDirty?.())
+    }
+  }, [])
+
+  const onWaveformWordDoubleClick = useCallback(
+    (lineIndex: number, wordIndex: number) => {
+      const line = subtitles[lineIndex]
+      const sw = line?.words?.[wordIndex]
+      const row = vrewRows[lineIndex]
+      if (!sw || !row?.words?.length) return
+
+      /** gap-fill 무음(??)이 끼면 vrew.words 인덱스 ≠ 자막 words 인덱스 — 시간으로 매칭 */
+      const matchTime = (a: number, b: number) => Math.abs(a - b) < 0.05
+      let w = row.words.find(
+        (vw) =>
+          !vw.isSilence &&
+          matchTime(vw.start, sw.start) &&
+          matchTime(vw.end, sw.end)
+      )
+      if (!w && sw.isSilence) {
+        w = row.words.find(
+          (vw) => vw.isSilence && matchTime(vw.start, sw.start) && matchTime(vw.end, sw.end)
+        )
+      }
+      if (!w) {
+        const nonSilent = row.words.filter((vw) => !vw.isSilence)
+        if (nonSilent.length > 0) {
+          w = nonSilent.reduce((best, vw) =>
+            Math.abs(vw.start - sw.start) < Math.abs(best.start - sw.start) ? vw : best
+          )
+        }
+      }
+      if (!w) return
+      setWaveformLineIndex(lineIndex)
+      setWaveformWordId(w.id)
+    },
+    [subtitles, vrewRows]
+  )
+
+  /** 파형 마운트를 단어 아래로 옮긴 뒤 body 포털·연결선 좌표 동기화 */
+  const onWaveformMountLayout = useCallback(() => {
+    queueMicrotask(() => waveformPeaksRef.current?.onWaveMountDirty?.())
+  }, [])
+
+  useEffect(() => {
+    if (subtitles.length === 0) {
+      setWaveformLineIndex(null)
+      setWaveformWordId(null)
+    }
+  }, [subtitles.length])
+
+  useEffect(() => {
+    if (waveformLineIndex === null) setPeaksZoomViewRange(null)
+  }, [waveformLineIndex])
+
+  /** 파형 편집 중 — 다른 단어·영상·빈 곳 클릭 시 닫기(활성 단어 칩·파형 UI는 유지) */
+  useEffect(() => {
+    if (waveformLineIndex === null && waveformWordId === null) return
+    const onPointerDown = (e: PointerEvent): void => {
+      const el = e.target as HTMLElement | null
+      if (!el) return
+      if (el.closest('.subtitle-waveform-flow-root')) return
+      if (el.closest('[data-waveform-active-word-chip="1"]')) return
+      if (el.closest('[data-waveform-mount-for-open-line="1"]')) return
+      /** body 포털된 CUT 삭제 버튼 — 클릭 시 파형 닫히면 CUT 확정 전에 줄이 닫혀 삭제가 스킵됨 */
+      if (el.closest('[data-waveform-app-portal="1"]')) return
+      setWaveformLineIndex(null)
+      setWaveformWordId(null)
+    }
+    document.addEventListener('pointerdown', onPointerDown, true)
+    return () => document.removeEventListener('pointerdown', onPointerDown, true)
+  }, [waveformLineIndex, waveformWordId])
 
   const updateSubtitleAt = useCallback((index: number, text: string) => {
     applySubtitleChange((prev) => prev.map((s, j) => (j === index ? { ...s, text } : s)))
@@ -491,6 +1053,7 @@ export default function App(): JSX.Element {
 
   const backspaceWordAt = useCallback(
     (cardIndex: number, wordIndex: number) => {
+      setGapFillWhenBuildingVrew(false)
       applySubtitleChange((prev) => {
         if (cardIndex < 0 || cardIndex >= prev.length) return prev
         const cur = prev[cardIndex]
@@ -535,6 +1098,7 @@ export default function App(): JSX.Element {
 
   const deleteWordAt = useCallback(
     (cardIndex: number, caretIndex: number) => {
+      setGapFillWhenBuildingVrew(false)
       applySubtitleChange((prev) => {
         if (cardIndex < 0 || cardIndex >= prev.length) return prev
         const cur = prev[cardIndex]
@@ -593,6 +1157,7 @@ export default function App(): JSX.Element {
 
   const deleteWordRangeAt = useCallback(
     (cardIndex: number, fromWordIndex: number, toWordIndex: number) => {
+      setGapFillWhenBuildingVrew(false)
       applySubtitleChange((prev) => {
         if (cardIndex < 0 || cardIndex >= prev.length) return prev
         const cur = prev[cardIndex]
@@ -655,11 +1220,86 @@ export default function App(): JSX.Element {
     }
   }, [cutRanges])
 
+  /** CUT 직후 `timeupdate`가 없을 수 있어 재생 헤드가 삭제 구간 안에 남음 → 재생이 멈춘 것처럼 보임 */
+  useEffect(() => {
+    const el = videoRef.current
+    if (!el || !videoPath) return
+    if (mergeCutRanges([...cutRanges]).length === 0) return
+    const fromTime = el.currentTime
+    const skipped = skipCutRangeAt(fromTime, cutRanges)
+    let t = skipped
+    if (Number.isFinite(el.duration) && el.duration > 0) {
+      t = Math.min(skipped, Math.max(0, el.duration - 0.001))
+    }
+    if (t !== fromTime) {
+      el.currentTime = t
+      setPlayheadSec(t)
+      timelineEditLog('playback', 'cutRanges 반영 — currentTime 을 삭제 구간 밖으로 이동', {
+        from: fromTime,
+        to: t
+      })
+    }
+  }, [cutRanges, videoPath])
+
   const togglePlay = useCallback(() => {
     const el = videoRef.current
     if (!el) return
-    if (el.paused) void el.play().catch(() => undefined)
-    else el.pause()
+    if (el.paused) {
+      const from = el.currentTime
+      let t = skipCutRangeAt(from, cutRangesRef.current)
+      if (Number.isFinite(el.duration) && el.duration > 0) {
+        t = Math.min(t, Math.max(0, el.duration - 0.001))
+      }
+      if (t !== from) {
+        el.currentTime = t
+        timelineEditLog('playback', 'togglePlay 직전 — 삭제 구간 밖으로 시크', { from, to: t })
+      }
+      void el.play().catch((e) => {
+        timelineEditLog('playback', 'togglePlay play() 거절', {
+          message: e instanceof Error ? e.message : String(e)
+        })
+      })
+    } else {
+      el.pause()
+    }
+  }, [])
+
+  /**
+   * 재생 중 삭제 구간으로 들어가며 seek 하면 일부 브라우저가 일시정지를 띄우고,
+   * `onPause` → isPlaying=false 로 RAF 가 끊겨 복귀 seek 이 안 됨 — pause 직후 구간 밖이면 즉시 재생.
+   */
+  const handleVideoPause = useCallback(() => {
+    const el = videoRef.current
+    if (!el) {
+      setIsPlaying(false)
+      return
+    }
+    const dur = el.duration
+    const cur = el.currentTime
+    if (Number.isFinite(dur) && dur > 0 && cur >= dur - 0.03) {
+      setIsPlaying(false)
+      return
+    }
+    if (mergeCutRanges([...cutRangesRef.current]).length === 0) {
+      setIsPlaying(false)
+      return
+    }
+    const next = skipCutRangeAt(cur, cutRangesRef.current)
+    let t = next
+    if (Number.isFinite(dur) && dur > 0) {
+      t = Math.min(next, Math.max(0, dur - 0.001))
+    }
+    if (next !== cur) {
+      el.currentTime = t
+      timelineEditLog('playback', 'pause 이벤트 — 삭제 구간 회피 시크 후 재생', { cur, to: t })
+      void el.play().catch((e) => {
+        timelineEditLog('playback', 'pause-회피 play() 거절', {
+          message: e instanceof Error ? e.message : String(e)
+        })
+      })
+      return
+    }
+    setIsPlaying(false)
   }, [])
 
   const pausePlayback = useCallback(() => {
@@ -682,12 +1322,20 @@ export default function App(): JSX.Element {
         rafPlayheadRef.current = null
         return
       }
-      let t = skipCutRangeAt(el.currentTime, cutRanges)
-      if (t !== el.currentTime) {
+      if (el.seeking) {
+        rafPlayheadRef.current = window.requestAnimationFrame(tick)
+        return
+      }
+      const from = el.currentTime
+      let t = skipCutRangeAt(from, cutRanges)
+      if (t !== from) {
         el.currentTime = t
+        timelineEditLog('playback', 'RAF — 재생 중 삭제 구간 스킵 시크', { from, to: t })
+        rafPlayheadRef.current = window.requestAnimationFrame(tick)
+        return
       }
       // 재생 라인 표시를 0.01초 단위로 안정화
-      t = Math.round(t * 100) / 100
+      t = Math.round(el.currentTime * 100) / 100
       setPlayheadSec(t)
       rafPlayheadRef.current = window.requestAnimationFrame(tick)
     }
@@ -826,6 +1474,17 @@ export default function App(): JSX.Element {
       setTranscribeMode('cpu')
       const lines = parseSubtitleLines((raw as { subtitles?: unknown })?.subtitles)
       setSubtitles(lines)
+      setSilenceSplitPending(true)
+      silenceSplitRunKeyRef.current = null
+      const wp = (raw as { waveform_peaks?: { ok?: boolean; path?: string | null } }).waveform_peaks
+      if (wp?.ok && wp.path) {
+        setWaveformPeaksJsonPath(wp.path)
+        void window.api.readLocalPeaksJsonFile(wp.path).then((jr) => {
+          if (jr.ok) setWaveformPeaksJsonData(jr.json as JsonWaveformData)
+          else setWaveformPeaksJsonData(null)
+        })
+      }
+      setGapFillWhenBuildingVrew(true)
       undoStackRef.current = []
       redoStackRef.current = []
     })
@@ -857,6 +1516,8 @@ export default function App(): JSX.Element {
         }
       } catch {
         if (!cancelled) setModelReady(false)
+      } finally {
+        if (!cancelled) setDepsResolved(true)
       }
     })()
     return () => {
@@ -1153,6 +1814,9 @@ export default function App(): JSX.Element {
     setVideoPath(d.videoPath)
     setCutRanges(mergeCutRanges(d.cutRanges))
     setSubtitles(d.subtitles)
+    setSilenceSplitPending(true)
+    silenceSplitRunKeyRef.current = null
+    setGapFillWhenBuildingVrew(true)
     undoStackRef.current = []
     redoStackRef.current = []
     const st = d.subtitleStyle
@@ -1305,7 +1969,7 @@ export default function App(): JSX.Element {
       transformOrigin: 'top left'
     }
   }, [videoContentBox.height, videoContentBox.width, videoNaturalSize.height, videoNaturalSize.width])
-  const previewSubtitleTextStyle = useMemo(() => {
+  const previewSubtitleTextStyle = useMemo<CSSProperties>(() => {
     const { r, g, b } = hexToRgb(subtitleBgColor)
     const shadow = Math.max(0, Math.min(6, subtitleStrokeWidth))
     const chrome = getSubtitleBoxChromeInline(subtitleFontSize, subtitleBgPaddingPct)
@@ -1326,7 +1990,7 @@ export default function App(): JSX.Element {
       color: subtitleTextColor,
       whiteSpace: 'normal',
       wordBreak: 'keep-all',
-      overflowWrap: 'normal',
+      overflowWrap: 'normal' as const,
       textShadow: `-${shadow}px 0 ${subtitleStrokeColor}, 0 ${shadow}px ${subtitleStrokeColor}, ${shadow}px 0 ${subtitleStrokeColor}, 0 -${shadow}px ${subtitleStrokeColor}, 0 2px 8px rgba(0,0,0,0.8)`
     }
   }, [
@@ -1466,7 +2130,11 @@ export default function App(): JSX.Element {
           </button>
         </div>
       ) : null}
-      <div className={`main-workspace ${modelReady ? 'main-workspace--active' : 'main-workspace--inactive'}`}>
+      <div
+        className={`main-workspace ${
+          modelReady || !depsResolved ? 'main-workspace--active' : 'main-workspace--inactive'
+        }`}
+      >
         <header className="app-topbar">
           <h1 className="app-title">AutoSubtitle</h1>
           <div className="app-topbar-actions">
@@ -1708,7 +2376,7 @@ export default function App(): JSX.Element {
                       }}
                       onDurationChange={syncFromVideo}
                       onPlay={() => setIsPlaying(true)}
-                      onPause={() => setIsPlaying(false)}
+                      onPause={handleVideoPause}
                       onEnded={() => setIsPlaying(false)}
                       onClick={() => togglePlay()}
                       onError={(e) => {
@@ -1790,11 +2458,34 @@ export default function App(): JSX.Element {
           <aside className="split-subtitles" aria-label="자막 편집" style={{ width: `${100 - previewWidthPct}%` }}>
             <div className="subtitle-panel">
               <header className="subtitle-panel-head">
-                <h2 className="subtitle-panel-title">자막</h2>
+                <div className="subtitle-panel-head-top">
+                  <h2 className="subtitle-panel-title">자막</h2>
+                  {subtitles.length > 0 ? (
+                    <div className="subtitle-panel-actions" role="group" aria-label="자막 일괄 편집">
+                      <button
+                        type="button"
+                        className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
+                        onClick={removeAllSilenceWords}
+                        title="isSilence 로 표시된 단어를 모두 제거합니다. 이후 파형 변환 시 단어 사이 무음 더미를 자동 삽입하지 않습니다."
+                      >
+                        무음 일괄 삭제
+                      </button>
+                      <button
+                        type="button"
+                        className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
+                        disabled={gapFillWhenBuildingVrew}
+                        onClick={() => setGapFillWhenBuildingVrew(true)}
+                        title="파형 편집용 줄을 만들 때 단어 사이 간격을 다시 메웁니다(무음 더미 포함)."
+                      >
+                        간격 다시 채우기
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
                 <p className="subtitle-panel-sub">
-                  <strong>Enter</strong> 자막 분할 · <strong>Shift+Enter</strong> 줄바꿈 · 빈 칸에서{' '}
-                  <strong>Backspace</strong> 이전과 병합 · <strong>Tab</strong> / <strong>Shift+Tab</strong> 다른
-                  줄로 이동
+                  <strong>단어 더블클릭</strong> 해당 줄 단어 아래 파동 편집 · <strong>Enter</strong> 줄바꿈 ·{' '}
+                  <strong>Ctrl+Enter</strong> 자막 분할 · 빈 칸에서 <strong>Backspace</strong> 이전과 병합 ·{' '}
+                  <strong>Tab</strong> / <strong>Shift+Tab</strong> 다른 줄로 이동
                 </p>
               </header>
               <div className="subtitle-panel-body">
@@ -1806,31 +2497,63 @@ export default function App(): JSX.Element {
                     </p>
                   </div>
                 ) : (
-                  <SubtitleDataProvider subtitles={subtitles}>
-                    <SubtitleVirtualList
-                      subtitles={subtitles}
-                      activeSubtitleIndex={activeSubtitleIndex}
-                      playheadSec={playheadSec}
-                      isPlaying={isPlaying}
-                      onSubtitleCardClick={onSubtitleCardClick}
-                      onCardNavigate={seekToSubtitleStart}
-                      onRequestPausePlayback={pausePlayback}
-                      onWordBlockClick={seekToSubtitleStart}
-                      onWaveformSeekAndPlay={seekAndPlayTo}
-                      splitSubtitleAtWord={splitSubtitleAtWord}
-                      backspaceWordAt={backspaceWordAt}
-                      deleteWordAt={deleteWordAt}
-                      deleteWordRangeAt={deleteWordRangeAt}
-                      onDeleteAudioRange={registerDeletedAudioRange}
-                      onUndo={undoSubtitleChange}
-                      onRedo={redoSubtitleChange}
-                      updateSubtitleAt={updateSubtitleAt}
-                      splitSubtitleAt={splitSubtitleAt}
-                      mergeEmptySubtitleAt={mergeEmptySubtitleAt}
-                      formatTimecode={formatTimecode}
-                      onTogglePlayback={togglePlay}
-                    />
-                  </SubtitleDataProvider>
+                  <>
+                    <div className="subtitle-list-stack">
+                      <SubtitleDataProvider subtitles={subtitles}>
+                        <SubtitleVirtualList
+                          subtitles={subtitles}
+                          activeSubtitleIndex={activeSubtitleIndex}
+                          playheadSec={playheadSec}
+                          isPlaying={isPlaying}
+                          mediaFileUrl={videoPath ? window.api.getMediaFileUrl(videoPath) : null}
+                          onSubtitleCardClick={onSubtitleCardClick}
+                          onCardNavigate={seekToSubtitleStart}
+                          onRequestPausePlayback={pausePlayback}
+                          onWordBlockClick={seekToSubtitleStart}
+                          onWaveformSeekAndPlay={seekAndPlayTo}
+                          splitSubtitleAtWord={splitSubtitleAtWord}
+                          backspaceWordAt={backspaceWordAt}
+                          deleteWordAt={deleteWordAt}
+                          deleteWordRangeAt={deleteWordRangeAt}
+                          onDeleteAudioRange={registerDeletedAudioRange}
+                          onUndo={undoSubtitleChange}
+                          onRedo={redoSubtitleChange}
+                          updateSubtitleAt={updateSubtitleAt}
+                          splitSubtitleAt={splitSubtitleAt}
+                          mergeEmptySubtitleAt={mergeEmptySubtitleAt}
+                          formatTimecode={formatTimecode}
+                          onTogglePlayback={togglePlay}
+                          waveformEnabled={Boolean(modelReady)}
+                          registerWaveMount={registerWaveMount}
+                          waveformExpandedLineIndex={waveformLineIndex}
+                          waveformActiveWordId={waveformWordId}
+                          onWaveformWordDoubleClick={onWaveformWordDoubleClick}
+                          vrewRows={vrewRows}
+                          onWaveformMountLayout={onWaveformMountLayout}
+                          mediaDurationSec={durationSec > 0 ? durationSec : undefined}
+                          peaksZoomViewRange={peaksZoomViewRange}
+                        />
+                      </SubtitleDataProvider>
+                    </div>
+                    {modelReady && subtitles.length > 0 ? (
+                      <SubtitleWaveformPeaks
+                        ref={waveformPeaksRef}
+                        rows={vrewRows}
+                        onRowsChange={onVrewRowsChange}
+                        audioUrl={waveformMediaUrl}
+                        localMediaPath={videoPath}
+                        prefetchedAudioBuffer={waveformPrefetchedBuffer}
+                        precomputedWaveformJson={waveformPeaksJsonData}
+                        precomputedPeaksJsonFileUrl={waveformPeaksJsonData ? null : waveformPeaksFileUrl}
+                        waveMountByLineRef={waveMountByLineRef}
+                        activeLineIndex={waveformLineIndex}
+                        activeWordId={waveformWordId}
+                        waveformCardBounds={waveformLineZoomBounds}
+                        onZoomViewRange={setPeaksZoomViewRange}
+                        onTimeRangeCut={applyTimeRangeCut}
+                      />
+                    ) : null}
+                  </>
                 )}
               </div>
             </div>
@@ -1838,7 +2561,7 @@ export default function App(): JSX.Element {
         </div>
       </div>
 
-      {!modelReady && !engineOverlayOpen ? (
+      {depsResolved && !modelReady && !engineOverlayOpen ? (
         <div className="engine-gate" role="region" aria-label="필수 엔진 준비">
           <div className="engine-gate-card">
             <p className="engine-gate-title">

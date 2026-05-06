@@ -1,13 +1,54 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
-import { List, useListRef } from 'react-window'
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent
+} from 'react'
+import { flushSync } from 'react-dom'
+import { LayoutGroup, motion } from 'framer-motion'
+import { List, useDynamicRowHeight, useListRef } from 'react-window'
 import type { RowComponentProps } from 'react-window'
 import type { MouseEvent } from 'react'
 
 import type { SubtitleLine } from '../../shared/subtitles'
+import type { SubtitleRow } from './components/vrewPeaksEditor/types'
+import type { PeaksZoomViewRange } from './SubtitleWaveformPeaks'
+import { computeLineZoomWindowFromCardBounds, type LineZoomWindowResult } from './lineZoomWindow'
 import { useSubtitleData } from './subtitleDataContext'
 
-/** 카드(타임코드 + 텍스트) + 행 간격을 포함한 고정 행 높이 */
-export const SUBTITLE_LIST_ROW_HEIGHT = 140
+const WORD_LAYOUT_SPRING = { type: 'spring' as const, stiffness: 380, damping: 34 }
+
+/** 가상 목록 기본 행 높이(초기 추정) — 이후 `useDynamicRowHeight`+ResizeObserver로 실제 카드 높이로 갱신 */
+export const SUBTITLE_LIST_ROW_HEIGHT = 152
+
+/** 단어 레일 — 파형 켜진 줄은 Peaks 와 같은 소스(vrew)로 시간 경계를 맞춘다 */
+type WordRailItem = {
+  start: number
+  end: number
+  label: string
+  isSilence?: boolean
+}
+
+function wordChipSlotStyle(w: { start: number; end: number }, tw: LineZoomWindowResult): CSSProperties {
+  let left = ((w.start - tw.windowStart) / tw.span) * 100
+  let width = ((w.end - w.start) / tw.span) * 100
+  left = Math.max(0, Math.min(100, left))
+  width = Math.max(0, Math.min(100 - left, width))
+  return {
+    position: 'absolute',
+    left: `${left}%`,
+    width: `${width}%`,
+    top: 0,
+    bottom: 0,
+    minWidth: 0,
+    boxSizing: 'border-box'
+  }
+}
 
 export type SubtitleVirtualListProps = {
   subtitles: SubtitleLine[]
@@ -33,10 +74,23 @@ export type SubtitleVirtualListProps = {
   formatTimecode: (sec: number) => string
   /** 일시정지 상태에서 현재 시점부터 재생 재개(위치 유지) */
   onTogglePlayback: () => void
+  /** 단어별 파동(Peaks) — 자막 카드 안에 단어 아래·텍스트 위로 삽입 */
+  waveformEnabled?: boolean
+  registerWaveMount?: (lineIndex: number, el: HTMLDivElement | null) => void
+  waveformExpandedLineIndex?: number | null
+  waveformActiveWordId?: number | null
+  onWaveformWordDoubleClick?: (lineIndex: number, wordIndex: number) => void
+  vrewRows?: SubtitleRow[]
+  /** 파형 마운트를 선택 단어 아래로 정렬한 뒤 body 포털 위치 동기화 */
+  onWaveformMountLayout?: () => void
+  /** 미디어 길이(초) — 단어 칹·줌 창 상한과 동일하게 맞춤 */
+  mediaDurationSec?: number
+  /** Peaks zoomview 실제 구간 — 있으면 칹 %는 이 축을 따름(zoomLevels 양자화 일치) */
+  peaksZoomViewRange?: PeaksZoomViewRange | null
 }
 
 /** `List` 의 `rowProps` — `index` / `style` / `ariaAttributes` 는 List가 주입 */
-type SubtitleListRowProps = {
+export type SubtitleListRowProps = {
   subtitles: SubtitleLine[]
   activeSubtitleIndex: number | null
   playheadSec: number
@@ -67,6 +121,15 @@ type SubtitleListRowProps = {
    * 키보드로 다른 카드로 옮길 때만 프리뷰 시크; 삭제 직후 `onCardNavigate`+`requestFocusCaret`는 중복 시크 방지.
    */
   registerCardFocus: (cardIndex: number) => void
+  waveformEnabled?: boolean
+  registerWaveMount?: (lineIndex: number, el: HTMLDivElement | null) => void
+  waveformExpandedLineIndex?: number | null
+  waveformActiveWordId?: number | null
+  onWaveformWordDoubleClick?: (lineIndex: number, wordIndex: number) => void
+  vrewRows?: SubtitleRow[]
+  onWaveformMountLayout?: SubtitleVirtualListProps['onWaveformMountLayout']
+  mediaDurationSec?: number
+  peaksZoomViewRange?: PeaksZoomViewRange | null
 }
 
 function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
@@ -98,7 +161,16 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     navigateSubtitleField,
     requestFocusWord,
     requestFocusCard,
-    registerCardFocus
+    registerCardFocus,
+    waveformEnabled,
+    registerWaveMount,
+    waveformExpandedLineIndex,
+    waveformActiveWordId,
+    onWaveformWordDoubleClick,
+    vrewRows,
+    onWaveformMountLayout,
+    mediaDurationSec,
+    peaksZoomViewRange
   } = props
   const requestFocusCaret = requestFocusWord
   const row = subtitles[index]
@@ -112,20 +184,360 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
   const [hoveredCaretIndex, setHoveredCaretIndex] = useState<number | null>(null)
   const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null)
   const articleRef = useRef<HTMLElement | null>(null)
+  const waveformMountRef = useRef<HTMLDivElement | null>(null)
   /** 마우스로 단어/캐럿 또는 카드 빈 곳을 눌렀을 때만 Space로 시크+재생. 그 외 Space는 재생/일시정지 토글 */
   const spaceSeekIntentRef = useRef<'none' | 'caret' | 'wholeLine'>('none')
   /** 방향키로 재생을 멈추며 이미 캐럿을 옮긴 경우, pause 직후 playhead 동기화를 하지 않음 */
   const skipPlayheadCaretSyncOnPauseRef = useRef(false)
   /** 재생 중 방향키로 일시정지하며 캐럿 편집 UI를 잠깐 허용할 때 true */
   const [keyboardPauseCaret, setKeyboardPauseCaret] = useState(false)
+  /** 부모 subtitles 갱신 없이 타이핑 — blur 시에만 commit (전체 vrewRows·리스트 재계산 방지) */
+  const subtitleTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const [subtitleTextDraft, setSubtitleTextDraft] = useState<string | null>(null)
+  const subtitleTextDisplay = subtitleTextDraft ?? row.text
+
   useEffect(() => {
-    const n = row.words?.length ?? 0
+    if (subtitleTextareaRef.current === document.activeElement) {
+      setSubtitleTextDraft(row.text)
+      return
+    }
+    setSubtitleTextDraft(null)
+  }, [row.text, row.start, row.end, index])
+
+  const wordRail = useMemo((): WordRailItem[] => {
+    const sw = row.words ?? []
+    const vr = vrewRows?.[index]?.words
+    if (waveformEnabled && vr && vr.length > 0) {
+      return vr.map((w) => ({
+        start: w.start,
+        end: w.end,
+        label: w.isSilence ? '·' : w.text,
+        isSilence: w.isSilence
+      }))
+    }
+    return sw.map((w) => ({
+      start: w.start,
+      end: w.end,
+      label: w.word,
+      isSilence: w.isSilence
+    }))
+  }, [waveformEnabled, vrewRows, index, row.words])
+
+  /** vrew 레일 캐럿 ci → 자막 줄에서 splitSubtitleAtWord 에 넘길 인덱스 */
+  const subtitleSplitIndexFromRailCaret = useCallback(
+    (ci: number): number => {
+      const subs = row.words ?? []
+      if (subs.length === 0 || ci <= 0) return 0
+      if (ci >= wordRail.length) return subs.length
+      const bt = (wordRail[ci - 1]!.end + wordRail[ci]!.start) / 2
+      for (let j = 1; j < subs.length; j++) {
+        const mid = (subs[j - 1]!.end + subs[j]!.start) / 2
+        if (bt <= mid) return j
+      }
+      return subs.length
+    },
+    [row.words, wordRail]
+  )
+
+  useEffect(() => {
+    const n = wordRail.length
     setCaretIndex((prev) => Math.max(0, Math.min(prev, n)))
-  }, [row.words])
+  }, [wordRail])
+
+  /**
+   * 파형이 열린 줄이면 Peaks 가 보고한 실제 zoomview 구간(windowStart/End)으로 %를 맞춘다.
+   * 이론상 computeLineZoomWindow 만 쓰면 zoomLevels 스냅 때문에 세그먼트·흰선과 칹 경계가 어긋난다.
+   */
+  const wordTimeline = useMemo((): LineZoomWindowResult | null => {
+    if (wordRail.length === 0) return null
+    const lineStart = Math.min(...wordRail.map((w) => w.start))
+    const lineEnd = Math.max(...wordRail.map((w) => w.end))
+    if (
+      peaksZoomViewRange != null &&
+      peaksZoomViewRange.lineIndex === index &&
+      waveformExpandedLineIndex === index
+    ) {
+      const ws = peaksZoomViewRange.windowStart
+      const we = peaksZoomViewRange.windowEnd
+      const span = Math.max(we - ws, 1e-6)
+      return {
+        lineStart,
+        lineEnd,
+        windowStart: ws,
+        windowEnd: we,
+        span
+      }
+    }
+    return computeLineZoomWindowFromCardBounds(lineStart, lineEnd, {
+      mediaDurationSec:
+        mediaDurationSec != null && mediaDurationSec > 0 ? mediaDurationSec : undefined,
+      clipTrailingToLineEnd: true
+    })
+  }, [wordRail, mediaDurationSec, peaksZoomViewRange, waveformExpandedLineIndex, index])
+
+  /** 파형이 열린 줄만 시간축(%)·가로 스크롤 — 그 외는 줄바꿈 읽기 모드 */
+  const timelineLayoutThisRow = Boolean(
+    waveformEnabled && waveformExpandedLineIndex === index
+  )
+
+  const wordRowOuterRef = useRef<HTMLDivElement>(null)
+  const wordRowInnerRef = useRef<HTMLDivElement>(null)
+  /** 단어 칩 실제 픽셀 경계 — 비율(%)만 쓰면 -1px 이웃 겹침 때문에 세로 구분선과 어긋남 */
+  const [measuredCaretLeftPx, setMeasuredCaretLeftPx] = useState<number[] | null>(null)
+  /** 캐럿마다 인접 칩·줄바꿈 기준 세로 중앙(px) — 창 리사이즈·줄바꿈 후에도 맞추려면 전역 mid-y 가 아님 */
+  const [measuredCaretTopPx, setMeasuredCaretTopPx] = useState<number[] | null>(null)
+
+  const measureCaretEdges = useCallback(() => {
+    /** 타임라인(파형 열림) 줄은 단어 사이 캐럿 UI를 쓰지 않음 */
+    if (waveformEnabled && waveformExpandedLineIndex === index) {
+      wordRowInnerRef.current?.style.removeProperty('--subtitle-caret-bar-height')
+      setMeasuredCaretLeftPx(null)
+      setMeasuredCaretTopPx(null)
+      return
+    }
+    const inner = wordRowInnerRef.current
+    const words = wordRail
+    const n = words.length
+    const tw = wordTimeline
+    if (!inner || n === 0 || !tw) {
+      inner?.style.removeProperty('--subtitle-caret-bar-height')
+      setMeasuredCaretLeftPx(null)
+      setMeasuredCaretTopPx(null)
+      return
+    }
+    const innerRect = inner.getBoundingClientRect()
+    if (innerRect.width < 0.5) {
+      inner.style.removeProperty('--subtitle-caret-bar-height')
+      setMeasuredCaretLeftPx(null)
+      setMeasuredCaretTopPx(null)
+      return
+    }
+    const timeToPx = (t: number) => ((t - tw.windowStart) / tw.span) * innerRect.width
+    const chipEl = (wi: number) => document.getElementById(`subtitle-word-${index}-${wi}`)
+    /** 칩 경계 사이 공백의 가로 중앙(px, inner 기준) — 캐럿은 translateX(-50%)로 이 점에 맞춤 */
+    const centers: number[] = new Array(n + 1)
+    const innerW = innerRect.width
+    for (let k = 0; k <= n; k++) {
+      if (k === 0) {
+        const r0 = chipEl(0)?.getBoundingClientRect()
+        if (r0) {
+          const left0 = r0.left - innerRect.left
+          centers[0] = left0 * 0.5
+        } else {
+          centers[0] = timeToPx((tw.windowStart + words[0]!.start) * 0.5)
+        }
+      } else if (k === n) {
+        const rLast = chipEl(n - 1)?.getBoundingClientRect()
+        if (rLast) {
+          const rightLast = rLast.right - innerRect.left
+          /** 카드 전체 너비까지 중앙 잡지 않음 — 마지막 칩 직후 좁은 구간(빈 여백 방지) */
+          const tailPx = 8
+          centers[n] = Math.min(rightLast + tailPx, innerW - 4)
+        } else {
+          const nearEndPx = timeToPx(words[n - 1]!.end) + 8
+          centers[n] = Math.min(nearEndPx, innerW - 4)
+        }
+      } else {
+        const rPrev = chipEl(k - 1)?.getBoundingClientRect()
+        const rCurr = chipEl(k)?.getBoundingClientRect()
+        if (rPrev && rCurr) {
+          const a = rPrev.right - innerRect.left
+          const b = rCurr.left - innerRect.left
+          centers[k] = (a + b) * 0.5
+        } else {
+          const tMid = (words[k - 1]!.end + words[k]!.start) * 0.5
+          centers[k] = timeToPx(tMid)
+        }
+      }
+    }
+    /** 막대 높이 + 캐럿별 세로: 줄바꿈 시 전체 블록 중앙이 아니라 각 간격(이전·다음 칩)의 세로 중앙 */
+    let maxChipH = 0
+    for (let wi = 0; wi < n; wi++) {
+      const cr = chipEl(wi)?.getBoundingClientRect()
+      if (cr) maxChipH = Math.max(maxChipH, cr.height)
+    }
+    const innerH = innerRect.height
+    const barPx =
+      maxChipH > 4
+        ? Math.round(Math.min(Math.max(maxChipH * 0.94, 18), Math.max(innerH, maxChipH)))
+        : Math.round(Math.min(Math.max(innerH * 0.85, 20), 48))
+    inner.style.setProperty('--subtitle-caret-bar-height', `${barPx}px`)
+
+    const tops: number[] = new Array(n + 1)
+    const fallbackMid = innerH > 0.5 ? innerH * 0.5 : 22
+    for (let k = 0; k <= n; k++) {
+      if (k === 0) {
+        const r0 = chipEl(0)?.getBoundingClientRect()
+        tops[k] = r0 ? r0.top + r0.height / 2 - innerRect.top : fallbackMid
+      } else if (k === n) {
+        const rl = chipEl(n - 1)?.getBoundingClientRect()
+        tops[k] = rl ? rl.top + rl.height / 2 - innerRect.top : fallbackMid
+      } else {
+        const ra = chipEl(k - 1)?.getBoundingClientRect()
+        const rb = chipEl(k)?.getBoundingClientRect()
+        if (ra && rb) {
+          tops[k] = (ra.bottom + rb.top) / 2 - innerRect.top
+        } else {
+          tops[k] = fallbackMid
+        }
+      }
+    }
+    setMeasuredCaretTopPx((prev) => {
+      if (
+        prev &&
+        prev.length === tops.length &&
+        prev.every((p, i) => Math.abs(p - tops[i]!) < 0.5)
+      ) {
+        return prev
+      }
+      return tops
+    })
+
+    setMeasuredCaretLeftPx((prev) => {
+      if (
+        prev &&
+        prev.length === centers.length &&
+        prev.every((p, i) => Math.abs(p - centers[i]!) < 0.35)
+      ) {
+        return prev
+      }
+      return centers
+    })
+  }, [index, wordRail, wordTimeline, waveformEnabled, waveformExpandedLineIndex])
+
+  const getWordCaretEdgeStyle = useCallback(
+    (k: number, n: number): CSSProperties => {
+      const m = measuredCaretLeftPx
+      const tw = wordTimeline
+      const words = wordRail
+      if (m && m.length === n + 1 && m.every((x) => Number.isFinite(x))) {
+        const leftPx = m[k]!
+        return { left: leftPx }
+      }
+      if (!tw || words.length === 0) {
+        return k === 0
+          ? { left: 0 }
+          : k === n
+            ? { left: '100%' }
+            : { left: '50%' }
+      }
+      const tMid =
+        k === 0
+          ? (tw.windowStart + words[0]!.start) * 0.5
+          : k === n
+            ? Math.min(
+                words[n - 1]!.end + tw.span * 0.004,
+                tw.windowEnd - tw.span * 1e-6
+              )
+            : (words[k - 1]!.end + words[k]!.start) * 0.5
+      const pctRaw = ((tMid - tw.windowStart) / tw.span) * 100
+      const pct = Math.max(0, Math.min(100, pctRaw))
+      return { left: `${pct}%` }
+    },
+    [measuredCaretLeftPx, wordTimeline, wordRail]
+  )
+
+  useLayoutEffect(() => {
+    measureCaretEdges()
+  }, [measureCaretEdges])
+
+  /** 파형 열림/닫힘·줄 전환 후 Framer 레이아웃이 끝난 뒤 좌표·칩 높이 재측정 */
+  useEffect(() => {
+    const t = window.setTimeout(() => measureCaretEdges(), 450)
+    return () => window.clearTimeout(t)
+  }, [waveformExpandedLineIndex, measureCaretEdges])
+
+  useEffect(() => {
+    if (waveformEnabled && waveformExpandedLineIndex === index) return
+    const outer = wordRowOuterRef.current
+    const inner = wordRowInnerRef.current
+    if (!outer || !inner) return
+    const ro = new ResizeObserver(() => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => measureCaretEdges())
+      })
+    })
+    ro.observe(outer)
+    ro.observe(inner)
+    const onWin = (): void => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => measureCaretEdges())
+      })
+    }
+    window.addEventListener('resize', onWin)
+    void document.fonts.ready.then(() => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => measureCaretEdges())
+      })
+    })
+    return () => {
+      ro.disconnect()
+      window.removeEventListener('resize', onWin)
+    }
+  }, [measureCaretEdges, index, wordTimeline, waveformEnabled, waveformExpandedLineIndex])
 
   useEffect(() => {
     setSelectionAnchor(null)
-  }, [index, row.words])
+  }, [index, wordRail])
+
+  const setWaveformMountEl = useCallback(
+    (el: HTMLDivElement | null) => {
+      waveformMountRef.current = el
+      if (!waveformEnabled || !(row.words && row.words.length > 0)) {
+        registerWaveMount?.(index, null)
+        return
+      }
+      if (waveformExpandedLineIndex === index) {
+        registerWaveMount?.(index, el)
+      } else {
+        registerWaveMount?.(index, null)
+      }
+    },
+    [waveformEnabled, waveformExpandedLineIndex, index, registerWaveMount, row.words?.length]
+  )
+
+  const wordTimeSig = useMemo(
+    () => wordRail.map((w) => `${w.start}|${w.end}`).join(';'),
+    [wordRail]
+  )
+
+  /** 파형 마운트는 단어 행과 동일 부모 폭(w-full). 타임라인·미디어 길이 바뀔 때 Peaks fit 동기화 */
+  useLayoutEffect(() => {
+    if (!waveformEnabled || waveformExpandedLineIndex !== index) return
+    onWaveformMountLayout?.()
+  }, [
+    waveformEnabled,
+    waveformExpandedLineIndex,
+    index,
+    wordTimeSig,
+    mediaDurationSec,
+    onWaveformMountLayout
+  ])
+
+  useEffect(() => {
+    if (!waveformEnabled || waveformExpandedLineIndex !== index) return
+    const art = articleRef.current
+    if (!art) return
+    const ro = new ResizeObserver(() => {
+      onWaveformMountLayout?.()
+    })
+    ro.observe(art)
+    const onWin = (): void => {
+      onWaveformMountLayout?.()
+    }
+    window.addEventListener('resize', onWin)
+    return () => {
+      ro.disconnect()
+      window.removeEventListener('resize', onWin)
+    }
+  }, [waveformEnabled, waveformExpandedLineIndex, index, onWaveformMountLayout])
+
+  useLayoutEffect(() => {
+    return () => {
+      registerWaveMount?.(index, null)
+    }
+  }, [index, registerWaveMount])
+
   useEffect(() => {
     setCaretVisible(false)
     setCaretBlink(false)
@@ -134,14 +546,14 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     setHoveredCaretIndex(null)
     spaceSeekIntentRef.current = 'none'
     setKeyboardPauseCaret(false)
-  }, [index, row.words])
+  }, [index, wordRail])
 
   useEffect(() => {
     if (!isPlaying) setKeyboardPauseCaret(false)
   }, [isPlaying])
 
   useEffect(() => {
-    const words = row.words ?? []
+    const words = wordRail
     const wi = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
     if (!isPlaying) return
     if (keyboardPauseCaret) return
@@ -159,7 +571,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     if (wi >= 0) setCaretIndex(wi)
     const activeEl = document.activeElement as HTMLElement | null
     if (activeEl?.id?.startsWith(`subtitle-caret-${index}-`)) activeEl.blur()
-  }, [index, isPlaying, playheadSec, row.words, keyboardPauseCaret])
+  }, [index, isPlaying, playheadSec, wordRail, keyboardPauseCaret])
 
   const clearSelection = () => setSelectionAnchor(null)
   const clearRowCaretState = useCallback(
@@ -309,11 +721,24 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       return
     }
 
-    if (e.key === 'Enter' && !e.shiftKey) {
+    /** Enter 줄바꿈 · Ctrl+Enter 자막 분할(커서 위치) */
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault()
-      const pos = e.currentTarget.selectionStart
+      e.stopPropagation()
+      const ta = e.currentTarget
+      const live = subtitleTextDraft !== null ? subtitleTextDraft : ta.value
+      if (live !== row.text) {
+        flushSync(() => {
+          updateSubtitleAt(index, live)
+        })
+      }
+      const pos = ta.selectionStart
       splitSubtitleAt(index, pos)
       window.setTimeout(() => requestFocusRow(index + 1, 0), 0)
+      return
+    }
+    if (e.key === 'Enter') {
+      e.stopPropagation()
       return
     }
 
@@ -336,7 +761,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
   }
 
   const playAtCaret = (nextCaret: number) => {
-    const words = row.words ?? []
+    const words = wordRail
     if (words.length === 0) {
       onWaveformSeekAndPlay(row.start)
       return
@@ -347,7 +772,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
 
   /** playhead가 속한 단어 블록 바로 앞의 캐럿 인덱스(재생 중 방향키 기준점) */
   const caretIndexBeforePlayheadWord = (): number => {
-    const words = row.words ?? []
+    const words = wordRail
     if (words.length === 0) return 0
     const inside = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
     if (inside >= 0) return inside
@@ -371,7 +796,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     const ae = document.activeElement as HTMLElement | null
     if (ae && root?.contains(ae) && ae.closest('[data-subtitle-edit]')) return
 
-    const words = row.words ?? []
+    const words = wordRail
     if (words.length === 0) return
 
     const inside = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
@@ -395,7 +820,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
         el?.focus({ preventScroll: true })
       })
     })
-  }, [activeSubtitleIndex, index, isPlaying, playheadSec, row.words])
+  }, [activeSubtitleIndex, index, isPlaying, playheadSec, wordRail])
 
   const onCaretKeyDown = (e: KeyboardEvent<HTMLButtonElement>, ci: number) => {
     e.stopPropagation()
@@ -432,7 +857,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     }
     if (e.key === 'End') {
       e.preventDefault()
-      const n = row.words?.length ?? 0
+      const n = wordRail.length
       clearSelection()
       showKeyboardCaret()
       activateCaretAt(n, true)
@@ -462,7 +887,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     if (e.key === 'ArrowRight') {
       e.preventDefault()
       showKeyboardCaret()
-      const n = row.words?.length ?? 0
+      const n = wordRail.length
       if (isPlaying) {
         clearSelection()
         const snap = caretIndexBeforePlayheadWord()
@@ -521,7 +946,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       e.preventDefault()
       clearSelection()
       showKeyboardCaret()
-      splitSubtitleAtWord(index, ci)
+      splitSubtitleAtWord(index, subtitleSplitIndexFromRailCaret(ci))
       window.setTimeout(() => requestFocusCaret(index + 1, 0), 0)
       return
     }
@@ -648,7 +1073,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     }
     if (e.key === 'ArrowRight') {
       e.preventDefault()
-      const n = row.words?.length ?? 0
+      const n = wordRail.length
       if (isPlaying) {
         const snap = caretIndexBeforePlayheadWord()
         if (n === 0 || snap >= n) {
@@ -709,7 +1134,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     }
     if (e.key === 'End') {
       e.preventDefault()
-      const n = row.words?.length ?? 0
+      const n = wordRail.length
       setCaretIndex(n)
       showKeyboardCaret()
       requestFocusCaret(index, n)
@@ -743,11 +1168,11 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
         onMouseDownCapture={(e) => {
           const t = e.target as HTMLElement
           if (t.closest('textarea') || t.closest('[data-subtitle-edit]')) return
-          if (t.closest('.subtitle-card-editor-label')) return
+          if (t.closest('.subtitle-waveform-mount')) return
           if (t.closest('.subtitle-word-chip') || t.closest('.subtitle-word-caret')) return
 
           const tryActivateFirstCaret = (): boolean => {
-            if (!(row.words && row.words.length > 0)) return false
+            if (wordRail.length === 0) return false
             e.preventDefault()
             if (isPlaying) onRequestPausePlayback()
             clearSelection()
@@ -802,9 +1227,15 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
             <span className="subtitle-time">{formatTimecode(row.end)}</span>
           </div>
         </div>
-        {row.words && row.words.length > 0 ? (
+        {wordRail.length > 0 ? (
+          <div className="subtitle-card-media-rail flex w-full min-w-0 flex-col">
           <div
-            className="subtitle-word-row"
+            ref={wordRowOuterRef}
+            className={`subtitle-word-row subtitle-word-row--wave-seamless ${
+              timelineLayoutThisRow
+                ? 'subtitle-word-row--time-proportional subtitle-word-row--wave-fit subtitle-word-row--timeline'
+                : 'subtitle-word-row--compact'
+            }`}
             onClick={(e) => e.stopPropagation()}
             onMouseLeave={() => {
               setHoveredCaretIndex(null)
@@ -817,109 +1248,182 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
               }
             }}
           >
-            <button
-              key={`caret-${index}-0`}
-              id={`subtitle-caret-${index}-0`}
-              type="button"
-              className={`subtitle-word-caret${playbackHidesCaret ? ' subtitle-word-caret--hidden' : ''}${isCaretShownAt(0) ? ' subtitle-word-caret--visible' : ''}${!playbackHidesCaret && rowHasFocus && focusedCaretIndex === 0 ? ' subtitle-word-caret--active' : ''}${!playbackHidesCaret && caretBlink && rowHasFocus && focusedCaretIndex === 0 ? ' subtitle-word-caret--blink' : ''}`}
-              tabIndex={0}
-              onClick={() => {
-                activateCaretAt(0, true)
-              }}
-              onFocus={() => {
-                syncCaretFromFocus(0)
-              }}
-              onMouseEnter={() => {
-                setCaretVisible(true)
-                setCaretBlink(false)
-                setHoveredCaretIndex(0)
-                setCaretIndex(0)
-              }}
-              onKeyDown={(e) => onCaretKeyDown(e, 0)}
-              aria-label="단어 사이 커서 0"
-            />
-            {row.words.map((w, wi) => {
-              const isWordActive = isPlaying && playheadSec >= w.start && playheadSec < w.end
-              return (
-                <div key={`${index}-${wi}-${w.start}`} className="subtitle-word-slot">
-                  <button
-                    id={`subtitle-word-${index}-${wi}`}
-                    type="button"
-                    tabIndex={-1}
-                    className={`subtitle-word-chip${isWordActive ? ' subtitle-word-chip--active' : ''}`}
-                    onMouseEnter={() => {
-                      setCaretIndex(wi)
-                      showStaticCaret()
-                      setHoveredCaretIndex(wi)
-                    }}
-                    onClick={() => {
-                      onWordBlockClick(w.start)
-                      if (isPlaying) {
-                        onRequestPausePlayback()
-                      }
-                      clearSelection()
-                      activateCaretAt(wi, true)
-                    }}
-                    onMouseDown={(e) => {
-                      // 클릭하면 해당 단어 "앞" 위치로 커서를 고정한다.
-                      e.preventDefault()
-                      if (isPlaying) {
-                        onRequestPausePlayback()
-                      }
-                      clearSelection()
-                      activateCaretAt(wi, true)
-                    }}
-                    title={`${formatTimecode(w.start)} ~ ${formatTimecode(w.end)}`}
+            <LayoutGroup id={`subtitle-word-line-${index}`}>
+            <div
+              ref={wordRowInnerRef}
+              className={`subtitle-word-row-scale-inner ${
+                timelineLayoutThisRow
+                  ? 'subtitle-word-row-scale-inner--timeline'
+                  : 'subtitle-word-row-scale-inner--compact'
+              }`}
+            >
+            <div
+              className={`subtitle-word-row-tracks ${
+                timelineLayoutThisRow
+                  ? 'subtitle-word-row-tracks--timeline'
+                  : 'subtitle-word-row-tracks--compact'
+              }`}
+            >
+              {wordRail.map((rw, wi) => {
+                const isWordActive = isPlaying && playheadSec >= rw.start && playheadSec < rw.end
+                const chipWordId = vrewRows?.[index]?.words?.[wi]?.id
+                const wordMotionKey =
+                  chipWordId != null ? `wid-${chipWordId}` : `w-${index}-${rw.start}-${rw.end}`
+                const isActiveWaveformChip =
+                  timelineLayoutThisRow &&
+                  waveformActiveWordId != null &&
+                  chipWordId === waveformActiveWordId
+                return (
+                  <motion.div
+                    key={wordMotionKey}
+                    layout={timelineLayoutThisRow}
+                    initial={false}
+                    transition={WORD_LAYOUT_SPRING}
+                    className={`subtitle-word-slot${timelineLayoutThisRow ? '' : ' subtitle-word-slot--compact'}`}
+                    style={
+                      timelineLayoutThisRow && wordTimeline
+                        ? wordChipSlotStyle(rw, wordTimeline)
+                        : undefined
+                    }
                   >
-                    <span
-                      className={
-                        hasSelection && wi >= selStart && wi < selEnd
-                          ? 'subtitle-word-chip-text subtitle-word-chip-text--selected'
-                          : 'subtitle-word-chip-text'
-                      }
+                    <motion.button
+                      layout={timelineLayoutThisRow}
+                      initial={false}
+                      transition={WORD_LAYOUT_SPRING}
+                      id={`subtitle-word-${index}-${wi}`}
+                      type="button"
+                      tabIndex={-1}
+                      data-word-start={rw.start}
+                      data-word-end={rw.end}
+                      data-waveform-active-word-chip={isActiveWaveformChip ? '1' : undefined}
+                      className={`subtitle-word-chip subtitle-word-chip--proportional${isWordActive ? ' subtitle-word-chip--active' : ''}${rw.isSilence ? ' subtitle-word-chip--silence' : ''}`}
+                      onMouseEnter={() => {
+                        setCaretIndex(wi)
+                        showStaticCaret()
+                        setHoveredCaretIndex(wi)
+                      }}
+                      onClick={() => {
+                        onWordBlockClick(rw.start)
+                        if (isPlaying) {
+                          onRequestPausePlayback()
+                        }
+                        clearSelection()
+                        activateCaretAt(wi, true)
+                      }}
+                      onMouseDown={(e) => {
+                        // 클릭하면 해당 단어 "앞" 위치로 커서를 고정한다.
+                        // 더블클릭의 두 번째 mousedown(detail>1)에서 preventDefault 하면 dblclick이 막힐 수 있음
+                        if (e.detail > 1) return
+                        e.preventDefault()
+                        if (isPlaying) {
+                          onRequestPausePlayback()
+                        }
+                        clearSelection()
+                        activateCaretAt(wi, true)
+                      }}
+                      onDoubleClick={(e) => {
+                        if (!waveformEnabled || !onWaveformWordDoubleClick) return
+                        e.preventDefault()
+                        e.stopPropagation()
+                        onWaveformWordDoubleClick(index, wi)
+                      }}
+                      title={`${formatTimecode(rw.start)} ~ ${formatTimecode(rw.end)}`}
                     >
-                      {w.word}
-                    </span>
-                  </button>
+                      <span
+                        className={
+                          hasSelection && wi >= selStart && wi < selEnd
+                            ? 'subtitle-word-chip-text subtitle-word-chip-text--selected'
+                            : 'subtitle-word-chip-text'
+                        }
+                      >
+                        {rw.label}
+                      </span>
+                    </motion.button>
+                  </motion.div>
+                )
+              })}
+            </div>
+            {!timelineLayoutThisRow ? (
+            <div className="subtitle-word-carets-overlay" aria-hidden={false}>
+              {Array.from({ length: wordRail.length + 1 }, (_, k) => {
+                const n = wordRail.length
+                const edgeStyle = getWordCaretEdgeStyle(k, n)
+                const ty = measuredCaretTopPx?.[k]
+                const caretCls = `subtitle-word-caret subtitle-word-caret--overlay${playbackHidesCaret ? ' subtitle-word-caret--hidden' : ''}${isCaretShownAt(k) ? ' subtitle-word-caret--visible' : ''}${!playbackHidesCaret && rowHasFocus && focusedCaretIndex === k ? ' subtitle-word-caret--active' : ''}${!playbackHidesCaret && caretBlink && rowHasFocus && focusedCaretIndex === k ? ' subtitle-word-caret--blink' : ''}`
+                return (
                   <button
-                    key={`caret-${index}-${wi + 1}`}
-                    id={`subtitle-caret-${index}-${wi + 1}`}
+                    key={`caret-${index}-${k}`}
+                    id={`subtitle-caret-${index}-${k}`}
                     type="button"
-                    className={`subtitle-word-caret${playbackHidesCaret ? ' subtitle-word-caret--hidden' : ''}${isCaretShownAt(wi + 1) ? ' subtitle-word-caret--visible' : ''}${!playbackHidesCaret && rowHasFocus && focusedCaretIndex === wi + 1 ? ' subtitle-word-caret--active' : ''}${!playbackHidesCaret && caretBlink && rowHasFocus && focusedCaretIndex === wi + 1 ? ' subtitle-word-caret--blink' : ''}`}
+                    style={
+                      ty != null && Number.isFinite(ty)
+                        ? { ...edgeStyle, top: ty }
+                        : edgeStyle
+                    }
+                    className={caretCls}
                     tabIndex={0}
                     onClick={() => {
-                      clearSelection()
-                      activateCaretAt(wi + 1, true)
+                      if (k > 0) clearSelection()
+                      activateCaretAt(k, true)
                     }}
                     onFocus={() => {
-                      syncCaretFromFocus(wi + 1)
+                      syncCaretFromFocus(k)
                     }}
                     onMouseEnter={() => {
                       setCaretVisible(true)
                       setCaretBlink(false)
-                      setHoveredCaretIndex(wi + 1)
-                      setCaretIndex(wi + 1)
+                      setHoveredCaretIndex(k)
+                      setCaretIndex(k)
                     }}
-                    onKeyDown={(e) => onCaretKeyDown(e, wi + 1)}
-                    aria-label={`단어 사이 커서 ${wi + 1}`}
+                    onKeyDown={(e) => onCaretKeyDown(e, k)}
+                    aria-label={`단어 사이 커서 ${k}`}
                   />
-                </div>
-              )
-            })}
+                )
+              })}
+            </div>
+            ) : null}
+            </div>
+            </LayoutGroup>
+          </div>
+        {waveformEnabled ? (
+          <div
+            className={`subtitle-waveform-accordion min-h-0 w-full overflow-hidden transition-[max-height] duration-100 ease-out ${
+              waveformExpandedLineIndex === index
+                ? 'max-h-[min(760px,78vh)]'
+                : 'max-h-0 min-h-0'
+            }`}
+          >
+            <div
+              ref={setWaveformMountEl}
+              data-waveform-mount-for-open-line={waveformExpandedLineIndex === index ? '1' : undefined}
+              className="subtitle-waveform-mount relative z-10 w-full min-h-0 min-w-0 border-t border-white/[0.08] bg-transparent"
+            />
           </div>
         ) : null}
-        <label className="subtitle-card-editor-label" htmlFor={`subtitle-v-${index}`}>
-          자막 텍스트
-        </label>
+          </div>
+        ) : null}
         <textarea
           id={`subtitle-v-${index}`}
+          ref={subtitleTextareaRef}
           className="subtitle-card-textarea subtitle-card-textarea--virtual"
           data-subtitle-edit
-          value={row.text}
-          onChange={(e) => updateSubtitleAt(index, e.target.value)}
+          aria-label="자막 텍스트"
+          value={subtitleTextDisplay}
+          onChange={(e) => {
+            setSubtitleTextDraft(e.target.value)
+          }}
           onFocus={() => {
+            setSubtitleTextDraft(row.text)
             setCaretVisible(false)
             setCaretBlink(false)
+          }}
+          onBlur={() => {
+            const el = subtitleTextareaRef.current
+            const cur = subtitleTextDraft !== null ? subtitleTextDraft : el?.value ?? row.text
+            if (cur !== row.text) {
+              updateSubtitleAt(index, cur)
+            }
+            setSubtitleTextDraft(null)
           }}
           onKeyDown={onTextareaKeyDown}
           onClick={(e) => e.stopPropagation()}
@@ -945,27 +1449,56 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     lastCardFocusRef.current = cardIndex
   }, [])
 
+  /** 파동 펼침 줄은 가상 목록 밖으로 나가면 마운트가 사라져 포털이 보이지 않음 → 즉시 스크롤 + 짧은 재시도 */
+  useEffect(() => {
+    const idx = props.waveformExpandedLineIndex
+    if (idx === null || idx === undefined || idx < 0) return
+    const scroll = () => {
+      try {
+        listRef.current?.scrollToRow({
+          index: idx,
+          align: 'center',
+          behavior: 'instant'
+        })
+      } catch {
+        /* ignore */
+      }
+    }
+    scroll()
+    const t1 = window.setTimeout(scroll, 40)
+    const t2 = window.setTimeout(scroll, 120)
+    const t3 = window.setTimeout(scroll, 220)
+    return () => {
+      window.clearTimeout(t1)
+      window.clearTimeout(t2)
+      window.clearTimeout(t3)
+    }
+  }, [props.waveformExpandedLineIndex, size.h, size.w])
+
   const requestFocusRow = useCallback((index: number, caret: number | 'end') => {
     if (index < 0) return
     const row = subtitles[index]
-    if (row && lastCardFocusRef.current !== index) {
+    const crossedIntoOtherCard = lastCardFocusRef.current !== index
+    if (row && crossedIntoOtherCard) {
       props.onCardNavigate(row.start)
     }
     lastCardFocusRef.current = index
-    try {
-      listRef.current?.scrollToRow({
-        index,
-        align: 'center',
-        behavior: 'instant'
-      })
-    } catch {
-      return
+    if (crossedIntoOtherCard) {
+      try {
+        listRef.current?.scrollToRow({
+          index,
+          align: 'center',
+          behavior: 'instant'
+        })
+      } catch {
+        return
+      }
     }
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         const ta = document.getElementById(`subtitle-v-${index}`) as HTMLTextAreaElement | null
         if (!ta) return
-        ta.focus()
+        ta.focus({ preventScroll: true })
         if (caret === 'end') {
           const len = ta.value.length
           ta.setSelectionRange(len, len)
@@ -989,24 +1522,27 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
   const requestFocusCaret = useCallback((cardIndex: number, caretIndex: number) => {
     if (cardIndex < 0 || caretIndex < 0) return
     const row = subtitles[cardIndex]
-    if (row && lastCardFocusRef.current !== cardIndex) {
+    const crossedIntoOtherCard = lastCardFocusRef.current !== cardIndex
+    if (row && crossedIntoOtherCard) {
       props.onCardNavigate(row.start)
     }
     lastCardFocusRef.current = cardIndex
-    try {
-      listRef.current?.scrollToRow({
-        index: cardIndex,
-        align: 'center',
-        behavior: 'instant'
-      })
-    } catch {
-      return
+    if (crossedIntoOtherCard) {
+      try {
+        listRef.current?.scrollToRow({
+          index: cardIndex,
+          align: 'center',
+          behavior: 'instant'
+        })
+      } catch {
+        return
+      }
     }
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         const el = document.getElementById(`subtitle-caret-${cardIndex}-${caretIndex}`) as HTMLButtonElement | null
         if (!el) return
-        el.focus()
+        el.focus({ preventScroll: true })
       })
     })
   }, [subtitles, props.onCardNavigate])
@@ -1097,7 +1633,16 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       navigateSubtitleField,
       requestFocusWord: requestFocusCaret,
       requestFocusCard,
-      registerCardFocus
+      registerCardFocus,
+      waveformEnabled: props.waveformEnabled,
+      registerWaveMount: props.registerWaveMount,
+      waveformExpandedLineIndex: props.waveformExpandedLineIndex,
+      waveformActiveWordId: props.waveformActiveWordId,
+      onWaveformWordDoubleClick: props.onWaveformWordDoubleClick,
+      vrewRows: props.vrewRows,
+      onWaveformMountLayout: props.onWaveformMountLayout,
+      mediaDurationSec: props.mediaDurationSec,
+      peaksZoomViewRange: props.peaksZoomViewRange
     }),
     [
       subtitles,
@@ -1122,6 +1667,15 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.splitSubtitleAt,
       props.mergeEmptySubtitleAt,
       props.formatTimecode,
+      props.waveformEnabled,
+      props.registerWaveMount,
+      props.waveformExpandedLineIndex,
+      props.waveformActiveWordId,
+      props.onWaveformWordDoubleClick,
+      props.vrewRows,
+      props.onWaveformMountLayout,
+      props.mediaDurationSec,
+      props.peaksZoomViewRange,
       requestFocusRow,
       navigateSubtitleField,
       requestFocusCaret,
@@ -1129,6 +1683,21 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       registerCardFocus
     ]
   )
+
+  /** 고정 행 높이 대신 실제 카드 DOM 높이 측정 — 파형 펼침/접힘에 따라 행마다 빈 슬롯이 생기던 문제 완화 */
+  const dynamicRowHeightKey = useMemo(
+    () => `${subtitles.length}-${props.waveformExpandedLineIndex ?? 'x'}`,
+    [subtitles.length, props.waveformExpandedLineIndex]
+  )
+  const dynamicRowHeight = useDynamicRowHeight({
+    defaultRowHeight: SUBTITLE_LIST_ROW_HEIGHT,
+    key: dynamicRowHeightKey
+  })
+
+  const waveExpanded =
+    props.waveformExpandedLineIndex !== null &&
+    props.waveformExpandedLineIndex !== undefined &&
+    props.waveformExpandedLineIndex >= 0
 
   return (
     <div ref={containerRef} className="subtitle-virtual-root">
@@ -1138,10 +1707,11 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
           className="subtitle-virtual-list"
           style={{ height: size.h, width: size.w }}
           rowCount={subtitles.length}
-          rowHeight={SUBTITLE_LIST_ROW_HEIGHT}
+          rowHeight={dynamicRowHeight}
           rowComponent={SubtitleVirtualRow}
           rowProps={rowProps}
-          overscanCount={8}
+          /** 160 은 스크롤 밖까지 수백 행을 마운트해 타이핑 시 전체가 버벅였음 — 파형 줄도 소량 overscan 으로 충분 */
+          overscanCount={waveExpanded ? 10 : 6}
         />
       ) : null}
     </div>

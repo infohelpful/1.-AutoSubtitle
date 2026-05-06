@@ -3,6 +3,8 @@ export type SubtitleWord = {
   start: number
   end: number
   word: string
+  /** true: gap-fill 등으로 삽입된 무음 구간(표시용 `word`는 보통 `??`) */
+  isSilence?: boolean
 }
 
 export type SubtitleLine = {
@@ -32,8 +34,20 @@ export function parseSubtitleLines(raw: unknown): SubtitleLine[] {
       const ws = Number(w.start)
       const we = Number(w.end)
       const ww = typeof w.word === 'string' ? w.word : ''
-      if (!Number.isFinite(ws) || !Number.isFinite(we) || ww.trim().length === 0) continue
-      words.push({ start: ws, end: we, word: ww.trim() })
+      const isSilence =
+        w.isSilence === true ||
+        (typeof (w as { is_silence?: unknown }).is_silence === 'boolean' &&
+          (w as { is_silence?: boolean }).is_silence === true)
+      if (!Number.isFinite(ws) || !Number.isFinite(we)) continue
+      if (ww.trim().length === 0 && !isSilence) continue
+      const tw = ww.trim()
+      const entry: SubtitleWord = {
+        start: ws,
+        end: we,
+        word: isSilence ? '' : tw.length > 0 ? tw : '??'
+      }
+      if (isSilence) entry.isSilence = true
+      words.push(entry)
     }
     if (!Number.isFinite(start) || !Number.isFinite(end)) continue
     out.push({ start, end, text, words })

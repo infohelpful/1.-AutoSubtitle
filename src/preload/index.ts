@@ -14,7 +14,8 @@ import {
   type OpenVideoDialogResult,
   type ProjectOpenResult,
   type ProjectSaveAsResult,
-  type ProjectSaveResult
+  type ProjectSaveResult,
+  type WaveformPeaksCachePathResult
 } from '../shared/ipc'
 
 const CH_PROGRESS = 'model:download-progress'
@@ -53,6 +54,16 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('dialog:openVideo') as Promise<OpenVideoDialogResult>,
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   getMediaFileUrl: (absoluteFilePath: string) => pathToFileURL(absoluteFilePath).href,
+  readLocalMediaFileBuffer: (absoluteFilePath: string) =>
+    ipcRenderer.invoke('media:readFileBuffer', absoluteFilePath) as Promise<
+      { ok: true; arrayBuffer: ArrayBuffer } | { ok: false; reason: string }
+    >,
+  readLocalPeaksJsonFile: (absoluteFilePath: string) =>
+    ipcRenderer.invoke('media:readPeaksJson', absoluteFilePath) as Promise<
+      { ok: true; json: unknown } | { ok: false; reason: string }
+    >,
+  getWaveformPeaksCachePath: (absoluteVideoPath: string) =>
+    ipcRenderer.invoke('waveform:getPeaksCachePath', absoluteVideoPath) as Promise<WaveformPeaksCachePathResult>,
   sidecarCall: (method: string, params?: Record<string, unknown>) =>
     ipcRenderer.invoke('sidecar:call', method, params) as Promise<unknown>,
   getDepsStatus: () => ipcRenderer.invoke('deps:status'),
@@ -123,5 +134,17 @@ contextBridge.exposeInMainWorld('api', {
   saveProjectFile: (path: string, content: string) =>
     ipcRenderer.invoke('project:save', { path, content }) as Promise<ProjectSaveResult>,
   saveProjectFileAs: (content: string, defaultPath?: string) =>
-    ipcRenderer.invoke('project:saveAs', { content, defaultPath }) as Promise<ProjectSaveAsResult>
+    ipcRenderer.invoke('project:saveAs', { content, defaultPath }) as Promise<ProjectSaveAsResult>,
+  logWaveformDebug: (scope: string, message: string, ...details: unknown[]) =>
+    ipcRenderer.invoke('debug:waveform-log', {
+      scope,
+      message,
+      details
+    }) as Promise<{ ok: true; path: string }>,
+  logTimelineEdit: (scope: string, message: string, ...details: unknown[]) =>
+    ipcRenderer.invoke('debug:timeline-log', {
+      scope,
+      message,
+      details
+    }) as Promise<{ ok: true; path: string }>
 })

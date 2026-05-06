@@ -3,6 +3,8 @@
   font-family: system-ui, 'Segoe UI', sans-serif;
   background: #0f1115;
   color: #e8eaed;
+  /** 자막 카드 세로 간격 — 한 값만 바꾸면 전체 동기화 */
+  --sv-gap: 10px;
 }
 
 html,
@@ -258,7 +260,7 @@ body {
   cursor: not-allowed;
 }
 
-/* 60% / 40% 가로 분할 — 전체는 스크롤 없음 */
+/* 기본 약 50/50, 드래그 시 미리보기 35~65% — 자막 쪽 최대 65%까지 */
 .layout-split {
   flex: 1;
   display: flex;
@@ -282,6 +284,7 @@ body {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
@@ -401,8 +404,8 @@ body {
   align-items: stretch;
   justify-content: space-between;
   flex-wrap: nowrap;
-  gap: 0.55rem;
-  padding: 0.58rem 0.9rem;
+  gap: 0.45rem;
+  padding: 0.38rem 0.75rem;
   box-sizing: border-box;
   border-bottom: 1px solid #2b3648;
   background: linear-gradient(180deg, rgba(9, 13, 20, 0.98) 0%, rgba(11, 16, 24, 0.94) 100%);
@@ -418,8 +421,8 @@ body {
   display: grid;
   /* 열별 너비 = 위·아래 중 더 긴 쪽; 칸 안 카드는 width:100% 로 빈칸 없이 맞춤 */
   grid-template-columns: repeat(4, auto);
-  column-gap: 0.45rem;
-  row-gap: 0.45rem;
+  column-gap: 0.32rem;
+  row-gap: 0.28rem;
   align-items: stretch;
 }
 
@@ -441,7 +444,7 @@ body {
   grid-template-columns: minmax(200px, 260px) minmax(5.5rem, auto);
   /* 왼쪽 형식·오른쪽 내보내기 버튼 모두 왼쪽 자막 옵션 2줄과 같은 높이로 한 줄 그리드에서 꽉 채움 */
   grid-template-rows: 1fr;
-  gap: 0.45rem 0.5rem;
+  gap: 0.32rem 0.45rem;
   align-items: stretch;
   align-self: stretch;
   min-height: 0;
@@ -456,8 +459,8 @@ body {
   align-items: center;
   justify-content: center;
   min-height: 0;
-  padding: 0.5rem 0.75rem;
-  font-size: 0.88rem;
+  padding: 0.38rem 0.65rem;
+  font-size: 0.85rem;
 }
 
 .preview-export-format {
@@ -489,16 +492,16 @@ body {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 0.35rem;
-  font-size: 0.8rem;
+  gap: 0.28rem;
+  font-size: 0.78rem;
   color: #c3d4f1;
   white-space: nowrap;
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
-  min-height: 44px;
-  padding: 0.35rem 0.48rem;
-  border-radius: 10px;
+  min-height: 34px;
+  padding: 0.22rem 0.4rem;
+  border-radius: 8px;
   border: 1px solid rgba(72, 96, 132, 0.6);
   background: linear-gradient(180deg, rgba(21, 30, 44, 0.82) 0%, rgba(14, 20, 31, 0.8) 100%);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
@@ -525,7 +528,7 @@ body {
 .preview-subtitle-font-input {
   min-width: 0;
   width: 100%;
-  height: 1.7rem;
+  height: 1.52rem;
   border-radius: 6px;
   border: 1px solid #405271;
   background: #111b2a;
@@ -697,13 +700,34 @@ body {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 0.75rem 1rem 0.75rem 0.85rem;
+  /** 세로는 유지, 가로만 줄여 단어줄·파형 트랙 폭 확보 */
+  padding: var(--sv-gap, 10px) 0.28rem;
   box-sizing: border-box;
 }
 
 .subtitle-panel-head {
   flex-shrink: 0;
-  margin-bottom: 0.65rem;
+  margin-bottom: var(--sv-gap, 10px);
+}
+
+.subtitle-panel-head-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem 0.75rem;
+}
+
+.subtitle-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+
+.subtitle-panel-action-btn {
+  padding: 0.28rem 0.5rem;
+  font-size: 0.72rem;
 }
 
 .subtitle-panel-title {
@@ -728,10 +752,18 @@ body {
   overflow: hidden;
 }
 
+.subtitle-list-stack {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .subtitle-empty-placeholder {
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -757,19 +789,31 @@ body {
 
 .subtitle-virtual-list {
   overflow-x: hidden;
+  /* react-window List 가 세로 스크롤을 쓰지만 스크롤바는 숨김 — 휠·터치로만 이동 */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.subtitle-virtual-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 .subtitle-virtual-row {
   box-sizing: border-box;
-  padding-right: 2px;
-  padding-bottom: 4px;
+  padding-right: 0;
+  padding-bottom: var(--sv-gap, 10px);
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .subtitle-card {
   position: relative;
   cursor: pointer;
+  box-sizing: border-box;
   padding: 0.75rem 0.85rem;
   border-radius: 10px;
   border: 1px solid #323b4e;
@@ -854,57 +898,378 @@ body {
 
 .subtitle-card-textarea:focus {
   outline: none;
-  border-color: #4a6fa5;
-  box-shadow: 0 0 0 1px rgba(74, 111, 165, 0.4);
+  border-color: #343d52;
+  box-shadow: none;
 }
 
+.subtitle-card-textarea:focus-visible {
+  outline: none;
+}
+
+/** 가상 행 높이(고정)를 꽉 채우지 않음 — flex gap 만 세로 간격(레이블 DOM 제거로 gap 이 실제로 적용됨) */
 .subtitle-card--virtual {
-  flex: 1;
-  min-height: 0;
+  flex: 0 0 auto;
+  align-self: stretch;
   width: 100%;
+  min-height: 0;
+  height: auto;
+  max-height: none;
   margin: 0;
-  padding: 0.36rem 0.5rem;
+  padding: var(--sv-gap, 10px) 0.28rem;
   display: flex;
   flex-direction: column;
+  flex-wrap: nowrap;
+  gap: var(--sv-gap, 10px);
+  row-gap: var(--sv-gap, 10px);
+  justify-content: flex-start;
+  overflow: hidden;
 }
 
 .subtitle-card--virtual .subtitle-card-head {
-  margin-bottom: 0.35rem;
+  flex: 0 0 auto;
+  margin-bottom: 0;
+}
+
+.subtitle-card--virtual .subtitle-word-row {
+  margin-bottom: 0;
+}
+
+.subtitle-card--virtual .subtitle-card-media-rail {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+  padding-bottom: 0;
+  gap: var(--sv-gap, 10px);
+  row-gap: var(--sv-gap, 10px);
+}
+
+/** Peaks 포털: zoom / overview 사이 */
+.subtitle-waveform-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sv-gap, 10px);
+  row-gap: var(--sv-gap, 10px);
+}
+
+/** Phase 3: 단어 행 + 파형 1:1 — `.subtitle-card--virtual` 가로 패딩만큼 끌어올려 카드 안 최대 폭 */
+.subtitle-card-media-rail {
+  box-sizing: border-box;
+  min-width: 0;
+  flex: 0 0 auto;
+  /** min-height:0 은 내부에 불필요한 세로 스크롤 포트를 만들 수 있어 자연 높이 사용 */
+  min-height: auto;
+  margin-left: -0.28rem;
+  margin-right: -0.28rem;
+  width: calc(100% + 0.56rem);
+  max-width: none;
+  scrollbar-width: none;
+}
+
+/** 레일 자체가 스크롤 영역으로 잡히는 경우 세로·불필요 트랙 숨김 — 단어 줄 가로 스크롤은 `.subtitle-word-row`에서 처리 */
+.subtitle-card-media-rail::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .subtitle-word-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.16rem;
+  gap: 0.32rem;
   align-items: center;
-  margin-bottom: 0.32rem;
+  margin-bottom: 0;
+}
+
+/** 단어 타일: 가로로 빈틈 없이(시간 비율 flex) — 자막 카드 간격은 .subtitle-virtual-row 쪽 */
+.subtitle-word-row--wave-seamless {
+  align-items: stretch;
+  position: relative;
+  min-height: 2.75rem;
+  /** WebKit: 가로 스크롤만 두께 유지, 세로 막대(width)는 0 — 단어 줄 오른쪽 세로 스크롤 제거 */
+  scrollbar-gutter: auto;
+}
+
+.subtitle-word-row.subtitle-word-row--wave-seamless::-webkit-scrollbar {
+  width: 0;
+  height: 8px;
+}
+
+.subtitle-word-row-tracks {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 0;
+  width: 100%;
+  min-height: 2.75rem;
+}
+
+.subtitle-word-carets-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+}
+
+/**
+ * 캐럿 버튼: 가로는 인라인 left, 세로는 측정된 px top(캐럿마다 다름) 또는 폴백 50%.
+ * transform 은 여기서만 — 인라인과 이중 적용 금지.
+ */
+.subtitle-word-carets-overlay .subtitle-word-caret--overlay {
+  pointer-events: auto;
+  position: absolute;
+  top: 50%;
+  bottom: auto;
+  width: 7px;
+  height: var(--subtitle-caret-bar-height, 2.35rem);
+  min-height: 0;
+  z-index: 1;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  line-height: 0;
+  font-size: 0;
+  transform: translate(-50%, -50%);
+  box-sizing: border-box;
+}
+
+.subtitle-word-carets-overlay .subtitle-word-caret {
+  width: 7px;
+}
+
+.subtitle-word-carets-overlay .subtitle-word-caret--overlay::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  height: auto;
+  transform: translateX(-50%);
+  background: #ffd84d;
+  box-shadow: 0 0 5px rgba(255, 216, 77, 0.45);
+}
+
+.subtitle-word-carets-overlay .subtitle-word-caret--overlay.subtitle-word-caret--visible::before,
+.subtitle-word-carets-overlay .subtitle-word-caret--overlay:focus-visible::before {
+  background: #ffd84d;
+  box-shadow: 0 0 6px rgba(255, 216, 77, 0.55);
+}
+
+.subtitle-word-carets-overlay .subtitle-word-caret--overlay.subtitle-word-caret--active::before {
+  background: #ffe566;
+  box-shadow: 0 0 8px rgba(255, 228, 102, 0.65);
+}
+
+.subtitle-word-carets-overlay .subtitle-word-caret--overlay.subtitle-word-caret--blink::before {
+  background: #fff59b;
+  box-shadow: 0 0 10px rgba(255, 241, 155, 0.55);
+}
+
+/** Phase 2: duration 비율 타일 — 한 줄 유지 */
+.subtitle-word-row--time-proportional {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-gutter: auto;
+}
+
+/** 가로 맞춤(scaleX) 시 스크롤 제거 — 자식 intrinsic 폭으로 축소 */
+.subtitle-word-row--time-proportional.subtitle-word-row--wave-fit {
+  overflow-x: hidden;
+  overflow-y: hidden;
+  scrollbar-gutter: auto;
+  max-width: 100%;
+}
+
+.subtitle-word-row-scale-inner {
+  position: relative;
+  width: max-content;
+  min-width: 100%;
+  max-width: none;
+  box-sizing: border-box;
+}
+
+.subtitle-word-row--wave-fit .subtitle-word-row-tracks {
+  width: max-content;
+  min-width: 100%;
+}
+
+/** 단어 칩 = Peaks 줌과 동일 구간·선형 시간축 */
+.subtitle-word-row--timeline.subtitle-word-row--wave-fit .subtitle-word-row-tracks--timeline {
+  width: 100%;
+  min-width: 0;
+}
+
+.subtitle-word-row-scale-inner--timeline {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.subtitle-word-row-tracks--timeline {
+  display: block !important;
+  position: relative !important;
+  width: 100% !important;
+  min-height: 2.75rem;
+  box-sizing: border-box;
+  flex-direction: unset !important;
+}
+
+/** 인라인 left/width% 가 flex 항목으로 뭉개지지 않게 — 타임라인은 절대 배치만 */
+.subtitle-word-row-tracks--timeline > .subtitle-word-slot {
+  position: absolute !important;
+  top: 0 !important;
+  bottom: 0 !important;
+  display: flex !important;
+  align-items: stretch !important;
+  float: none !important;
+  overflow: hidden;
+}
+
+.subtitle-word-row-tracks--timeline .subtitle-word-chip {
+  width: 100%;
+  min-width: 0 !important;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+/** 파형 닫힘·다른 줄: 단어 칩 줄바꿈·가로 스크롤 없음 (읽기 모드) */
+.subtitle-word-row--compact.subtitle-word-row--wave-seamless {
+  flex-wrap: wrap;
+  overflow-x: hidden;
+  overflow-y: visible;
+  align-items: center;
+  min-height: 2.75rem;
+}
+
+.subtitle-word-row-scale-inner--compact {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  position: relative;
+}
+
+.subtitle-word-row-tracks--compact {
+  display: flex !important;
+  flex-direction: row;
+  flex-wrap: wrap !important;
+  align-items: center;
+  gap: 0.32rem;
+  row-gap: 0.28rem;
+  width: 100%;
+  min-width: 0;
+  min-height: auto;
+  position: relative;
+  overflow-x: hidden;
+  box-sizing: border-box;
+}
+
+.subtitle-word-row-tracks--compact > .subtitle-word-slot--compact {
+  position: relative !important;
+  width: auto !important;
+  flex: 0 0 auto;
+  top: auto !important;
+  bottom: auto !important;
+  left: auto !important;
+  padding: 0;
+}
+
+.subtitle-word-row-tracks--compact .subtitle-word-chip--proportional {
+  width: auto;
+  min-width: auto;
+  min-height: auto;
+  height: auto;
+  align-self: auto;
+}
+
+.subtitle-word-row-tracks--compact .subtitle-word-chip--proportional .subtitle-word-chip-text {
+  width: auto;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+}
+
+.subtitle-word-chip--silence {
+  opacity: 0.72;
+  font-size: 14px;
 }
 
 .subtitle-word-slot {
   display: inline-flex;
   align-items: center;
   gap: 0.16rem;
+  min-width: 0;
+}
+
+.subtitle-word-row--time-proportional .subtitle-word-slot {
+  display: flex;
+}
+
+.subtitle-word-row--wave-seamless .subtitle-word-slot {
+  gap: 0;
+  /** 타임라인 슬롯(시간 %) 안에서 칩을 안쪽으로 — 단어블록 사이 시각적 공백 */
+  padding: 0 0.32rem;
+  box-sizing: border-box;
+}
+
+.subtitle-word-row--wave-seamless .subtitle-word-slot + .subtitle-word-slot {
+  margin-left: 0;
 }
 
 .subtitle-word-chip {
   border: 1px solid #3a465d;
+  /** 아래쪽만 밝게 — 단어 블록 가로 띠에서 하단 경계가 잘 보이게 */
+  border-bottom-color: rgba(255, 255, 255, 0.32);
   background: #141a26;
   color: #c8d4e9;
-  border-radius: 7px;
-  padding: 0.14rem 0.5rem;
-  font-size: 15px;
-  line-height: 1.28;
+  border-radius: 10px;
+  padding: 0.18rem 0.48rem;
+  font-size: 16px;
+  line-height: 1.3;
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.35);
+}
+
+.subtitle-word-chip--proportional {
+  width: 100%;
+  min-width: 2.5rem;
+  min-height: 2.75rem;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.subtitle-word-row--wave-seamless .subtitle-word-chip--proportional {
+  min-width: 0;
+  border-radius: 10px;
+  align-self: stretch;
+  height: auto;
+}
+
+.subtitle-word-chip--proportional .subtitle-word-chip-text {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
+  word-break: keep-all;
+  line-height: 1.25;
 }
 
 .subtitle-word-chip:hover {
   border-color: #5d7aa7;
+  border-bottom-color: rgba(255, 255, 255, 0.42);
   background: #1d2940;
 }
 
 .subtitle-word-chip--active {
   border-color: #ffd84d;
+  border-bottom-color: rgba(255, 248, 210, 0.65);
   background: linear-gradient(180deg, #3a3f00 0%, #2a2f00 100%);
   color: #fffdf0;
   box-shadow:
@@ -914,8 +1279,12 @@ body {
 
 .subtitle-word-chip-text {
   display: inline-block;
-  border-radius: 4px;
-  padding: 0 1px;
+  border-radius: 6px;
+  padding: 0 2px;
+}
+
+.subtitle-word-row--wave-seamless .subtitle-word-chip-text {
+  border-radius: 6px;
 }
 
 .subtitle-word-chip-text--selected {
@@ -965,9 +1334,7 @@ body {
 }
 
 .subtitle-word-caret:focus-visible {
-  outline: 1px solid rgba(255, 224, 138, 0.5);
-  outline-offset: 1px;
-  border-radius: 2px;
+  outline: none;
 }
 
 @keyframes word-caret-blink {
@@ -983,10 +1350,26 @@ body {
 
 .subtitle-card-textarea--virtual {
   flex: 0 0 auto;
-  min-height: 2.7rem;
-  max-height: 2.7rem;
+  margin-top: 0;
+  min-height: 2.75rem;
+  max-height: min(42vh, 14rem);
   resize: none;
   overflow-y: auto;
+  overflow-x: hidden;
+  field-sizing: content;
+  padding: 0.375rem 0.5rem;
+  font-size: 0.88rem;
+  line-height: 1.35;
+  border-radius: 8px;
+  /** 스크롤은 유지하되 카드 오른쪽 트랙은 숨김 */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.subtitle-card-textarea--virtual::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 .main-workspace--inactive {

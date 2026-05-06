@@ -12,10 +12,23 @@ import {
   unlinkSync,
   writeFileSync
 } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { PythonSidecar } from './sidecar'
 import { ffmpegReadyForUse, getBundledFfmpegPath, getFfmpegUserBinDir, systemFfmpegWorks } from './ffmpeg-deps'
-import { logMain, getMainLogFilePath } from './app-log'
+import {
+  logMain,
+  getMainLogFilePath,
+  logWaveform,
+  getWaveformLogFilePath,
+  logTimeline,
+  getTimelineLogFilePath
+} from './app-log'
+import {
+  getWaveformCacheJsonPathForMedia,
+  pruneStaleWaveformCacheEntries,
+  touchWaveformCacheFile
+} from './waveformCache'
 import { mergeEnvFromFile } from './dotenv-merge'
 import { getGpuRuntimeDir, installGpuRuntime, isGpuRuntimeInstalled } from './gpu-runtime'
 import { prepareAllEngines } from './deps-prepare'
@@ -147,9 +160,19 @@ function ensureSidecar(): PythonSidecar {
     } catch {
       /* ignore */
     }
-    sidecar = new PythonSidecar(spec.command, spec.args, pathPrefix, {
+    const extraEnv: Record<string, string> = {
       AUTOSUBTITLE_MODELS_DIR: modelsDir
-    })
+    }
+    try {
+      extraEnv.AUTOSUBTITLE_FFMPEG_PATH = getUsableFfmpegExecutable()
+    } catch {
+      /* waveform_peaks 는 렌더러에서 ffmpeg_path 로 넘길 수 있음 */
+    }
+    const awf = resolveBundledAudiowaveformPath()
+    if (awf) {
+      extraEnv.AUTOSUBTITLE_AUDIOWAVEFORM_PATH = awf
+    }
+    sidecar = new PythonSidecar(spec.command, spec.args, pathPrefix, extraEnv)
     attachSidecarProgressToWindow()
   }
   return sidecar
@@ -246,6 +269,20 @@ function getUsableFfmpegExecutable(): string {
   const bundled = getBundledFfmpegPath()
   if (existsSync(bundled)) return bundled
   throw new Error('ffmpeg 실행 파일을 찾지 못했습니다. 먼저 엔진 다운로드를 실행해 주세요.')
+}
+
+/** `resources/bin/audiowaveform(.exe)` — Peaks.js용 사전 피크 JSON (BBC audiowaveform CLI) */
+function resolveBundledAudiowaveformPath(): string | null {
+  const name = process.platform === 'win32' ? 'audiowaveform.exe' : 'audiowaveform'
+  if (app.isPackaged) {
+    const p = join(process.resourcesPath, 'bin', name)
+    return existsSync(p) ? p : null
+  }
+  const fromCwd = join(process.cwd(), 'resources', 'bin', name)
+  if (existsSync(fromCwd)) return fromCwd
+  const fromMain = join(__dirname, '../../resources/bin', name)
+  if (existsSync(fromMain)) return fromMain
+  return null
 }
 
 let cachedFfmpegEncodersText: { ffmpegPath: string; text: string } | null = null
@@ -852,6 +889,28 @@ app.whenReady().then(() => {
     'whenReady',
     `v${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath('userData')} log=${getMainLogFilePath()}`
   )
+  logWaveform(
+    'app',
+    '세션 시작 — 단어별 파동 UI 사용 시 이 파일에 디버그가 append 됩니다',
+    getWaveformLogFilePath()
+  )
+  void pruneStaleWaveformCacheEntries().catch(() => {
+    /* 캐시 정리 실패는 앱 동작에 필수 아님 */
+  })
+
+  ipcMain.handle('waveform:getPeaksCachePath', async (_event, rawPath: unknown) => {
+    if (typeof rawPath !== 'string' || !rawPath.trim()) {
+      return { ok: false as const, reason: 'invalid_path' }
+    }
+    const abs = normalizeDroppedPath(rawPath)
+    if (!existsSync(abs)) {
+      return { ok: false as const, reason: 'not_found' }
+    }
+    if (!isVideoFilePath(abs)) {
+      return { ok: false as const, reason: 'not_video' }
+    }
+    return getWaveformCacheJsonPathForMedia(abs)
+  })
 
   ipcMain.handle('shell:showItemInFolder', (_event, raw: unknown) => {
     if (typeof raw !== 'string' || !raw.trim()) return { ok: false as const, reason: 'empty' }
@@ -859,6 +918,62 @@ app.whenReady().then(() => {
     if (!existsSync(p)) return { ok: false as const, reason: 'missing' }
     shell.showItemInFolder(p)
     return { ok: true as const }
+  })
+
+  ipcMain.handle('debug:waveform-log', (_event, payload: unknown) => {
+    const o = payload as { scope?: string; message?: string; details?: unknown[] }
+    const scope = typeof o.scope === 'string' ? o.scope : 'renderer'
+    const message = typeof o.message === 'string' ? o.message : JSON.stringify(payload)
+    const details = Array.isArray(o.details) ? o.details : []
+    logWaveform(scope, message, ...details)
+    return { ok: true as const, path: getWaveformLogFilePath() }
+  })
+
+  ipcMain.handle('debug:timeline-log', (_event, payload: unknown) => {
+    const o = payload as { scope?: string; message?: string; details?: unknown[] }
+    const scope = typeof o.scope === 'string' ? o.scope : 'renderer'
+    const message = typeof o.message === 'string' ? o.message : JSON.stringify(payload)
+    const details = Array.isArray(o.details) ? o.details : []
+    logTimeline(scope, message, ...details)
+    return { ok: true as const, path: getTimelineLogFilePath() }
+  })
+
+  ipcMain.handle('media:readFileBuffer', async (_event, rawPath: unknown) => {
+    if (typeof rawPath !== 'string' || !rawPath.trim()) {
+      return { ok: false as const, reason: 'invalid_path' }
+    }
+    const abs = normalize(rawPath.trim())
+    if (!existsSync(abs)) {
+      return { ok: false as const, reason: 'not_found' }
+    }
+    try {
+      const buf = await readFile(abs)
+      const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)
+      return { ok: true as const, arrayBuffer: ab }
+    } catch (e) {
+      return { ok: false as const, reason: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('media:readPeaksJson', async (_event, rawPath: unknown) => {
+    if (typeof rawPath !== 'string' || !rawPath.trim()) {
+      return { ok: false as const, reason: 'invalid_path' }
+    }
+    const abs = normalize(rawPath.trim())
+    if (!existsSync(abs)) {
+      return { ok: false as const, reason: 'not_found' }
+    }
+    try {
+      const text = await readFile(abs, 'utf8')
+      const parsed = JSON.parse(text) as { data?: unknown }
+      if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.data)) {
+        return { ok: false as const, reason: 'invalid_peaks_json' }
+      }
+      void touchWaveformCacheFile(abs).catch(() => {})
+      return { ok: true as const, json: parsed }
+    } catch (e) {
+      return { ok: false as const, reason: e instanceof Error ? e.message : String(e) }
+    }
   })
 
   ipcMain.handle('shell:openExternal', async (_event, raw: unknown) => {
@@ -1047,10 +1162,19 @@ app.whenReady().then(() => {
     const timeoutMs =
       method === 'prepare_model'
         ? PREPARE_MODEL_TIMEOUT_MS
-        : method === 'transcribe'
+        : method === 'transcribe' || method === 'waveform_peaks'
           ? TRANSCRIBE_TIMEOUT_MS
           : undefined
-    const result = await sc.call(method, params, timeoutMs)
+    let mergedParams: Record<string, unknown> | undefined = params
+    if (method === 'waveform_peaks' && params && typeof params.path === 'string' && params.path.trim()) {
+      const abs = normalizeDroppedPath(params.path)
+      const cache = await getWaveformCacheJsonPathForMedia(abs)
+      if (!cache.ok) {
+        return { ok: false, path: null, reason: `waveform_cache: ${cache.reason}` }
+      }
+      mergedParams = { ...params, out_json_path: cache.cachePath }
+    }
+    const result = await sc.call(method, mergedParams, timeoutMs)
     if (method === 'prepare_model') {
       const w = mainWindow
       if (w && !w.isDestroyed()) {
@@ -1102,7 +1226,12 @@ app.whenReady().then(() => {
         sc.setTranscribeProgressHandler((pct) => {
           if (!win.isDestroyed()) win.webContents.send('transcribe:progress', pct)
         })
-        const result = (await sc.call('transcribe', { path: absPath }, TRANSCRIBE_TIMEOUT_MS)) as {
+        const txParams: Record<string, unknown> = { path: absPath }
+        const wfCache = await getWaveformCacheJsonPathForMedia(absPath)
+        if (wfCache.ok) {
+          txParams.waveform_out_json_path = wfCache.cachePath
+        }
+        const result = (await sc.call('transcribe', txParams, TRANSCRIBE_TIMEOUT_MS)) as {
           device?: string | null
           device_before?: string | null
           fallback_to_cpu?: boolean

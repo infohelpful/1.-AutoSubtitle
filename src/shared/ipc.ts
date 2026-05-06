@@ -135,6 +135,11 @@ export type FfmpegCapabilities = {
   isQtrleAvailable: boolean
 }
 
+/** `userData/WaveformCache/{md5}.autosub-peaks.json` — 영상 경로·mtime·size 로 무효화 */
+export type WaveformPeaksCachePathResult =
+  | { ok: true; cachePath: string; hash: string }
+  | { ok: false; reason: string }
+
 export type SidecarApi = {
   openVideoFileDialog: () => Promise<OpenVideoDialogResult>
   /** 드롭한 `File`의 디스크 절대 경로 (렌더러의 `File.path`는 비어 있는 경우가 많음) */
@@ -172,4 +177,30 @@ export type SidecarApi = {
   saveProjectFile: (path: string, content: string) => Promise<ProjectSaveResult>
   /** 저장 대화상자로 새 경로에 저장 */
   saveProjectFileAs: (content: string, defaultPath?: string) => Promise<ProjectSaveAsResult>
+  /** Peaks/파동 디버그 로그 (`userData/logs/waveform.log`) */
+  logWaveformDebug: (
+    scope: string,
+    message: string,
+    ...details: unknown[]
+  ) => Promise<{ ok: true; path: string }>
+  /** 타임라인 CUT·cutRanges 등 (`userData/logs/timeline.log`) */
+  logTimelineEdit: (
+    scope: string,
+    message: string,
+    ...details: unknown[]
+  ) => Promise<{ ok: true; path: string }>
+  /**
+   * 로컬 미디어 파일을 ArrayBuffer로 읽음 — Peaks가 http 페이지에서 file:// 를 XHR로 못 가져올 때 파형 생성용.
+   */
+  readLocalMediaFileBuffer: (
+    absoluteFilePath: string
+  ) => Promise<{ ok: true; arrayBuffer: ArrayBuffer } | { ok: false; reason: string }>
+  /**
+   * audiowaveform이 만든 Peaks.js 호환 JSON — 메인에서 읽어 `waveformData` 주입용(dataUri 비동기 로드 생략).
+   */
+  readLocalPeaksJsonFile: (
+    absoluteFilePath: string
+  ) => Promise<{ ok: true; json: unknown } | { ok: false; reason: string }>
+  /** 영상 절대 경로 → 글로벌 파형 캐시 JSON 절대 경로(MD5 해시) */
+  getWaveformPeaksCachePath: (absoluteVideoPath: string) => Promise<WaveformPeaksCachePathResult>
 }

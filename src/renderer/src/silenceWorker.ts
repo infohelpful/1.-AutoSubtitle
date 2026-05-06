@@ -82,7 +82,9 @@ function splitWordBySilenceRuns(
 
   if (runs.length === 0) return [w]
 
-  const parts: WorkerWord[] = []
+  type TempPart = { start: number; end: number; isSilence: boolean }
+  const tempParts: TempPart[] = []
+
   let cursor = w.start
   for (const run of runs) {
     const rawStart = run.s / sampleRate
@@ -92,29 +94,51 @@ function splitWordBySilenceRuns(
     if (!(silentEnd > silentStart + EPS)) continue
 
     if (silentStart > cursor + EPS) {
-      parts.push({
-        start: cursor,
-        end: silentStart,
-        word: w.word,
-        ...(w.isSilence ? { isSilence: true } : {})
-      })
+      tempParts.push({ start: cursor, end: silentStart, isSilence: false })
     }
-    parts.push({
-      start: silentStart,
-      end: silentEnd,
-      word: '',
-      isSilence: true
-    })
+    tempParts.push({ start: silentStart, end: silentEnd, isSilence: true })
     cursor = silentEnd
   }
 
   if (cursor < w.end - EPS) {
-    parts.push({
-      start: cursor,
-      end: w.end,
-      word: w.word,
-      ...(w.isSilence ? { isSilence: true } : {})
-    })
+    tempParts.push({ start: cursor, end: w.end, isSilence: false })
+  }
+
+  if (tempParts.length === 0) return [w]
+
+  let longestVoiceIdx = -1
+  let maxDur = -1
+  for (let i = 0; i < tempParts.length; i += 1) {
+    const tp = tempParts[i]
+    if (!tp.isSilence) {
+      const dur = tp.end - tp.start
+      if (dur > maxDur) {
+        maxDur = dur
+        longestVoiceIdx = i
+      }
+    }
+  }
+
+  if (longestVoiceIdx < 0) return [w]
+
+  const parts: WorkerWord[] = []
+  for (let i = 0; i < tempParts.length; i += 1) {
+    const p = tempParts[i]
+    if (i === longestVoiceIdx) {
+      parts.push({
+        start: p.start,
+        end: p.end,
+        word: w.word,
+        ...(w.isSilence ? { isSilence: true } : {})
+      })
+    } else {
+      parts.push({
+        start: p.start,
+        end: p.end,
+        word: '',
+        isSilence: true
+      })
+    }
   }
 
   return parts.length > 0 ? parts : [w]

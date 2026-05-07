@@ -951,17 +951,17 @@ body {
   row-gap: var(--sv-gap, 10px);
 }
 
-/** Phase 3: 단어 행 + 파형 1:1 — `.subtitle-card--virtual` 가로 패딩만큼 끌어올려 카드 안 최대 폭 */
+/** 단어 줄·파형은 카드 패딩 안 가로폭에 맞춤(음수 마진 확장 시 파형이 카드 밖으로 넘침) */
 .subtitle-card-media-rail {
   box-sizing: border-box;
   min-width: 0;
   flex: 0 0 auto;
   /** min-height:0 은 내부에 불필요한 세로 스크롤 포트를 만들 수 있어 자연 높이 사용 */
   min-height: auto;
-  margin-left: -0.28rem;
-  margin-right: -0.28rem;
-  width: calc(100% + 0.56rem);
-  max-width: none;
+  margin-left: 0;
+  margin-right: 0;
+  width: 100%;
+  max-width: 100%;
   scrollbar-width: none;
 }
 

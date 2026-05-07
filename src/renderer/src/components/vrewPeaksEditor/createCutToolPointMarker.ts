@@ -8,10 +8,12 @@ export const CUT_TOOL_POINT_ID = 'autosub-cut-marker'
 type LayerWithFormat = { getHeight: () => number; formatTime?: (t: number) => string }
 
 /**
- * CUT 모드 1차 클릭 — 세로선은 주황 계열(흰색 라인 비표시), 시간 라벨은 표시하지 않음.
+ * CUT 포인트 마커 — 활성 파형 황금색과 구분되도록 시안 계열 (DOM 컷 라인과 동일 톤).
  */
 class CutToolPointMarker implements PointMarker {
   private readonly opts: CreatePointMarkerOptions
+  /** 좁은 대시 선만 있으면 listening 이 모두 꺼져 히트가 파형으로 빠져 드래그가 불가 — 넓은 투명 스트립으로 그룹 드래그 수신 */
+  private hitStrip!: Konva.Rect
   private line!: Konva.Line
   private timeLabel!: Konva.Text
   private labelBg!: Konva.Rect
@@ -22,17 +24,29 @@ class CutToolPointMarker implements PointMarker {
   }
 
   init(group: Konva.Group): void {
+    const layer = this.opts.layer as LayerWithFormat
+    const h = Math.max(8, layer.getHeight())
+    this.hitStrip = new Konva.Rect({
+      x: -14,
+      y: 0,
+      width: 28,
+      height: h,
+      fill: 'rgba(255,255,255,0.003)',
+      listening: true,
+      perfectDrawEnabled: false
+    })
+    group.add(this.hitStrip)
+
     this.line = new Konva.Line({
       x: 0,
       y: 0,
       points: [0.5, 0, 0.5, 80],
-      stroke: 'rgba(217, 119, 6, 0.9)',
+      stroke: 'rgba(34, 211, 238, 0.9)',
       strokeWidth: 1.5,
       dash: [5, 4],
       listening: false
     })
 
-    const layer = this.opts.layer as LayerWithFormat
     const fmt =
       typeof layer.formatTime === 'function'
         ? layer.formatTime(this.opts.point.time)
@@ -83,6 +97,7 @@ class CutToolPointMarker implements PointMarker {
 
   fitToView(): void {
     const h = this.opts.layer.getHeight()
+    this.hitStrip.height(Math.max(8, h))
     this.line.points([0.5, 0, 0.5, h])
     const tipW = this.labelBg.width()
     const pad = 6
@@ -104,6 +119,7 @@ class CutToolPointMarker implements PointMarker {
   }
 
   destroy(): void {
+    this.hitStrip?.destroy()
     this.line?.destroy()
     this.labelGroup?.destroy()
   }

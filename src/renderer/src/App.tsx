@@ -26,12 +26,9 @@ import { subtitleLinesToVrewRows, vrewRowsToSubtitleLines } from './vrewSubtitle
 import { applyTimeRangeCutToVrewRows } from './waveformCutSync'
 import {
   mergeCutRanges,
-  mediaToEditTime,
-  editToMediaTime,
   peaksEditRangeToMediaCut,
   snapTimelineSec
 } from '../../shared/timelineCollapse'
-import { replayMediaCutsOnDecodedBuffer, spliceAudioBuffer } from './spliceAudioBuffer'
 import { timelineEditLog } from './timelineEditLog'
 
 type OverlayPhase = 'working' | 'success' | 'error'
@@ -302,6 +299,13 @@ function normalizeWorkerLines(lines: SubtitleLine[]): SubtitleLine[] {
 /** 삭제 구간 끝에 정확히 맞추면 디코더가 같은 키프레임에 걸려 멈추는 경우가 있어 살짝 건너뜀 */
 const SKIP_CUT_TAIL_SEC = 2e-4
 
+type TimelineClip = {
+  mediaIn: number
+  mediaOut: number
+  timelineStart: number
+  timelineEnd: number
+}
+
 function skipCutRangeAt(timeSec: number, ranges: CutRange[]): number {
   const merged = mergeCutRanges([...ranges])
   let t = timeSec
@@ -317,6 +321,280 @@ function skipCutRangeAt(timeSec: number, ranges: CutRange[]): number {
     if (!jumped) break
   }
   return t
+}
+
+function buildTimelineClips(ranges: CutRange[], mediaEndHintSec: number): TimelineClip[] {
+  const merged = mergeCutRanges([...ranges])
+  const clips: TimelineClip[] = []
+  let timelineCursor = 0
+  let mediaCursor = 0
+  for (const r of merged) {
+    if (r.start > mediaCursor) {
+      const dur = r.start - mediaCursor
+      clips.push({
+        mediaIn: mediaCursor,
+        mediaOut: r.start,
+        timelineStart: timelineCursor,
+        timelineEnd: timelineCursor + dur
+      })
+      timelineCursor += dur
+    }
+    mediaCursor = Math.max(mediaCursor, r.end)
+  }
+  const tailEnd = Math.max(mediaCursor, mediaEndHintSec)
+  if (tailEnd > mediaCursor) {
+    const dur = tailEnd - mediaCursor
+    clips.push({
+      mediaIn: mediaCursor,
+      mediaOut: tailEnd,
+      timelineStart: timelineCursor,
+      timelineEnd: timelineCursor + dur
+    })
+  }
+  return clips
+}
+
+function mapEditToMediaWithClips(editSec: number, clips: TimelineClip[]): number {
+  const t = Math.max(0, editSec)
+  if (clips.length === 0) return t
+  for (const c of clips) {
+    if (t < c.timelineEnd) return c.mediaIn + (t - c.timelineStart)
+  }
+  const last = clips[clips.length - 1]
+  return last.mediaOut
+}
+
+function mapMediaToEditWithClips(mediaSec: number, clips: TimelineClip[]): number {
+  const t = Math.max(0, mediaSec)
+  if (clips.length === 0) return t
+  for (const c of clips) {
+    if (t < c.mediaOut) return c.timelineStart + (t - c.mediaIn)
+  }
+  const last = clips[clips.length - 1]
+  return last.timelineEnd
+}
+
+function estimateSpeechOnsetFromWaveformJson(
+  json: JsonWaveformData | null,
+  mediaDurationSec: number
+): number | null {
+  if (!json || !(mediaDurationSec > 0)) return null
+  const data = json.data ?? []
+  if (data.length < 4) return null
+  let pps = 0
+  if (json.sample_rate && json.samples_per_pixel) {
+    pps = json.sample_rate / json.samples_per_pixel
+  } else if (json.length && json.length > 0) {
+    pps = json.length / mediaDurationSec
+  }
+  if (!(pps > 1)) return null
+  const pixels = Math.floor(data.length / 2)
+  let maxAmp = 0
+  const amps: number[] = new Array(pixels)
+  for (let i = 0; i < pixels; i += 1) {
+    const lo = Math.abs(data[i * 2] ?? 0)
+    const hi = Math.abs(data[i * 2 + 1] ?? 0)
+    const a = Math.max(lo, hi)
+    amps[i] = a
+    if (a > maxAmp) maxAmp = a
+  }
+  if (!(maxAmp > 0)) return null
+  const threshold = maxAmp * 0.12
+  for (let i = 0; i < pixels; i += 1) {
+    if (amps[i] > threshold) return i / pps
+  }
+  return null
+}
+
+function stitchAudioBufferByCuts(
+  src: AudioBuffer,
+  cuts: CutRange[],
+  targetSampleRate: number
+): { buffer: AudioBuffer; totalSamples: number } {
+  const merged = mergeCutRanges([...cuts])
+  const channelCount = src.numberOfChannels
+  const sampleRate = src.sampleRate
+  const keepRanges: Array<{ startSec: number; endSec: number }> = []
+  let cursor = 0
+  const mediaDuration = src.length / sampleRate
+  for (const c of merged) {
+    const s = Math.max(0, Math.min(mediaDuration, c.start))
+    const e = Math.max(0, Math.min(mediaDuration, c.end))
+    if (s > cursor) keepRanges.push({ startSec: cursor, endSec: s })
+    cursor = Math.max(cursor, e)
+  }
+  if (cursor < mediaDuration) keepRanges.push({ startSec: cursor, endSec: mediaDuration })
+
+  let totalSamples = 0
+  const sampleRanges = keepRanges.map((r) => {
+    const s = Math.max(0, Math.floor(r.startSec * sampleRate))
+    const e = Math.max(s, Math.floor(r.endSec * sampleRate))
+    totalSamples += e - s
+    return { start: s, end: e }
+  })
+  const out = new AudioBuffer({
+    numberOfChannels: channelCount,
+    length: Math.max(1, totalSamples),
+    sampleRate: targetSampleRate
+  })
+  for (let ch = 0; ch < channelCount; ch += 1) {
+    const srcData = src.getChannelData(ch)
+    const outData = out.getChannelData(ch)
+    let write = 0
+    for (const r of sampleRanges) {
+      outData.set(srcData.subarray(r.start, r.end), write)
+      write += r.end - r.start
+    }
+  }
+  return { buffer: out, totalSamples: Math.max(1, totalSamples) }
+}
+
+function encodeWavFromAudioBuffer(buf: AudioBuffer): Blob {
+  const numChannels = buf.numberOfChannels
+  const sampleRate = buf.sampleRate
+  const bitsPerSample = 16
+  const blockAlign = (numChannels * bitsPerSample) / 8
+  const byteRate = sampleRate * blockAlign
+  const dataSize = buf.length * blockAlign
+  const buffer = new ArrayBuffer(44 + dataSize)
+  const view = new DataView(buffer)
+  const writeString = (offset: number, s: string) => {
+    for (let i = 0; i < s.length; i += 1) view.setUint8(offset + i, s.charCodeAt(i))
+  }
+  writeString(0, 'RIFF')
+  view.setUint32(4, 36 + dataSize, true)
+  writeString(8, 'WAVE')
+  writeString(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, numChannels, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, byteRate, true)
+  view.setUint16(32, blockAlign, true)
+  view.setUint16(34, bitsPerSample, true)
+  writeString(36, 'data')
+  view.setUint32(40, dataSize, true)
+
+  let offset = 44
+  for (let i = 0; i < buf.length; i += 1) {
+    for (let ch = 0; ch < numChannels; ch += 1) {
+      const sample = Math.max(-1, Math.min(1, buf.getChannelData(ch)[i] ?? 0))
+      const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7fff
+      view.setInt16(offset, int16, true)
+      offset += 2
+    }
+  }
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
+/**
+ * 디코딩 버퍼에서 Peaks용 피크 JSON을 만든다.
+ * Peaks.js 는 zoom scale 이 JSON 의 samples_per_pixel 보다 작으면 클램프하므로,
+ * 네이티브 spp 가 크면(예: 512) 짧은 자막 줄도 한 화면에 못 담는다.
+ * 일반 길이 미디어는 spp 를 낮추고, 초장시에는 픽셀 상한을 넘기지 않게 spp 를 올린다.
+ */
+function buildWaveformJsonFromAudioBuffer(buf: AudioBuffer, samplesPerPixelHint = 128): JsonWaveformData {
+  const src = buf.getChannelData(0)
+  /** 피크 픽셀 수 상한 — 500k 근처면 spp 가 다시 커져 Peaks 최소 줌(~zw*spp/sr)이 과도하게 넓어짐 */
+  const targetMaxPixels = 980_000
+  /** zw≈1900·48kHz·spp=48 ⇒ 최소 가시 구간 ~1.9s — spp=96 이면 ~3.8s 로 칩 타임라인과 어긋남 */
+  const maxNativeSppForEditing = 48
+  const minSpp = 32
+  const adaptiveSpp = Math.ceil(src.length / targetMaxPixels)
+  let spp = Math.max(minSpp, Math.floor(samplesPerPixelHint), adaptiveSpp)
+  spp = Math.min(maxNativeSppForEditing, spp)
+  let pixels = Math.max(1, Math.ceil(src.length / spp))
+  if (pixels > targetMaxPixels) {
+    spp = Math.max(minSpp, Math.ceil(src.length / targetMaxPixels))
+    pixels = Math.max(1, Math.ceil(src.length / spp))
+  }
+  const data: number[] = new Array(pixels * 2)
+  for (let p = 0; p < pixels; p += 1) {
+    const start = p * spp
+    const end = Math.min(src.length, start + spp)
+    let min = 1
+    let max = -1
+    for (let i = start; i < end; i += 1) {
+      const v = src[i] ?? 0
+      if (v < min) min = v
+      if (v > max) max = v
+    }
+    // Peaks.js v4 JSON 파형은 8-bit(min/max per pixel) 포맷으로 전달해야 안정적으로 초기화된다.
+    data[p * 2] = Math.max(-128, Math.min(127, Math.round(min * 127)))
+    data[p * 2 + 1] = Math.max(-128, Math.min(127, Math.round(max * 127)))
+  }
+  return {
+    sample_rate: buf.sampleRate,
+    samples_per_pixel: spp,
+    bits: 8,
+    length: pixels,
+    data
+  } as JsonWaveformData
+}
+
+function realignSubtitleWordBoundariesByWaveform(
+  lines: SubtitleLine[],
+  waveform: JsonWaveformData,
+  durationSec: number
+): { lines: SubtitleLine[]; changedWords: number } {
+  const data = waveform.data ?? []
+  if (data.length < 4 || !(durationSec > 0)) return { lines, changedWords: 0 }
+  let pps = 0
+  if (waveform.sample_rate && waveform.samples_per_pixel) {
+    pps = waveform.sample_rate / waveform.samples_per_pixel
+  } else if (waveform.length && waveform.length > 0) {
+    pps = waveform.length / durationSec
+  }
+  if (!(pps > 1)) return { lines, changedWords: 0 }
+  const pixels = Math.floor(data.length / 2)
+  const amps = new Array<number>(pixels)
+  for (let i = 0; i < pixels; i += 1) {
+    amps[i] = Math.max(Math.abs(data[i * 2] ?? 0), Math.abs(data[i * 2 + 1] ?? 0))
+  }
+  const snapToValley = (timeSec: number): number => {
+    const center = Math.max(0, Math.min(pixels - 1, Math.round(timeSec * pps)))
+    const radius = Math.max(1, Math.round(0.08 * pps))
+    let best = center
+    let bestAmp = amps[center] ?? Number.POSITIVE_INFINITY
+    const lo = Math.max(0, center - radius)
+    const hi = Math.min(pixels - 1, center + radius)
+    for (let i = lo; i <= hi; i += 1) {
+      const a = amps[i] ?? Number.POSITIVE_INFINITY
+      if (a < bestAmp) {
+        bestAmp = a
+        best = i
+      }
+    }
+    return best / pps
+  }
+
+  let changedWords = 0
+  const maxShiftSec = 0.12
+  const next = lines.map((line) => {
+    const words = line.words ?? []
+    if (words.length === 0) return line
+    let prevEnd = Math.max(0, line.start ?? 0)
+    const nextWords = words.map((w) => {
+      const s0 = Math.max(0, w.start)
+      const e0 = Math.max(s0 + 0.02, w.end)
+      const s1 = snapToValley(s0)
+      const e1 = snapToValley(e0)
+      const snappedStart = Math.abs(s1 - s0) <= maxShiftSec ? s1 : s0
+      const snappedEnd = Math.abs(e1 - e0) <= maxShiftSec ? e1 : e0
+      const start = Math.max(prevEnd + 0.004, snappedStart)
+      const end = Math.max(start + 0.04, snappedEnd)
+      prevEnd = end
+      if (Math.abs(start - s0) > 1e-4 || Math.abs(end - e0) > 1e-4) changedWords += 1
+      return { ...w, start, end }
+    })
+    return {
+      ...line,
+      start: nextWords[0]?.start ?? line.start,
+      end: nextWords[nextWords.length - 1]?.end ?? line.end,
+      words: nextWords
+    }
+  })
+  return { lines: next, changedWords }
 }
 
 function subtitleLinesMeaningfullyChanged(next: SubtitleLine[], prev: SubtitleLine[]): boolean {
@@ -398,6 +676,10 @@ export default function App(): ReactElement {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const previewStackRef = useRef<HTMLDivElement | null>(null)
   const rafPlayheadRef = useRef<number | null>(null)
+  const previewEndMediaSecRef = useRef<number | null>(null)
+  const masterAudioRef = useRef<HTMLAudioElement | null>(null)
+  /** 동일 시크가 짧은 간격에 반복 로그될 때 timeline.log 노이즈 방지(더블클릭 등) */
+  const seekToSubtitleStartLogDedupeRef = useRef<{ startSec: number; at: number } | null>(null)
   const [playheadSec, setPlayheadSec] = useState(0)
   const [durationSec, setDurationSec] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -406,6 +688,19 @@ export default function App(): ReactElement {
   useEffect(() => {
     cutRangesRef.current = cutRanges
   }, [cutRanges])
+
+  const pauseMasterClock = useCallback((fallbackMediaSec: number): void => {
+    const audio = masterAudioRef.current
+    if (!audio) return
+    audio.currentTime = Math.max(0, fallbackMediaSec)
+    if (!audio.paused) audio.pause()
+  }, [])
+
+  const getMasterClockMediaSec = useCallback((): number => {
+    const audio = masterAudioRef.current
+    if (audio) return Math.max(0, audio.currentTime)
+    return 0
+  }, [])
 
   const [subtitleFontFamily, setSubtitleFontFamily] = useState<string>(
     savedSubtitleStyle?.subtitleFontFamily ?? 'Malgun Gothic'
@@ -435,6 +730,7 @@ export default function App(): ReactElement {
   const [subtitles, setSubtitles] = useState<SubtitleLine[]>([])
   const [silenceSplitPending, setSilenceSplitPending] = useState(false)
   const silenceSplitRunKeyRef = useRef<string | null>(null)
+  const autoWordRealignRunKeyRef = useRef<string | null>(null)
   const undoStackRef = useRef<SubtitleLine[][]>([])
   const redoStackRef = useRef<SubtitleLine[][]>([])
   /** 마지막으로 저장/연 `.autosub` 경로 — 「저장」 덮어쓰기용 */
@@ -453,41 +749,170 @@ export default function App(): ReactElement {
   const [exportFormat, setExportFormat] = useState<ExportFormat>('video')
   /** false면 subtitleLinesToVrewRows 가 단어 간 gap-fill(무음 더미)을 넣지 않음 — 편집 후 타임라인 덮어쓰기 방지 */
   const [gapFillWhenBuildingVrew, setGapFillWhenBuildingVrew] = useState(true)
+  const [masterAudioSrcUrl, setMasterAudioSrcUrl] = useState<string | undefined>(undefined)
+  const [masterAudioTimelineBased, setMasterAudioTimelineBased] = useState(false)
+  const [stitchedWaveformJsonData, setStitchedWaveformJsonData] = useState<JsonWaveformData | null>(null)
+  const masterAudioBlobUrlRef = useRef<string | null>(null)
+  const mergedCutRanges = useMemo(() => mergeCutRanges([...cutRanges]), [cutRanges])
+  const timelineClips = useMemo(() => {
+    const subtitleEnd = subtitles.reduce((m, line) => Math.max(m, line.end ?? 0), 0)
+    const mediaEndHint = durationSec > 0 ? durationSec : Math.max(subtitleEnd, 0)
+    return buildTimelineClips(mergedCutRanges, mediaEndHint)
+  }, [mergedCutRanges, durationSec, subtitles])
+  const firstWordStartSec = useMemo(() => {
+    let first = Number.POSITIVE_INFINITY
+    for (const line of subtitles) {
+      const ws = line.words ?? []
+      if (ws.length > 0) {
+        for (const w of ws) first = Math.min(first, w.start)
+      } else {
+        first = Math.min(first, line.start ?? Number.POSITIVE_INFINITY)
+      }
+    }
+    return Number.isFinite(first) ? Math.max(0, first) : null
+  }, [subtitles])
+  const autoGlobalSyncOffsetSec = 0
+  const mapEditToMediaSec = useCallback(
+    (sec: number): number => {
+      const mapped = mapEditToMediaWithClips(sec, timelineClips)
+      return Math.max(0, mapped)
+    },
+    [timelineClips]
+  )
 
+  const mapMediaToEditSec = useCallback(
+    (sec: number): number => {
+      return Math.max(0, mapMediaToEditWithClips(sec, timelineClips))
+    },
+    [timelineClips]
+  )
+
+  const playheadEditSec = useMemo(() => mapMediaToEditSec(playheadSec), [mapMediaToEditSec, playheadSec])
+  useEffect(() => {
+    if (!videoPath) return
+    timelineEditLog('sync', 'auto global offset calibrated', {
+      cutCount: mergedCutRanges.length,
+      durationSec,
+      firstWordStartSec,
+      autoGlobalSyncOffsetSec
+    })
+  }, [videoPath, mergedCutRanges.length, durationSec, firstWordStartSec, autoGlobalSyncOffsetSec])
   const activeSubtitleIndex = useMemo(
-    () => pickActiveSubtitleIndex(subtitles, mediaToEditTime(playheadSec, cutRanges)),
-    [subtitles, playheadSec, cutRanges]
+    () => pickActiveSubtitleIndex(subtitles, playheadEditSec),
+    [subtitles, playheadEditSec]
+  )
+
+  const toMediaSeekSec = useCallback(
+    (editSec: number, el: HTMLVideoElement | null): number => {
+      let t = mapEditToMediaSec(editSec)
+      t = skipCutRangeAt(t, mergedCutRanges)
+      if (el && Number.isFinite(el.duration) && el.duration > 0) {
+        t = Math.min(t, Math.max(0, el.duration - 0.001))
+      }
+      return t
+    },
+    [mergedCutRanges, mapEditToMediaSec]
+  )
+
+  const mediaToMasterAudioSec = useCallback(
+    (mediaSec: number): number => {
+      if (!masterAudioTimelineBased) return Math.max(0, mediaSec)
+      return Math.max(0, mapMediaToEditSec(mediaSec))
+    },
+    [mapMediaToEditSec, masterAudioTimelineBased]
+  )
+
+  const masterAudioToMediaSec = useCallback(
+    (masterSec: number): number => {
+      if (!masterAudioTimelineBased) return Math.max(0, masterSec)
+      return Math.max(0, mapEditToMediaSec(masterSec))
+    },
+    [mapEditToMediaSec, masterAudioTimelineBased]
   )
 
   const seekToSubtitleStart = useCallback(
     (startSec: number) => {
       const el = videoRef.current
       if (!el || !videoPath) return
-      let t = Math.max(0, editToMediaTime(startSec, cutRanges))
-      t = skipCutRangeAt(t, cutRanges)
-      if (Number.isFinite(el.duration) && el.duration > 0) {
-        t = Math.min(t, Math.max(0, el.duration - 0.001))
+      previewEndMediaSecRef.current = null
+      const t = toMediaSeekSec(startSec, el)
+      const now = performance.now()
+      const prev = seekToSubtitleStartLogDedupeRef.current
+      const dupLog =
+        prev != null &&
+        Math.abs(prev.startSec - startSec) < 1e-7 &&
+        now - prev.at < 85
+      if (!dupLog) {
+        timelineEditLog('playback', 'seekToSubtitleStart mapping', {
+          requestedStartEditSec: startSec,
+          requestedEndEditSec: null,
+          resolvedStartMediaSec: t,
+          resolvedEndMediaSec: null,
+          cutCount: mergedCutRanges.length
+        })
+        seekToSubtitleStartLogDedupeRef.current = { startSec, at: now }
       }
       el.currentTime = t
       setPlayheadSec(t)
+      pauseMasterClock(t)
     },
-    [videoPath, cutRanges]
+    [videoPath, mergedCutRanges.length, toMediaSeekSec, pauseMasterClock]
   )
 
   const seekAndPlayTo = useCallback(
     (startSec: number) => {
       const el = videoRef.current
-      if (!el || !videoPath) return
-      let t = Math.max(0, editToMediaTime(startSec, cutRanges))
-      t = skipCutRangeAt(t, cutRanges)
-      if (Number.isFinite(el.duration) && el.duration > 0) {
-        t = Math.min(t, Math.max(0, el.duration - 0.001))
-      }
+      const masterAudio = masterAudioRef.current
+      if (!el || !masterAudio || !videoPath) return
+      previewEndMediaSecRef.current = null
+      const t = toMediaSeekSec(startSec, el)
+      timelineEditLog('playback', 'seekAndPlayTo mapping', {
+        requestedStartEditSec: startSec,
+        requestedEndEditSec: null,
+        resolvedStartMediaSec: t,
+        resolvedEndMediaSec: null,
+        cutCount: mergedCutRanges.length
+      })
+      masterAudio.currentTime = mediaToMasterAudioSec(t)
       el.currentTime = t
       setPlayheadSec(t)
+      void masterAudio.play().catch(() => undefined)
       void el.play().catch(() => undefined)
     },
-    [videoPath, cutRanges]
+    [videoPath, mergedCutRanges.length, toMediaSeekSec, mediaToMasterAudioSec]
+  )
+
+  const playEditRange = useCallback(
+    (startSec: number, endSec: number) => {
+      const el = videoRef.current
+      const masterAudio = masterAudioRef.current
+      if (!el || !masterAudio || !videoPath) return
+      const startEdit = Math.max(0, Math.min(startSec, endSec))
+      const endEdit = Math.max(0, Math.max(startSec, endSec))
+      if (!(endEdit > startEdit + 1e-4)) return
+
+      const mediaStart = toMediaSeekSec(startEdit, el)
+      let mediaEnd = toMediaSeekSec(endEdit, el)
+      if (!(mediaEnd > mediaStart + 1e-4)) {
+        mediaEnd = mediaStart + 0.05
+      }
+      previewEndMediaSecRef.current = mediaEnd
+      timelineEditLog('playback', 'playEditRange mapping', {
+        requestedStartEditSec: startEdit,
+        requestedEndEditSec: endEdit,
+        resolvedStartMediaSec: mediaStart,
+        resolvedEndMediaSec: mediaEnd,
+        cutCount: mergedCutRanges.length
+      })
+      masterAudio.currentTime = mediaToMasterAudioSec(mediaStart)
+      el.currentTime = mediaStart
+      setPlayheadSec(mediaStart)
+      void masterAudio.play().catch(() => {
+        previewEndMediaSecRef.current = null
+      })
+      void el.play().catch(() => undefined)
+    },
+    [videoPath, mergedCutRanges.length, toMediaSeekSec, mediaToMasterAudioSec]
   )
 
   const registerDeletedAudioRange = useCallback((startSec: number, endSec: number) => {
@@ -548,8 +973,74 @@ export default function App(): ReactElement {
     [videoPath]
   )
 
-  /** Peaks 파형용 — 파일 단 한 번 디코딩(폴백). 사전 피크 JSON이 있으면 사용하지 않음 */
-  const [waveformPrefetchedBuffer, setWaveformPrefetchedBuffer] = useState<AudioBuffer | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    const revokePrev = () => {
+      if (masterAudioBlobUrlRef.current) {
+        URL.revokeObjectURL(masterAudioBlobUrlRef.current)
+        masterAudioBlobUrlRef.current = null
+      }
+    }
+    if (!videoPath) {
+      revokePrev()
+      setMasterAudioSrcUrl(undefined)
+      setMasterAudioTimelineBased(false)
+      setStitchedWaveformJsonData(null)
+      return
+    }
+    const baseUrl = window.api.getMediaFileUrl(videoPath)
+    void (async () => {
+      let ctx: AudioContext | null = null
+      try {
+        const resp = await fetch(baseUrl)
+        const arr = await resp.arrayBuffer()
+        if (cancelled) return
+        ctx = new AudioContext()
+        const decoded = await ctx.decodeAudioData(arr.slice(0))
+        if (cancelled) return
+        const sourceBuffer =
+          mergedCutRanges.length > 0 ? stitchAudioBufferByCuts(decoded, mergedCutRanges, decoded.sampleRate).buffer : decoded
+        const wavBlob = encodeWavFromAudioBuffer(sourceBuffer)
+        const wavUrl = URL.createObjectURL(wavBlob)
+        const waveformJson = buildWaveformJsonFromAudioBuffer(sourceBuffer)
+        if (cancelled) {
+          URL.revokeObjectURL(wavUrl)
+          return
+        }
+        revokePrev()
+        masterAudioBlobUrlRef.current = wavUrl
+        setMasterAudioSrcUrl(wavUrl)
+        setMasterAudioTimelineBased(mergedCutRanges.length > 0)
+        setStitchedWaveformJsonData(waveformJson)
+        void window.api
+          .logWaveformDebug('audio-master', 'master audio source built from decoded buffer', {
+            cutCount: mergedCutRanges.length,
+            decodedDuration: decoded.duration,
+            stitchedDuration: sourceBuffer.duration,
+            waveformSamplesPerPixel: waveformJson.samples_per_pixel,
+            waveformPeakPixels: waveformJson.length
+          })
+          .catch(() => {})
+      } catch (e) {
+        if (cancelled) return
+        revokePrev()
+        setMasterAudioSrcUrl(baseUrl)
+        setMasterAudioTimelineBased(false)
+        setStitchedWaveformJsonData(null)
+        void window.api
+          .logWaveformDebug('audio-master', 'stitched master audio fallback', {
+            message: e instanceof Error ? e.message : String(e)
+          })
+          .catch(() => {})
+      } finally {
+        if (ctx) void ctx.close()
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [videoPath, mergedCutRanges])
+
   /** Peaks 사전 피크 JSON 절대 경로 — `userData/WaveformCache` 또는 레거시(영상 옆) */
   const [waveformPeaksJsonPath, setWaveformPeaksJsonPath] = useState<string | null>(null)
   /** 메인 IPC로 읽은 JSON — `waveformData` 직접 주입 시 file:// XHR 없음(더블클릭 체감 지연 감소) */
@@ -562,14 +1053,12 @@ export default function App(): ReactElement {
 
   useEffect(() => {
     if (!videoPath) {
-      setWaveformPrefetchedBuffer(null)
       setWaveformPeaksJsonPath(null)
       setWaveformPeaksJsonData(null)
       silenceSplitRunKeyRef.current = null
       setSilenceSplitPending(false)
       return
     }
-    setWaveformPrefetchedBuffer(null)
     setWaveformPeaksJsonPath(null)
     setWaveformPeaksJsonData(null)
     let cancelled = false
@@ -694,29 +1183,6 @@ export default function App(): ReactElement {
             .catch(() => {})
         }
       }
-      if (cancelled) return
-      if (typeof window.api.readLocalMediaFileBuffer !== 'function') {
-        setWaveformPrefetchedBuffer(null)
-        return
-      }
-      try {
-        const res = await window.api.readLocalMediaFileBuffer(videoPath)
-        if (cancelled) return
-        if (!res.ok) {
-          setWaveformPrefetchedBuffer(null)
-          return
-        }
-        const ac = new AudioContext()
-        try {
-          const buf = await ac.decodeAudioData(res.arrayBuffer.slice(0))
-          if (cancelled) return
-          setWaveformPrefetchedBuffer(buf)
-        } finally {
-          void ac.close()
-        }
-      } catch {
-        if (!cancelled) setWaveformPrefetchedBuffer(null)
-      }
     })()
     return () => {
       cancelled = true
@@ -724,8 +1190,22 @@ export default function App(): ReactElement {
   }, [videoPath])
 
   useEffect(() => {
+    const AUTO_SILENCE_RESPLIT = false
     if (!silenceSplitPending) return
     if (!videoPath || subtitles.length === 0) return
+    if (!AUTO_SILENCE_RESPLIT) {
+      // 싱크 안정화 우선: 자동 무음 재분할은 단어 경계를 다시 계산해 타임코드가 이동할 수 있다.
+      setSilenceSplitPending(false)
+      setGapFillWhenBuildingVrew(false)
+      void window.api
+        .logWaveformDebug('silence-worker', '자동 무음 재분할 생략(타임코드 보존 모드)', {
+          reason: 'preserve-word-timestamps',
+          subtitleCount: subtitles.length
+        })
+        .catch(() => {})
+      return
+    }
+
     const payload = extractWaveformPayload(waveformPeaksJsonData, subtitles)
     if (!payload) return
 
@@ -774,27 +1254,6 @@ export default function App(): ReactElement {
     }
   }, [silenceSplitPending, videoPath, subtitles, waveformPeaksJsonData])
 
-  /**
-   * 피크 JSON이 먼저 오고 디코딩이 늦을 때: CUT 후 `cutRanges`만 있고 버퍼는 풀 길이인 채로 들어오면
-   * 파형을 닫았다 열 때 전체 피크가 부활한다 — 한 번에 스플라이스 재적용.
-   */
-  useEffect(() => {
-    const buf = waveformPrefetchedBuffer
-    if (!buf || cutRanges.length === 0) return
-    const merged = mergeCutRanges(cutRanges)
-    let removed = 0
-    for (const c of merged) removed += c.end - c.start
-    const durFull = durationSec > 0.25 ? durationSec : buf.duration
-    const expectedShort = Math.max(0, durFull - removed)
-    if (expectedShort < 0.2) return
-    if (buf.duration > expectedShort + 0.12) {
-      setWaveformPrefetchedBuffer((cur) => {
-        if (!cur) return cur
-        return replayMediaCutsOnDecodedBuffer(cur, cutRanges)
-      })
-    }
-  }, [waveformPrefetchedBuffer, cutRanges, durationSec])
-
   const onVrewRowsChange = useCallback(
     (nextRows: SubtitleRow[]) => {
       setGapFillWhenBuildingVrew(false)
@@ -817,6 +1276,37 @@ export default function App(): ReactElement {
   const [waveformLineIndex, setWaveformLineIndex] = useState<number | null>(null)
   const [waveformWordId, setWaveformWordId] = useState<number | null>(null)
   const [peaksZoomViewRange, setPeaksZoomViewRange] = useState<PeaksZoomViewRange | null>(null)
+
+  useEffect(() => {
+    if (!videoPath || subtitles.length === 0) return
+    if (mergedCutRanges.length > 0) return
+    /** 파형 편집 중 자동 경계 스냅은 Peaks 세그먼트·단어 칩과 충돌(1:1 깨짐) — 접힌 뒤에만 적용 */
+    if (waveformLineIndex !== null) return
+    const wf = stitchedWaveformJsonData
+    if (!wf || !(durationSec > 0)) return
+    /** 비디오·피크 버퍼만 키에 넣음 — 지문 FP 를 넣으면 줄 분할·단어 편집 후 해시가 바뀌어 접은 직후 대량 스냅(수백 단어)이 한 번 더 돈다 */
+    const wfSig = `${wf.length ?? 0}:${(wf.data ?? []).length}`
+    const runKey = `${videoPath}|${wfSig}`
+    if (autoWordRealignRunKeyRef.current === runKey) return
+    const { lines: next, changedWords } = realignSubtitleWordBoundariesByWaveform(subtitles, wf, durationSec)
+    autoWordRealignRunKeyRef.current = runKey
+    if (changedWords <= 0) return
+    setGapFillWhenBuildingVrew(false)
+    applySubtitleChange(() => next, { recordHistory: false })
+    timelineEditLog('sync', 'auto word boundary realign', {
+      changedWords,
+      subtitleCount: subtitles.length,
+      durationSec
+    })
+  }, [
+    videoPath,
+    subtitles,
+    mergedCutRanges.length,
+    stitchedWaveformJsonData,
+    durationSec,
+    applySubtitleChange,
+    waveformLineIndex
+  ])
 
   /** 파형 CUT 확정 — 재생 스킵 + 전역 타임라인 자막 단어 반영 */
   const applyTimeRangeCut = useCallback(
@@ -846,7 +1336,6 @@ export default function App(): ReactElement {
         return next
       })
       setGapFillWhenBuildingVrew(false)
-      setWaveformPrefetchedBuffer((prev) => (prev ? spliceAudioBuffer(prev, s, e) : prev))
       applySubtitleChange((prev) => {
         const rows = subtitleLinesToVrewRows(prev, { gapFill: false })
         const nextRows = applyTimeRangeCutToVrewRows(rows, s, e)
@@ -863,9 +1352,10 @@ export default function App(): ReactElement {
   const vrewRows = useMemo(
     () =>
       subtitleLinesToVrewRows(subtitles, {
-        gapFill: gapFillWhenBuildingVrew && waveformLineIndex === null
+        // 싱크 우선 모드: 단어 타임코드를 원본 자막과 1:1로 유지
+        gapFill: false
       }),
-    [subtitles, gapFillWhenBuildingVrew, waveformLineIndex]
+    [subtitles]
   )
 
   /** Peaks 줌·단어 칹 %배치와 동일 소스 — 헤더 줄 시각만 쓰면 단어 타임코드와 어긋날 수 있음 */
@@ -896,37 +1386,37 @@ export default function App(): ReactElement {
 
   const onWaveformWordDoubleClick = useCallback(
     (lineIndex: number, wordIndex: number) => {
-      const line = subtitles[lineIndex]
-      const sw = line?.words?.[wordIndex]
       const row = vrewRows[lineIndex]
-      if (!sw || !row?.words?.length) return
-
-      /** gap-fill 무음(??)이 끼면 vrew.words 인덱스 ≠ 자막 words 인덱스 — 시간으로 매칭 */
-      const matchTime = (a: number, b: number) => Math.abs(a - b) < 0.05
-      let w = row.words.find(
-        (vw) =>
-          !vw.isSilence &&
-          matchTime(vw.start, sw.start) &&
-          matchTime(vw.end, sw.end)
-      )
-      if (!w && sw.isSilence) {
-        w = row.words.find(
-          (vw) => vw.isSilence && matchTime(vw.start, sw.start) && matchTime(vw.end, sw.end)
-        )
-      }
-      if (!w) {
-        const nonSilent = row.words.filter((vw) => !vw.isSilence)
-        if (nonSilent.length > 0) {
-          w = nonSilent.reduce((best, vw) =>
-            Math.abs(vw.start - sw.start) < Math.abs(best.start - sw.start) ? vw : best
-          )
-        }
-      }
+      const w = row?.words?.[wordIndex]
       if (!w) return
+      /** 같은 카드에서 이미 파형이 열려 있으면 접지 않고 활성 단어만 이동 */
+      if (waveformLineIndex === lineIndex) {
+        setWaveformWordId(w.id)
+        seekToSubtitleStart(w.start)
+        return
+      }
       setWaveformLineIndex(lineIndex)
       setWaveformWordId(w.id)
+      seekToSubtitleStart(w.start)
     },
-    [subtitles, vrewRows]
+    [vrewRows, waveformLineIndex, seekToSubtitleStart]
+  )
+
+  /** 파형이 펼쳐진 줄에서 단어 칩 단일 클릭 — 활성 칩이면 접기, 다른 칩이면 파형 유지·포커스만 이동 */
+  const onWaveformExpandedLineWordClick = useCallback(
+    (lineIndex: number, wordIndex: number) => {
+      const row = vrewRows[lineIndex]
+      const w = row?.words?.[wordIndex]
+      if (!w) return
+      if (waveformLineIndex === lineIndex && waveformWordId === w.id) {
+        setWaveformLineIndex(null)
+        setWaveformWordId(null)
+        return
+      }
+      setWaveformWordId(w.id)
+      seekToSubtitleStart(w.start)
+    },
+    [vrewRows, waveformLineIndex, waveformWordId, seekToSubtitleStart]
   )
 
   /** 파형 마운트를 단어 아래로 옮긴 뒤 body 포털·연결선 좌표 동기화 */
@@ -952,8 +1442,10 @@ export default function App(): ReactElement {
       const el = e.target as HTMLElement | null
       if (!el) return
       if (el.closest('.subtitle-waveform-flow-root')) return
-      if (el.closest('[data-waveform-active-word-chip="1"]')) return
+      /** 펼친 줄의 단어 칩 — 클릭은 칩 onClick(접기·단어 이동)에서 처리, 여기서는 외부 클릭만 닫기 */
+      if (el.closest('[data-waveform-expanded-row-chip="1"]')) return
       if (el.closest('[data-waveform-mount-for-open-line="1"]')) return
+      if (el.closest('[data-waveform-no-dismiss="1"]')) return
       /** body 포털된 CUT 삭제 버튼 — 클릭 시 파형 닫히면 CUT 확정 전에 줄이 닫혀 삭제가 스킵됨 */
       if (el.closest('[data-waveform-app-portal="1"]')) return
       setWaveformLineIndex(null)
@@ -1216,18 +1708,20 @@ export default function App(): ReactElement {
 
   const syncFromVideo = useCallback(() => {
     const el = videoRef.current
-    if (!el) return
-    let t = el.currentTime
+    const masterAudio = masterAudioRef.current
+    if (!el || !masterAudio) return
+    let t = masterAudioToMediaSec(masterAudio.paused ? masterAudio.currentTime : getMasterClockMediaSec())
     const skipped = skipCutRangeAt(t, cutRanges)
     if (skipped !== t) {
       t = skipped
+      masterAudio.currentTime = mediaToMasterAudioSec(t)
       el.currentTime = t
     }
     setPlayheadSec(t)
-    if (Number.isFinite(el.duration) && el.duration > 0) {
-      setDurationSec(el.duration)
+    if (Number.isFinite(masterAudio.duration) && masterAudio.duration > 0) {
+      setDurationSec(masterAudio.duration)
     }
-  }, [cutRanges])
+  }, [cutRanges, getMasterClockMediaSec, masterAudioToMediaSec, mediaToMasterAudioSec])
 
   /** CUT 직후 `timeupdate`가 없을 수 있어 재생 헤드가 삭제 구간 안에 남음 → 재생이 멈춘 것처럼 보임 */
   useEffect(() => {
@@ -1252,70 +1746,56 @@ export default function App(): ReactElement {
 
   const togglePlay = useCallback(() => {
     const el = videoRef.current
-    if (!el) return
-    if (el.paused) {
-      const from = el.currentTime
+    const masterAudio = masterAudioRef.current
+    if (!el || !masterAudio) return
+    previewEndMediaSecRef.current = null
+    if (masterAudio.paused) {
+      const from = masterAudioToMediaSec(masterAudio.currentTime)
       let t = skipCutRangeAt(from, cutRangesRef.current)
       if (Number.isFinite(el.duration) && el.duration > 0) {
         t = Math.min(t, Math.max(0, el.duration - 0.001))
       }
       if (t !== from) {
+        masterAudio.currentTime = mediaToMasterAudioSec(t)
         el.currentTime = t
         timelineEditLog('playback', 'togglePlay 직전 — 삭제 구간 밖으로 시크', { from, to: t })
       }
-      void el.play().catch((e) => {
+      void masterAudio.play().catch((e) => {
         timelineEditLog('playback', 'togglePlay play() 거절', {
           message: e instanceof Error ? e.message : String(e)
         })
       })
+      void el.play().catch(() => undefined)
     } else {
+      pauseMasterClock(masterAudioToMediaSec(masterAudio.currentTime))
       el.pause()
     }
-  }, [])
+  }, [pauseMasterClock, masterAudioToMediaSec, mediaToMasterAudioSec])
 
   /**
    * 재생 중 삭제 구간으로 들어가며 seek 하면 일부 브라우저가 일시정지를 띄우고,
    * `onPause` → isPlaying=false 로 RAF 가 끊겨 복귀 seek 이 안 됨 — pause 직후 구간 밖이면 즉시 재생.
    */
   const handleVideoPause = useCallback(() => {
+    const masterAudio = masterAudioRef.current
     const el = videoRef.current
-    if (!el) {
-      setIsPlaying(false)
+    if (masterAudio && !masterAudio.paused) {
+      void el?.play().catch(() => undefined)
       return
     }
-    const dur = el.duration
-    const cur = el.currentTime
-    if (Number.isFinite(dur) && dur > 0 && cur >= dur - 0.03) {
-      setIsPlaying(false)
-      return
-    }
-    if (mergeCutRanges([...cutRangesRef.current]).length === 0) {
-      setIsPlaying(false)
-      return
-    }
-    const next = skipCutRangeAt(cur, cutRangesRef.current)
-    let t = next
-    if (Number.isFinite(dur) && dur > 0) {
-      t = Math.min(next, Math.max(0, dur - 0.001))
-    }
-    if (next !== cur) {
-      el.currentTime = t
-      timelineEditLog('playback', 'pause 이벤트 — 삭제 구간 회피 시크 후 재생', { cur, to: t })
-      void el.play().catch((e) => {
-        timelineEditLog('playback', 'pause-회피 play() 거절', {
-          message: e instanceof Error ? e.message : String(e)
-        })
-      })
-      return
-    }
+    const cur = masterAudio ? masterAudioToMediaSec(masterAudio.currentTime) : (el?.currentTime ?? 0)
+    pauseMasterClock(cur)
     setIsPlaying(false)
-  }, [])
+  }, [pauseMasterClock, masterAudioToMediaSec])
 
   const pausePlayback = useCallback(() => {
     const el = videoRef.current
-    if (!el) return
+    const masterAudio = masterAudioRef.current
+    if (!el || !masterAudio) return
+    previewEndMediaSecRef.current = null
+    pauseMasterClock(masterAudioToMediaSec(masterAudio.currentTime))
     if (!el.paused) el.pause()
-  }, [])
+  }, [pauseMasterClock, masterAudioToMediaSec])
 
   useEffect(() => {
     if (!isPlaying) {
@@ -1327,24 +1807,36 @@ export default function App(): ReactElement {
     }
     const tick = () => {
       const el = videoRef.current
-      if (!el || el.paused) {
+      const masterAudio = masterAudioRef.current
+      if (!el || !masterAudio || masterAudio.paused) {
         rafPlayheadRef.current = null
         return
       }
-      if (el.seeking) {
+      const fromMaster = masterAudioToMediaSec(getMasterClockMediaSec())
+      let t = skipCutRangeAt(fromMaster, cutRanges)
+      if (t !== fromMaster) {
+        masterAudio.currentTime = mediaToMasterAudioSec(t)
+        el.currentTime = t
+        timelineEditLog('playback', 'RAF — 마스터클럭 기준 삭제 구간 스킵 시크', { from: fromMaster, to: t })
         rafPlayheadRef.current = window.requestAnimationFrame(tick)
         return
       }
-      const from = el.currentTime
-      let t = skipCutRangeAt(from, cutRanges)
-      if (t !== from) {
+      const drift = el.currentTime - t
+      if (Math.abs(drift) > 0.1 && !el.seeking) {
         el.currentTime = t
-        timelineEditLog('playback', 'RAF — 재생 중 삭제 구간 스킵 시크', { from, to: t })
-        rafPlayheadRef.current = window.requestAnimationFrame(tick)
-        return
       }
       // 재생 라인 표시를 0.01초 단위로 안정화
-      t = Math.round(el.currentTime * 100) / 100
+      t = Math.round(t * 100) / 100
+      const previewEnd = previewEndMediaSecRef.current
+      if (previewEnd != null && t >= previewEnd - 0.01) {
+        pauseMasterClock(previewEnd)
+        masterAudio.pause()
+        el.pause()
+        el.currentTime = previewEnd
+        setPlayheadSec(previewEnd)
+        previewEndMediaSecRef.current = null
+        return
+      }
       setPlayheadSec(t)
       rafPlayheadRef.current = window.requestAnimationFrame(tick)
     }
@@ -1355,7 +1847,7 @@ export default function App(): ReactElement {
         rafPlayheadRef.current = null
       }
     }
-  }, [cutRanges, isPlaying])
+  }, [cutRanges, isPlaying, getMasterClockMediaSec, pauseMasterClock, mediaToMasterAudioSec, masterAudioToMediaSec])
 
   useEffect(() => {
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
@@ -1372,13 +1864,16 @@ export default function App(): ReactElement {
 
   const applySeekValue = useCallback((raw: string) => {
     const el = videoRef.current
-    if (!el) return
+    const masterAudio = masterAudioRef.current
+    if (!el || !masterAudio) return
     const v = Number(raw)
     if (!Number.isFinite(v)) return
     const t = skipCutRangeAt(v, cutRanges)
+    masterAudio.currentTime = mediaToMasterAudioSec(t)
     el.currentTime = t
     setPlayheadSec(t)
-  }, [cutRanges])
+    pauseMasterClock(t)
+  }, [cutRanges, pauseMasterClock, mediaToMasterAudioSec])
 
   const onSeekChange = useCallback(
     (e: ChangeEvent<HTMLInputElement>) => {
@@ -2194,7 +2689,7 @@ export default function App(): ReactElement {
           </div>
         </header>
 
-        <div className="preview-subtitle-controls-bar">
+        <div className="preview-subtitle-controls-bar" data-waveform-no-dismiss="1">
           <div className="preview-subtitle-controls">
             <div className="preview-subtitle-controls-rows">
               <div className="preview-subtitle-controls-line">
@@ -2348,17 +2843,44 @@ export default function App(): ReactElement {
         </div>
 
         <div className="layout-split">
-          <section className="split-preview" aria-label="영상 미리보기" style={{ width: `${previewWidthPct}%` }}>
+          <section
+            className="split-preview"
+            aria-label="영상 미리보기"
+            style={{ width: `${previewWidthPct}%` }}
+            data-waveform-no-dismiss="1"
+          >
             {videoPath ? (
               <>
                 <div className={previewMediaClass}>
                   <div className="preview-video-stack" ref={previewStackRef}>
+                    <audio
+                      ref={masterAudioRef}
+                      preload="metadata"
+                      src={masterAudioSrcUrl ?? window.api.getMediaFileUrl(videoPath)}
+                      className="hidden"
+                      onTimeUpdate={syncFromVideo}
+                      onLoadedMetadata={syncFromVideo}
+                      onDurationChange={syncFromVideo}
+                      onPlay={() => setIsPlaying(true)}
+                      onPause={() => {
+                        const curRaw = masterAudioRef.current?.currentTime ?? 0
+                        const cur = masterAudioToMediaSec(curRaw)
+                        pauseMasterClock(cur)
+                        setIsPlaying(false)
+                      }}
+                      onEnded={() => {
+                        const endSec = masterAudioToMediaSec(masterAudioRef.current?.duration ?? durationSec)
+                        pauseMasterClock(endSec)
+                        setIsPlaying(false)
+                      }}
+                    />
                     <video
                       ref={videoRef}
                       key={videoPath}
                       className="preview-video"
                       preload="metadata"
                       playsInline
+                      muted
                       src={window.api.getMediaFileUrl(videoPath)}
                       title={videoPath}
                       onTimeUpdate={syncFromVideo}
@@ -2461,6 +2983,7 @@ export default function App(): ReactElement {
             role="separator"
             aria-orientation="vertical"
             aria-label="패널 너비 조절"
+            data-waveform-no-dismiss="1"
             onMouseDown={startSplitResize}
           />
 
@@ -2537,6 +3060,7 @@ export default function App(): ReactElement {
                           waveformExpandedLineIndex={waveformLineIndex}
                           waveformActiveWordId={waveformWordId}
                           onWaveformWordDoubleClick={onWaveformWordDoubleClick}
+                          onWaveformExpandedLineWordClick={onWaveformExpandedLineWordClick}
                           vrewRows={vrewRows}
                           onWaveformMountLayout={onWaveformMountLayout}
                           mediaDurationSec={durationSec > 0 ? durationSec : undefined}
@@ -2549,17 +3073,20 @@ export default function App(): ReactElement {
                         ref={waveformPeaksRef}
                         rows={vrewRows}
                         onRowsChange={onVrewRowsChange}
-                        audioUrl={waveformMediaUrl}
+                        audioUrl={masterAudioSrcUrl ?? waveformMediaUrl}
                         localMediaPath={videoPath}
-                        prefetchedAudioBuffer={waveformPrefetchedBuffer}
-                        precomputedWaveformJson={waveformPeaksJsonData}
-                        precomputedPeaksJsonFileUrl={waveformPeaksJsonData ? null : waveformPeaksFileUrl}
+                        precomputedWaveformJson={stitchedWaveformJsonData}
+                        precomputedPeaksJsonFileUrl={null}
                         waveMountByLineRef={waveMountByLineRef}
                         activeLineIndex={waveformLineIndex}
                         activeWordId={waveformWordId}
                         waveformCardBounds={waveformLineZoomBounds}
+                        cutRanges={cutRanges}
                         onZoomViewRange={setPeaksZoomViewRange}
                         onTimeRangeCut={applyTimeRangeCut}
+                        onPlayEditRange={playEditRange}
+                        playheadEditSec={playheadEditSec}
+                        isPlaying={isPlaying}
                       />
                     ) : null}
                   </>

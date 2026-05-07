@@ -8,6 +8,8 @@ import { formatVrewTime } from './formatVrewTime'
  */
 class VrewSegmentMarker implements SegmentMarker {
   private readonly opts: CreateSegmentMarkerOptions
+  /** SegmentOptions.markers — false 일 때는 자막 카드·WaveformWordConnector 가 경계를 표시하므로 Peaks 세로선을 숨긴다(인접 단위 경계 이중선 방지). */
+  private readonly markersUi: boolean
 
   private group!: Konva.Group
   private handle!: Konva.Rect
@@ -18,25 +20,27 @@ class VrewSegmentMarker implements SegmentMarker {
 
   constructor(options: CreateSegmentMarkerOptions) {
     this.opts = options
+    this.markersUi = this.opts.segment?.markers === true
   }
 
   init(group: Konva.Group): void {
     this.group = group
     const blue = '#3b82f6'
     const stroke = '#1d4ed8'
-    /** Peaks 가 draggable:false 로 넘길 때도 구간 경계선은 항상 보여야 함 */
-    const showEdgeUi = this.opts.draggable || this.opts.segment?.editable !== false
+    const showEdgeUi =
+      this.markersUi && (this.opts.draggable || this.opts.segment?.editable !== false)
     const handleW = 10
     const handleH = 22
     const handleX = -handleW / 2 + 0.5
 
+    /** 드래그 핸들·팁만 표시 — 세로선은 WaveformWordConnector(SVG)가 그려 이중선이 되지 않도록 Konva 라인은 끈다 */
     this.line = new Konva.Line({
       x: 0,
       y: 0,
       points: [0.5, 0, 0.5, 80],
       stroke: blue,
       strokeWidth: 2,
-      visible: true
+      visible: false
     })
 
     this.handle = new Konva.Rect({
@@ -74,7 +78,7 @@ class VrewSegmentMarker implements SegmentMarker {
       opacity: 1
     })
 
-    this.tipGroup = new Konva.Group({ visible: true })
+    this.tipGroup = new Konva.Group({ visible: this.markersUi })
     this.tipGroup.add(this.tipBg)
     this.tipGroup.add(this.tipText)
 
@@ -109,6 +113,7 @@ class VrewSegmentMarker implements SegmentMarker {
 
   private bindHandlers(): void {
     const refreshTip = (): void => {
+      if (!this.markersUi) return
       this.tipGroup.visible(true)
       this.fitTipBoxSize()
       this.positionTip()
@@ -126,9 +131,10 @@ class VrewSegmentMarker implements SegmentMarker {
     const mid = h / 2
     this.handle.y(mid - this.handle.height() / 2)
     this.line.points([0.5, 0, 0.5, h])
+    this.line.visible(false)
     this.fitTipBoxSize()
     this.positionTip()
-    this.tipGroup.visible(true)
+    this.tipGroup.visible(this.markersUi)
   }
 
   update(options: Partial<{ startTime: number; endTime: number; editable: boolean }>): void {
@@ -144,10 +150,10 @@ class VrewSegmentMarker implements SegmentMarker {
     this.tipText.text(formatVrewTime(t))
     this.fitTipBoxSize()
     this.positionTip()
-    this.tipGroup.visible(true)
+    this.tipGroup.visible(this.markersUi)
 
     if (options.editable !== undefined) {
-      this.handle.visible(options.editable)
+      this.handle.visible(this.markersUi && options.editable)
     }
   }
 

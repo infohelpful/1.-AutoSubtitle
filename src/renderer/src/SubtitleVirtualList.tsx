@@ -22,6 +22,8 @@ import { computeLineZoomWindowFromCardBounds, type LineZoomWindowResult } from '
 import { useSubtitleData } from './subtitleDataContext'
 
 const WORD_LAYOUT_SPRING = { type: 'spring' as const, stiffness: 380, damping: 34 }
+/** 파형 타임라인 펼침 — 칩 너비·위치 전환을 조금 더 부드럽게 */
+const WORD_LAYOUT_SPRING_TIMELINE = { type: 'spring' as const, stiffness: 300, damping: 36, mass: 0.92 }
 
 /** 가상 목록 기본 행 높이(초기 추정) — 이후 `useDynamicRowHeight`+ResizeObserver로 실제 카드 높이로 갱신 */
 export const SUBTITLE_LIST_ROW_HEIGHT = 152
@@ -80,6 +82,8 @@ export type SubtitleVirtualListProps = {
   waveformExpandedLineIndex?: number | null
   waveformActiveWordId?: number | null
   onWaveformWordDoubleClick?: (lineIndex: number, wordIndex: number) => void
+  /** 파형 펼침 줄에서 단어 칩 단일 클릭 — 활성 단어는 접기, 그 외 단어는 포커스만 이동 */
+  onWaveformExpandedLineWordClick?: (lineIndex: number, wordIndex: number) => void
   vrewRows?: SubtitleRow[]
   /** 파형 마운트를 선택 단어 아래로 정렬한 뒤 body 포털 위치 동기화 */
   onWaveformMountLayout?: () => void
@@ -126,6 +130,7 @@ export type SubtitleListRowProps = {
   waveformExpandedLineIndex?: number | null
   waveformActiveWordId?: number | null
   onWaveformWordDoubleClick?: (lineIndex: number, wordIndex: number) => void
+  onWaveformExpandedLineWordClick?: SubtitleVirtualListProps['onWaveformExpandedLineWordClick']
   vrewRows?: SubtitleRow[]
   onWaveformMountLayout?: SubtitleVirtualListProps['onWaveformMountLayout']
   mediaDurationSec?: number
@@ -167,6 +172,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     waveformExpandedLineIndex,
     waveformActiveWordId,
     onWaveformWordDoubleClick,
+    onWaveformExpandedLineWordClick,
     vrewRows,
     onWaveformMountLayout,
     mediaDurationSec,
@@ -245,13 +251,20 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
   }, [wordRail])
 
   /**
-   * 파형이 열린 줄이면 Peaks 가 보고한 실제 zoomview 구간(windowStart/End)으로 %를 맞춘다.
-   * 이론상 computeLineZoomWindow 만 쓰면 zoomLevels 스냅 때문에 세그먼트·흰선과 칹 경계가 어긋난다.
+   * 파형이 열린 줄: Peaks 실제 zoomview 구간과 줄 구간을 맞춘다.
+   * 다만 사전 생성 waveform JSON 의 최소 scale(samples_per_pixel) 때문에 Peaks 가
+   * 요청한 초 단위보다 훨씬 넓은 시간을 보여 줄 수 있음 — 그때는 칹 %를 줄(카드) 구간으로 채워
+   * 단어 라벨이 잘리지 않게 한다. 좁은 줌에서는 여전히 Peaks 구간을 써 세그먼트와 픽셀을 맞춘다.
    */
   const wordTimeline = useMemo((): LineZoomWindowResult | null => {
     if (wordRail.length === 0) return null
     const lineStart = Math.min(...wordRail.map((w) => w.start))
     const lineEnd = Math.max(...wordRail.map((w) => w.end))
+    const lineTw = computeLineZoomWindowFromCardBounds(lineStart, lineEnd, {
+      mediaDurationSec:
+        mediaDurationSec != null && mediaDurationSec > 0 ? mediaDurationSec : undefined,
+      clipTrailingToLineEnd: true
+    })
     if (
       peaksZoomViewRange != null &&
       peaksZoomViewRange.lineIndex === index &&
@@ -259,20 +272,18 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     ) {
       const ws = peaksZoomViewRange.windowStart
       const we = peaksZoomViewRange.windowEnd
-      const span = Math.max(we - ws, 1e-6)
-      return {
-        lineStart,
-        lineEnd,
-        windowStart: ws,
-        windowEnd: we,
-        span
+      const peaksSpan = Math.max(we - ws, 1e-6)
+      if (peaksSpan <= lineTw.span * 1.14) {
+        return {
+          lineStart,
+          lineEnd,
+          windowStart: ws,
+          windowEnd: we,
+          span: peaksSpan
+        }
       }
     }
-    return computeLineZoomWindowFromCardBounds(lineStart, lineEnd, {
-      mediaDurationSec:
-        mediaDurationSec != null && mediaDurationSec > 0 ? mediaDurationSec : undefined,
-      clipTrailingToLineEnd: true
-    })
+    return lineTw
   }, [wordRail, mediaDurationSec, peaksZoomViewRange, waveformExpandedLineIndex, index])
 
   /** 파형이 열린 줄만 시간축(%)·가로 스크롤 — 그 외는 줄바꿈 읽기 모드 */
@@ -282,6 +293,16 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
 
   const wordRowOuterRef = useRef<HTMLDivElement>(null)
   const wordRowInnerRef = useRef<HTMLDivElement>(null)
+  /** 활성 단어 칩 단일 클릭 접기는 지연 — 더블클릭(포커스 이동)이 성립하면 타이머 취소 */
+  const activeChipCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    return () => {
+      if (activeChipCloseTimerRef.current != null) {
+        clearTimeout(activeChipCloseTimerRef.current)
+        activeChipCloseTimerRef.current = null
+      }
+    }
+  }, [])
   /** 단어 칩 실제 픽셀 경계 — 비율(%)만 쓰면 -1px 이웃 겹침 때문에 세로 구분선과 어긋남 */
   const [measuredCaretLeftPx, setMeasuredCaretLeftPx] = useState<number[] | null>(null)
   /** 캐럿마다 인접 칩·줄바꿈 기준 세로 중앙(px) — 창 리사이즈·줄바꿈 후에도 맞추려면 전역 mid-y 가 아님 */
@@ -1278,7 +1299,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                     key={wordMotionKey}
                     layout={timelineLayoutThisRow}
                     initial={false}
-                    transition={WORD_LAYOUT_SPRING}
+                    transition={timelineLayoutThisRow ? WORD_LAYOUT_SPRING_TIMELINE : WORD_LAYOUT_SPRING}
                     className={`subtitle-word-slot${timelineLayoutThisRow ? '' : ' subtitle-word-slot--compact'}`}
                     style={
                       timelineLayoutThisRow && wordTimeline
@@ -1289,20 +1310,54 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                     <motion.button
                       layout={timelineLayoutThisRow}
                       initial={false}
-                      transition={WORD_LAYOUT_SPRING}
+                      transition={timelineLayoutThisRow ? WORD_LAYOUT_SPRING_TIMELINE : WORD_LAYOUT_SPRING}
                       id={`subtitle-word-${index}-${wi}`}
                       type="button"
                       tabIndex={-1}
                       data-word-start={rw.start}
                       data-word-end={rw.end}
+                      {...(chipWordId != null ? ({ 'data-word-id': String(chipWordId) } as const) : {})}
                       data-waveform-active-word-chip={isActiveWaveformChip ? '1' : undefined}
+                      data-waveform-expanded-row-chip={timelineLayoutThisRow ? '1' : undefined}
                       className={`subtitle-word-chip subtitle-word-chip--proportional${isWordActive ? ' subtitle-word-chip--active' : ''}${rw.isSilence ? ' subtitle-word-chip--silence' : ''}`}
                       onMouseEnter={() => {
                         setCaretIndex(wi)
                         showStaticCaret()
                         setHoveredCaretIndex(wi)
                       }}
-                      onClick={() => {
+                      onClick={(e: MouseEvent<HTMLButtonElement>) => {
+                        if (
+                          waveformEnabled &&
+                          waveformExpandedLineIndex === index &&
+                          onWaveformExpandedLineWordClick
+                        ) {
+                          const isWaveActiveChip =
+                            chipWordId != null &&
+                            waveformActiveWordId != null &&
+                            chipWordId === waveformActiveWordId
+
+                          if (activeChipCloseTimerRef.current != null) {
+                            clearTimeout(activeChipCloseTimerRef.current)
+                            activeChipCloseTimerRef.current = null
+                          }
+
+                          /** detail>=2 는 더블클릭의 두 번째 click — 접기 타이머를 걸면 안 됨 */
+                          if (isWaveActiveChip && e.detail === 1) {
+                            activeChipCloseTimerRef.current = setTimeout(() => {
+                              onWaveformExpandedLineWordClick(index, wi)
+                              activeChipCloseTimerRef.current = null
+                            }, 280)
+                          } else if (!isWaveActiveChip) {
+                            onWaveformExpandedLineWordClick(index, wi)
+                          }
+
+                          if (isPlaying) {
+                            onRequestPausePlayback()
+                          }
+                          clearSelection()
+                          activateCaretAt(wi, true)
+                          return
+                        }
                         onWordBlockClick(rw.start)
                         if (isPlaying) {
                           onRequestPausePlayback()
@@ -1322,6 +1377,10 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                         activateCaretAt(wi, true)
                       }}
                       onDoubleClick={(e) => {
+                        if (activeChipCloseTimerRef.current != null) {
+                          clearTimeout(activeChipCloseTimerRef.current)
+                          activeChipCloseTimerRef.current = null
+                        }
                         if (!waveformEnabled || !onWaveformWordDoubleClick) return
                         e.preventDefault()
                         e.stopPropagation()
@@ -1407,6 +1466,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
           ref={subtitleTextareaRef}
           className="subtitle-card-textarea subtitle-card-textarea--virtual"
           data-subtitle-edit
+          data-waveform-no-dismiss="1"
           aria-label="자막 텍스트"
           value={subtitleTextDisplay}
           onChange={(e) => {
@@ -1639,6 +1699,7 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       waveformExpandedLineIndex: props.waveformExpandedLineIndex,
       waveformActiveWordId: props.waveformActiveWordId,
       onWaveformWordDoubleClick: props.onWaveformWordDoubleClick,
+      onWaveformExpandedLineWordClick: props.onWaveformExpandedLineWordClick,
       vrewRows: props.vrewRows,
       onWaveformMountLayout: props.onWaveformMountLayout,
       mediaDurationSec: props.mediaDurationSec,
@@ -1672,6 +1733,7 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.waveformExpandedLineIndex,
       props.waveformActiveWordId,
       props.onWaveformWordDoubleClick,
+      props.onWaveformExpandedLineWordClick,
       props.vrewRows,
       props.onWaveformMountLayout,
       props.mediaDurationSec,

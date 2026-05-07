@@ -17,9 +17,11 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n))
 }
 
-/** 칩 DOM 순서대로 — data-word-start/end (자막 줄 시간) */
-function listWordTimesFromDom(lineIndex: number): { start: number; end: number }[] {
-  const out: { start: number; end: number }[] = []
+type WordChipDomMeta = { start: number; end: number; wordId: number | null }
+
+/** 칩 DOM 순서대로 — data-word-start/end; data-word-id 로 Peaks 세그먼트와 매칭 */
+function listWordChipMetaFromDom(lineIndex: number): WordChipDomMeta[] {
+  const out: WordChipDomMeta[] = []
   const prefix = `subtitle-word-${lineIndex}-`
   for (let i = 0; i < 512; i++) {
     const el = document.getElementById(`${prefix}${i}`) as HTMLElement | null
@@ -30,9 +32,35 @@ function listWordTimesFromDom(lineIndex: number): { start: number; end: number }
     const s = Number(ds)
     const e = Number(de)
     if (!Number.isFinite(s) || !Number.isFinite(e)) continue
-    out.push({ start: s, end: e })
+    const idRaw = el.dataset.wordId
+    const wid = idRaw !== undefined && idRaw !== '' ? Number(idRaw) : NaN
+    out.push({
+      start: s,
+      end: e,
+      wordId: Number.isFinite(wid) ? wid : null
+    })
   }
   return out
+}
+
+/**
+ * 길이 조절 드래그 중에는 칩 DOM 타임스탬프가 아직 반영 안 됨 — Peaks 세그먼트가 진실값
+ */
+function resolveWordTimesForConnectorLine(
+  lineIndex: number,
+  peaks: PeaksInstance | null | undefined,
+  peaksReady: boolean
+): { start: number; end: number }[] {
+  const chips = listWordChipMetaFromDom(lineIndex)
+  if (!peaksReady || !peaks) {
+    return chips.map(({ start, end }) => ({ start, end }))
+  }
+  return chips.map(({ start, end, wordId }) => {
+    if (wordId == null) return { start, end }
+    const seg = peaks.segments.getSegment(String(wordId))
+    if (!seg) return { start, end }
+    return { start: seg.startTime, end: seg.endTime }
+  })
 }
 
 function subtitleWordRowBottomPx(lineIndex: number): number {
@@ -63,6 +91,62 @@ function buildSegmentsFromChipRects(activeLineIndex: number, zr: DOMRect): VSegm
 }
 
 type VSegment = { x: number; y1: number; y2: number }
+
+/**
+ * DOM 단어 순서대로만 경계를 만든다. 전역 시간 정렬+큰 eps 는 짧은 무음 두 경계까지 합칠 수 있음.
+ * 인접 단어 end 와 다음 start 만 가깝다면 같은 말줄표로 보고 한 시각으로 묶음.
+ */
+function wordConnectorBoundaryTimes(words: { start: number; end: number }[], edgeEpsSec = 0.02): number[] {
+  if (words.length === 0) return []
+  const out: number[] = [words[0]!.start]
+  for (let i = 0; i < words.length - 1; i++) {
+    const end = words[i]!.end
+    const nextStart = words[i + 1]!.start
+    if (Math.abs(end - nextStart) <= edgeEpsSec) out.push((end + nextStart) / 2)
+    else {
+      out.push(end, nextStart)
+    }
+  }
+  out.push(words[words.length - 1]!.end)
+  const collapsed: number[] = []
+  for (const t of out) {
+    if (collapsed.length === 0 || Math.abs(t - collapsed[collapsed.length - 1]!) > 1e-5) collapsed.push(t)
+  }
+  return collapsed
+}
+
+/** 칩 사각형 폴백: 오른쪽 끝(i)=왼쪽 끝(i+1) 동일 픽셀 병합 */
+function dedupeSegmentsByX(segs: VSegment[]): VSegment[] {
+  const map = new Map<number, VSegment>()
+  for (const s of segs) {
+    const k = Math.round(s.x * 100) / 100
+    if (!map.has(k)) map.set(k, s)
+  }
+  return Array.from(map.values()).sort((a, b) => a.x - b.x)
+}
+
+/** float·줌 매핑 후 1px 이내면 눈에 두 줄 — 한 줄로 합치고 높이는 유지 */
+function mergeVerticalSegmentsByPixelProximity(segs: VSegment[], minDxPx = 2): VSegment[] {
+  if (segs.length <= 1) return segs
+  const sorted = [...segs].sort((a, b) => a.x - b.x)
+  const out: VSegment[] = []
+  let cur = sorted[0]!
+  for (let i = 1; i < sorted.length; i++) {
+    const s = sorted[i]!
+    if (Math.abs(s.x - cur.x) < minDxPx) {
+      cur = {
+        x: (cur.x + s.x) / 2,
+        y1: Math.min(cur.y1, s.y1),
+        y2: Math.max(cur.y2, s.y2)
+      }
+    } else {
+      out.push(cur)
+      cur = s
+    }
+  }
+  out.push(cur)
+  return out
+}
 
 export function WaveformWordConnector({
   activeLineIndex,
@@ -97,10 +181,10 @@ export function WaveformWordConnector({
 
     const plotLeft = zr.left
     const plotW = zr.width
-    const words = listWordTimesFromDom(activeLineIndex)
+    const peaks = peaksRef.current
+    const words = resolveWordTimesForConnectorLine(activeLineIndex, peaks, peaksReady)
 
     if (peaksReady && words.length > 0) {
-      const peaks = peaksRef.current
       const zv = peaks?.views.getView('zoomview')
       if (zv) {
         const t0 = zv.getStartTime()
@@ -112,25 +196,22 @@ export function WaveformWordConnector({
           const rowBottom = subtitleWordRowBottomPx(activeLineIndex)
           const y2 = Math.max(rowBottom > 0 ? rowBottom : zr.bottom, zr.bottom)
           const segs: VSegment[] = []
-          for (const w of words) {
+          for (const t of wordConnectorBoundaryTimes(words)) {
             segs.push({
-              x: clamp(xAt(w.start), plotLeft, plotLeft + plotW),
-              y1,
-              y2
-            })
-            segs.push({
-              x: clamp(xAt(w.end), plotLeft, plotLeft + plotW),
+              x: clamp(xAt(t), plotLeft, plotLeft + plotW),
               y1,
               y2
             })
           }
-          setWordBoundarySegments(segs)
+          setWordBoundarySegments(mergeVerticalSegmentsByPixelProximity(segs))
           return
         }
       }
     }
 
-    setWordBoundarySegments(buildSegmentsFromChipRects(activeLineIndex, zr))
+    setWordBoundarySegments(
+      mergeVerticalSegmentsByPixelProximity(dedupeSegmentsByX(buildSegmentsFromChipRects(activeLineIndex, zr)))
+    )
   }, [overlayVisible, activeLineIndex, peaksReady, peaksRef, zoomRef])
 
   useLayoutEffect(() => {
@@ -164,14 +245,28 @@ export function WaveformWordConnector({
         refresh()
       })
     }
+    /** segments.update 는 연속 다발 — 커넥터만 trailing 48ms 묶음(dragged/zoom 는 기존 rAF 합류) */
+    let updateThrottle: ReturnType<typeof setTimeout> | null = null
+    const onSegUpdateThrottled = (): void => {
+      if (updateThrottle !== null) return
+      updateThrottle = window.setTimeout(() => {
+        updateThrottle = null
+        refresh()
+      }, 48)
+    }
     peaks.on('zoomview.update', onZ)
     peaks.on('segments.dragend', onZ)
     peaks.on('segments.dragged', onZ)
+    peaks.on('segments.dragstart', onZ)
+    peaks.on('segments.update', onSegUpdateThrottled)
     return () => {
       if (rafPending) cancelAnimationFrame(rafPending)
+      if (updateThrottle !== null) window.clearTimeout(updateThrottle)
       peaks.off('zoomview.update', onZ)
       peaks.off('segments.dragend', onZ)
       peaks.off('segments.dragged', onZ)
+      peaks.off('segments.dragstart', onZ)
+      peaks.off('segments.update', onSegUpdateThrottled)
     }
   }, [peaksReady, refresh, peaksRef])
 
@@ -205,7 +300,8 @@ export function WaveformWordConnector({
     let attempts = 0
     let raf = 0
     const retry = (): void => {
-      const times = listWordTimesFromDom(activeLineIndex)
+      const peaks = peaksRef.current
+      const times = resolveWordTimesForConnectorLine(activeLineIndex, peaks, peaksReady && !!peaks)
       if (times.length === 0 && attempts < 90) {
         attempts++
         raf = requestAnimationFrame(retry)

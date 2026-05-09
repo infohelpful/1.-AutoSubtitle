@@ -20,6 +20,8 @@ export function computeLineZoomWindowFromCardBounds(
      * false/omit: 기존처럼 양끝 소량 패딩.
      */
     clipTrailingToLineEnd?: boolean
+    /** true: 첫 단어 앞 패딩 없음 — 회색 여백 줄임 */
+    clipLeadingToLineStart?: boolean
   }
 ): LineZoomWindowResult {
   const lineSpan = Math.max(lineEnd - lineStart, 0.001)
@@ -31,7 +33,8 @@ export function computeLineZoomWindowFromCardBounds(
       ? options.mediaDurationSec
       : Number.POSITIVE_INFINITY
   const clipEnd = options?.clipTrailingToLineEnd === true
-  let windowStart = Math.max(0, lineStart - pad)
+  const clipLead = options?.clipLeadingToLineStart === true
+  let windowStart = clipLead ? Math.max(0, lineStart) : Math.max(0, lineStart - pad)
   let windowEnd = clipEnd ? Math.min(dur, lineEnd) : Math.min(dur, lineEnd + pad)
   if (clipEnd && windowEnd <= windowStart + 1e-6) {
     windowStart = Math.max(0, lineStart)
@@ -46,7 +49,11 @@ export function computeLineZoomWindowFromCardBounds(
 
 export function computeLineZoomWindow(
   words: readonly { start: number; end: number }[],
-  options?: { mediaDurationSec?: number | null; clipTrailingToLineEnd?: boolean }
+  options?: {
+    mediaDurationSec?: number | null
+    clipTrailingToLineEnd?: boolean
+    clipLeadingToLineStart?: boolean
+  }
 ): LineZoomWindowResult | null {
   if (!words.length) return null
   const lineStart = Math.min(...words.map((w) => w.start))

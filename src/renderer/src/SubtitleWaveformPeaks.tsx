@@ -30,6 +30,13 @@ import { applyZoomThenClampEndBeforeOrAt } from './peaksZoomClamp'
 import { WaveformWordConnector } from './WaveformWordConnector'
 import type { CutRange } from '../../shared/ipc'
 import { mergeCutRanges } from '../../shared/timelineCollapse'
+import { cutRangesSignature } from './timeline/stitchWaveformJson'
+import {
+  canIncrementalWordList,
+  segmentOptionsPeaksUpdateEqual,
+  segmentOptionsRequireFullRebuild,
+  segmentOptionsUpdatePayload
+} from './flatWordsPeaksSyncHelpers'
 
 type WaveformEditTool = 'cut' | 'adjust' | null
 
@@ -288,77 +295,131 @@ function applyDirectionalAdjustResplit(args: {
   currentIndex: number
   oldSegment: SegmentBoundarySnapshot
   newSegment: SegmentBoundarySnapshot
+  cardBounds?: { start: number; end: number }
 }): Word[] {
-  const { words, currentIndex, oldSegment, newSegment } = args
+  const { words, currentIndex, oldSegment, newSegment, cardBounds } = args
   const next = words.map((w) => ({ ...w }))
+  const current = next[currentIndex]
+  if (!current) return next
 
   const isLeftEdgeDragged = newSegment.startTime !== oldSegment.startTime
   const isRightEdgeDragged = newSegment.endTime !== oldSegment.endTime
+  const minSeg = 0.05
+  const eps = 1e-6
+  const makeNextId = (): number => next.reduce((m, w) => Math.max(m, w.id), -1) + 1
+  const joinTexts = (parts: Array<string | undefined>): string =>
+    parts
+      .map((p) => (p ?? '').trim())
+      .filter(Boolean)
+      .join(' ')
 
-  let leftWordIndex = -1
-  let rightWordIndex = -1
-  let newBoundaryTime = 0
-
+  // 우측 경계 조절: 확장 시 다음 단어들을 흡수(병합), 축소 시 우측을 분리.
   if (isRightEdgeDragged) {
-    leftWordIndex = currentIndex
-    rightWordIndex = currentIndex + 1
-    newBoundaryTime = newSegment.endTime
-  } else if (isLeftEdgeDragged) {
-    leftWordIndex = currentIndex - 1
-    rightWordIndex = currentIndex
-    newBoundaryTime = newSegment.startTime
-  } else {
+    const minEnd = current.start + minSeg
+    const cardMaxEnd = cardBounds ? Math.max(cardBounds.start + minSeg, cardBounds.end) : Number.POSITIVE_INFINITY
+    const targetEnd = Math.min(cardMaxEnd, Math.max(minEnd, newSegment.endTime))
+    const oldEnd = current.end
+
+    // 축소: 잘려나간 우측 구간을 새 단어로 분리
+    if (targetEnd < oldEnd - eps) {
+      const ratio = (targetEnd - current.start) / Math.max(eps, oldEnd - current.start)
+      const { left, right } = splitWordTextByRatio(current.text ?? '', ratio)
+      current.end = targetEnd
+      if (right.trim().length > 0) {
+        current.text = left.trim().length > 0 ? left : current.text
+        const rightWord: Word = {
+          ...current,
+          id: makeNextId(),
+          start: targetEnd,
+          end: oldEnd,
+          text: right
+        }
+        next.splice(currentIndex + 1, 0, rightWord)
+      }
+      return next
+    }
+
+    // 확장: targetEnd까지 다음 단어 경계를 제거하며 흡수
+    current.end = targetEnd
+    const absorbedTexts: string[] = []
+    let i = currentIndex + 1
+    while (i < next.length) {
+      const w = next[i]
+      if (w.start >= targetEnd - eps) break
+      if (w.end <= targetEnd + eps) {
+        absorbedTexts.push(w.text)
+        next.splice(i, 1)
+        continue
+      }
+      // 마지막 단어 일부만 침범한 경우: 침범된 앞부분만 흡수하고 남은 뒷부분은 유지
+      const ratio = (targetEnd - w.start) / Math.max(eps, w.end - w.start)
+      const { left, right } = splitWordTextByRatio(w.text ?? '', ratio)
+      absorbedTexts.push(left)
+      w.start = targetEnd
+      if (right.trim().length > 0) w.text = right
+      break
+    }
+    if (absorbedTexts.length > 0) {
+      current.text = joinTexts([current.text, ...absorbedTexts])
+    }
     return next
   }
 
-  const leftWord = next[leftWordIndex]
-  const rightWord = next[rightWordIndex]
-  if (!leftWord || !rightWord) return next
+  // 좌측 경계 조절: 확장 시 이전 단어들을 흡수(병합), 축소 시 좌측을 분리.
+  if (isLeftEdgeDragged) {
+    const maxStart = current.end - minSeg
+    const cardMinStart = cardBounds ? cardBounds.start : 0
+    const targetStart = Math.max(cardMinStart, Math.min(newSegment.startTime, maxStart))
+    const oldStart = current.start
 
-  const totalDuration = rightWord.end - leftWord.start
-  if (totalDuration < 0.1) return next
+    // 축소: 잘려나간 좌측 구간을 새 단어로 분리
+    if (targetStart > oldStart + eps) {
+      const ratio = (targetStart - oldStart) / Math.max(eps, current.end - oldStart)
+      const { left, right } = splitWordTextByRatio(current.text ?? '', ratio)
+      current.start = targetStart
+      if (left.trim().length > 0) {
+        current.text = right.trim().length > 0 ? right : current.text
+        const leftWord: Word = {
+          ...current,
+          id: makeNextId(),
+          start: oldStart,
+          end: targetStart,
+          text: left
+        }
+        next.splice(currentIndex, 0, leftWord)
+      }
+      return next
+    }
 
-  newBoundaryTime = Math.max(leftWord.start + 0.05, Math.min(newBoundaryTime, rightWord.end - 0.05))
-
-  leftWord.end = newBoundaryTime
-  rightWord.start = newBoundaryTime
-
-  const isLeftSilence =
-    Boolean(leftWord.isSilence) || leftWord.text === '??' || leftWord.text === '-'
-  const isRightSilence =
-    Boolean(rightWord.isSilence) || rightWord.text === '??' || rightWord.text === '-'
-
-  if (isLeftSilence || isRightSilence) {
-    if (!leftWord.originalText) leftWord.originalText = leftWord.text
-    if (!rightWord.originalText) rightWord.originalText = rightWord.text
-    leftWord.text = leftWord.originalText ?? leftWord.text
-    rightWord.text = rightWord.originalText ?? rightWord.text
+    // 확장: targetStart까지 이전 단어 경계를 제거하며 흡수
+    current.start = targetStart
+    const absorbedTexts: string[] = []
+    let i = currentIndex - 1
+    while (i >= 0) {
+      const w = next[i]
+      if (w.end <= targetStart + eps) break
+      if (w.start >= targetStart - eps) {
+        absorbedTexts.unshift(w.text)
+        next.splice(i, 1)
+        i--
+        continue
+      }
+      // 첫 단어 일부만 침범한 경우: 침범된 뒷부분만 흡수하고 남은 앞부분은 유지
+      const ratio = (targetStart - w.start) / Math.max(eps, w.end - w.start)
+      const { left, right } = splitWordTextByRatio(w.text ?? '', ratio)
+      absorbedTexts.unshift(right)
+      w.end = targetStart
+      if (left.trim().length > 0) w.text = left
+      break
+    }
+    if (absorbedTexts.length > 0) {
+      current.text = joinTexts([...absorbedTexts, current.text])
+    }
     return next
   }
-
-  if (!leftWord.originalText) leftWord.originalText = leftWord.text
-  if (!rightWord.originalText) rightWord.originalText = rightWord.text
-
-  const combinedText = `${leftWord.originalText ?? ''}${rightWord.originalText ?? ''}`
-  const totalChars = combinedText.length
-  if (totalChars === 0) {
-    leftWord.text = ''
-    rightWord.text = ''
+  if (!isLeftEdgeDragged && !isRightEdgeDragged) {
     return next
   }
-
-  const ratio = (newBoundaryTime - leftWord.start) / totalDuration
-  const clampedRatio = Math.max(0, Math.min(1, ratio))
-  let splitIndex = Math.floor(totalChars * clampedRatio)
-
-  if (splitIndex === 0 && totalChars > 1) {
-    splitIndex = 1
-  } else if (splitIndex === totalChars && totalChars > 1) {
-    splitIndex = totalChars - 1
-  }
-
-  leftWord.text = combinedText.slice(0, splitIndex).trim()
-  rightWord.text = combinedText.slice(splitIndex).trim()
   return next
 }
 
@@ -433,7 +494,8 @@ function cutTimeSecFromZoomClientX(
   clientX: number,
   rect: DOMRect,
   peaks: PeaksInstance,
-  fromPeaksTimeFn: (sec: number, inst: PeaksInstance | null) => number
+  fromPeaksTimeFn: (sec: number, inst: PeaksInstance | null) => number,
+  clampBounds?: { start: number; end: number }
 ): number | null {
   const zv = peaks.views.getView('zoomview')
   if (!zv || rect.width < 2) return null
@@ -442,7 +504,9 @@ function cutTimeSecFromZoomClientX(
   const span = t1 - t0
   if (!(span > 1e-9)) return null
   const frac = clampPx((clientX - rect.left) / rect.width, 0, 1)
-  return fromPeaksTimeFn(t0 + span * frac, peaks)
+  const sec = fromPeaksTimeFn(t0 + span * frac, peaks)
+  if (!clampBounds) return sec
+  return Math.max(clampBounds.start, Math.min(sec, clampBounds.end))
 }
 
 function setZoomViewKonvaPlayheadVisible(zoomView: unknown, visible: boolean): void {
@@ -582,9 +646,72 @@ function paintCutSelectionOverlay(
   }
 }
 
+/**
+ * 동일 id·순서의 단어만 바뀐 경우 segment.update 로 갱신(removeAll 회피).
+ * markers/overlay 도구 전환 등은 전량 재구축으로 폴백.
+ */
+function syncFlatWordsToPeaksIncremental(
+  peaks: PeaksInstance,
+  prevFlat: Word[] | null,
+  nextFlat: Word[],
+  rows: SubtitleRow[],
+  activeLineIndex: number | null,
+  activeWordId: number | null,
+  activeTool: WaveformEditTool,
+  cutOverlay: CutSelectionOverlay | null,
+  mapTime: (sec: number) => number
+): 'full' | 'incremental' {
+  const mappedWord = (w: Word): Word => ({ ...w, start: mapTime(w.start), end: mapTime(w.end) })
+
+  if (!canIncrementalWordList(prevFlat, nextFlat)) {
+    applyWordsToPeaks(peaks, nextFlat, rows, activeLineIndex, activeWordId, activeTool, cutOverlay, mapTime)
+    return 'full'
+  }
+
+  const prev = prevFlat!
+  const eps = 1e-5
+
+  for (let i = 0; i < nextFlat.length; i++) {
+    const optsPrev = buildSegmentOptions(mappedWord(prev[i]!), rows, activeLineIndex, activeWordId, activeTool)
+    const optsNext = buildSegmentOptions(mappedWord(nextFlat[i]!), rows, activeLineIndex, activeWordId, activeTool)
+    if (segmentOptionsRequireFullRebuild(optsPrev, optsNext)) {
+      applyWordsToPeaks(peaks, nextFlat, rows, activeLineIndex, activeWordId, activeTool, cutOverlay, mapTime)
+      return 'full'
+    }
+  }
+
+  for (let i = 0; i < nextFlat.length; i++) {
+    const optsPrev = buildSegmentOptions(mappedWord(prev[i]!), rows, activeLineIndex, activeWordId, activeTool)
+    const optsNext = buildSegmentOptions(mappedWord(nextFlat[i]!), rows, activeLineIndex, activeWordId, activeTool)
+    if (segmentOptionsPeaksUpdateEqual(optsPrev, optsNext, eps)) continue
+
+    const seg = peaks.segments.getSegment(String(nextFlat[i]!.id))
+    if (!seg?.update || typeof seg.update !== 'function') {
+      applyWordsToPeaks(peaks, nextFlat, rows, activeLineIndex, activeWordId, activeTool, cutOverlay, mapTime)
+      return 'full'
+    }
+    try {
+      seg.update(segmentOptionsUpdatePayload(optsNext) as Partial<SegmentOptions>)
+    } catch {
+      applyWordsToPeaks(peaks, nextFlat, rows, activeLineIndex, activeWordId, activeTool, cutOverlay, mapTime)
+      return 'full'
+    }
+  }
+
+  if (cutOverlay) {
+    paintCutSelectionOverlay(peaks, cutOverlay, mapTime)
+  } else {
+    removeCutOverlayGraphics(peaks)
+  }
+
+  return 'incremental'
+}
+
 export type SubtitleWaveformPeaksHandle = {
   /** 행에서 wave 마운트 DOM을 App 쪽 맵에 넣은 뒤 포털 타깃을 다시 잡게 할 때 호출 */
   onWaveMountDirty: () => void
+  /** 재생 헤드 세로선 — edit 타임라인 초 기준(DOM만 갱신, React state 없음) */
+  syncPlayheadFromEditSec: (editSec: number) => void
 }
 
 /** zoomLevels 양자화 뒤 실제 표시 구간 — 단어 칹 %는 반드시 이 값과 같아야 세로선·세그먼트와 픽셀 일치 */
@@ -608,6 +735,10 @@ export type SubtitleWaveformPeaksProps = {
    * 메인에서 `readLocalPeaksJsonFile`로 읽은 객체 — `waveformData`로 직접 주입(비동기 dataUri/XHR 제거).
    */
   precomputedWaveformJson?: JsonWaveformData | null
+  /**
+   * true면 부모가 이미 컷을 반영한 편집 축 피크(JSON)를 넘긴 것 — 여기서 컷을 또 적용하면 이중 스티치로 단어·파동 축이 어긋난다.
+   */
+  precomputedWaveformIsEditAxis?: boolean
   /** App에서 유지 — layout effect 순서 때문에 Peaks ref보다 먼저 행이 등록해야 함 */
   waveMountByLineRef: MutableRefObject<Map<number, HTMLDivElement>>
   /** 자막 줄 인덱스 (SubtitleLine 배열과 동일) — 파동을 그 줄 카드 안에 붙임 */
@@ -622,9 +753,26 @@ export type SubtitleWaveformPeaksProps = {
    * CUT 모드에서 구간 삭제 확정 시 — 재생 스킵 범위 등록 + 자막 단어 동기화(부모).
    */
   onTimeRangeCut?: (startSec: number, endSec: number) => void
-  onPlayEditRange?: (startSec: number, endSec: number) => void
-  playheadEditSec?: number
+  onPlayEditRange?: (
+    startSec: number,
+    endSec: number,
+    meta?: { wordId?: number | null; wordText?: string | null; lineIndex?: number | null }
+  ) => void
+  /** App `syncPlayheadVisuals`와 동일한 edit 초 값 — Peaks 줌뷰 레이아웃 후 재동기화용 */
+  playheadEditSecRef?: MutableRefObject<number>
   isPlaying?: boolean
+  suppressAutoFocusSeek?: boolean
+  autoFocusSeekBlockToken?: number
+  /** App 비디오 duration — Peaks.edit-axis 길이와 비교(진단 로그) */
+  mediaDurationSec?: number
+  /** Peaks 초기화 직후 플레이어 길이 vs 미디어 길이 — 부모에서 불일치 경고용 */
+  onPeaksDurationComparedToMedia?: (info: {
+    peaksDurationSec: number
+    mediaDurationSec: number | undefined
+    deltaSec: number | null
+    /** init 시점 파형 JSON·무음 WAV 기준 이론 길이 — 비디오 컨테이너 duration 과 별개 */
+    exactTimelineDurationSec?: number | null
+  }) => void
 }
 
 /**
@@ -642,6 +790,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       localMediaPath,
       precomputedPeaksJsonFileUrl,
       precomputedWaveformJson,
+      precomputedWaveformIsEditAxis = false,
       waveMountByLineRef,
       activeLineIndex,
       activeWordId,
@@ -650,17 +799,31 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       onZoomViewRange,
       onTimeRangeCut,
       onPlayEditRange,
-      playheadEditSec,
-      isPlaying
+      playheadEditSecRef,
+      isPlaying,
+      suppressAutoFocusSeek = false,
+      autoFocusSeekBlockToken = 0,
+      mediaDurationSec: mediaDurationSecProp,
+      onPeaksDurationComparedToMedia
     },
     ref
   ) {
     const dummyAudioRef = useRef<HTMLAudioElement | null>(null)
     const audioContextRef = useRef<AudioContext | null>(null)
-    const zoomRef = useRef<HTMLDivElement | null>(null)
+    const zoomPlaceholderRef = useRef<HTMLDivElement | null>(null)
+    const persistentZoomRef = useRef<HTMLDivElement | null>(null)
+    if (!persistentZoomRef.current) {
+      const el = document.createElement('div')
+      el.style.width = '100%'
+      el.style.height = '100%'
+      el.style.position = 'absolute'
+      el.style.inset = '0'
+      persistentZoomRef.current = el
+    }
     /** 줌 Konva 와 같은 크기의 래퍼 — clientX→시간 매핑·DOM 컷 라인 위치에 사용 */
     const waveformZoomOuterRef = useRef<HTMLDivElement | null>(null)
     const overviewRef = useRef<HTMLDivElement | null>(null)
+    const zoomRef = zoomPlaceholderRef
 
     const peaksRef = useRef<PeaksInstance | null>(null)
     const isDraggingRef = useRef(false)
@@ -672,8 +835,16 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
     activeLineIndexRef.current = activeLineIndex
     activeWordIdRef.current = activeWordId
 
+    /** Peaks.init effect 의존성에서 제외 — 부모 콜백·duration 힌트 변경 시 destroy→init 방지 */
+    const mediaDurationSecPropRef = useRef(mediaDurationSecProp)
+    mediaDurationSecPropRef.current = mediaDurationSecProp
+    const onPeaksDurationComparedToMediaRef = useRef(onPeaksDurationComparedToMedia)
+    onPeaksDurationComparedToMediaRef.current = onPeaksDurationComparedToMedia
+
     const [portalRev, setPortalRev] = useState(0)
-    const [playheadLinePct, setPlayheadLinePct] = useState<number | null>(null)
+    const playheadLineRef = useRef<HTMLDivElement | null>(null)
+    const isPlayingWaveRef = useRef(false)
+    isPlayingWaveRef.current = Boolean(isPlaying)
     /** DOM 컷 라인 드래그 중 미리보기 시간 — 떼면 null 로 두고 cutSelection 만 확정 */
     const [cutHandlePreviewSec, setCutHandlePreviewSec] = useState<number | null>(null)
     /** 활성 줄 마운트 DOM — 포털 타깃이 바뀌면 Peaks 컨테이너가 바뀌므로 재바인딩한다 */
@@ -751,9 +922,34 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
 
     /** refit 연속 호출 시 동일 seek·줌만 반복되면 Peaks 재적용·로그 스팸 생략 */
     const lastFocusZoomSigRef = useRef<string>('')
+    const autoFocusSeekBlockUntilRef = useRef(0)
+    const waitingAutoFocusStabilizationRef = useRef(false)
     useEffect(() => {
       lastFocusZoomSigRef.current = ''
     }, [activeLineIndex, waveformCardBounds])
+
+    useEffect(() => {
+      autoFocusSeekBlockUntilRef.current = Math.max(autoFocusSeekBlockUntilRef.current, performance.now() + 4000)
+      waitingAutoFocusStabilizationRef.current = true
+      wfLog('seek', 'auto-focus seek block armed', {
+        token: autoFocusSeekBlockToken,
+        holdMs: 4000
+      })
+      timelineEditLog('playback', 'waveform auto-focus seek block armed', {
+        token: autoFocusSeekBlockToken,
+        holdMs: 4000
+      })
+    }, [autoFocusSeekBlockToken])
+
+    useEffect(() => {
+      if (!peaksReady || !waitingAutoFocusStabilizationRef.current) return
+      const id = window.setTimeout(() => {
+        waitingAutoFocusStabilizationRef.current = false
+        wfLog('seek', 'auto-focus stabilization complete', { token: autoFocusSeekBlockToken })
+        timelineEditLog('playback', 'waveform auto-focus stabilization complete', { token: autoFocusSeekBlockToken })
+      }, 520)
+      return () => window.clearTimeout(id)
+    }, [peaksReady, autoFocusSeekBlockToken])
 
     const onZoomViewRangeRef = useRef(onZoomViewRange)
     useEffect(() => {
@@ -787,6 +983,10 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
     }, [waveformCardBounds])
 
     const mergedCutRanges = useMemo(() => mergeCutRanges([...cutRanges]), [cutRanges])
+    const cutDiagSig = useMemo(() => cutRangesSignature(mergedCutRanges), [mergedCutRanges])
+    /** Peaks.init effect 재실행 방지 — 로그 시점의 컷 시그니처만 필요할 때 ref 사용 */
+    const cutDiagSigRef = useRef(cutDiagSig)
+    cutDiagSigRef.current = cutDiagSig
     const toPeaksTime = useCallback((sec: number, _inst: PeaksInstance | null): number => {
       return Math.max(0, sec)
     }, [])
@@ -797,6 +997,11 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
 
     const editedWaveformJson = useMemo(() => {
       if (!precomputedWaveformJson) return null
+      if (precomputedWaveformIsEditAxis) return precomputedWaveformJson
+      if (mergedCutRanges.length > 0) {
+        // 단일 경로 정책: 편집 축 스티치는 부모(App) 결과만 사용한다.
+        return precomputedWaveformJson
+      }
       if (mergedCutRanges.length === 0) return precomputedWaveformJson
 
       const oldData = precomputedWaveformJson.data || []
@@ -872,12 +1077,37 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         sample_rate: sr,
         samples_per_pixel: spp
       }
-    }, [precomputedWaveformJson, mergedCutRanges])
+    }, [precomputedWaveformJson, mergedCutRanges, precomputedWaveformIsEditAxis])
     const editedWaveformSig = useMemo(() => {
       const wf = editedWaveformJson
       if (!wf) return 'none'
       return `${wf.length}|${(wf.data ?? []).length}|${wf.sample_rate ?? 0}|${wf.samples_per_pixel ?? 0}`
     }, [editedWaveformJson])
+
+    useEffect(() => {
+      const rawPx = precomputedWaveformJson
+        ? Math.floor((precomputedWaveformJson.data?.length ?? 0) / 2)
+        : null
+      const editedPx = editedWaveformJson ? Math.floor(editedWaveformJson.length) : null
+      const cutSig = cutRangesSignature(mergedCutRanges)
+      wfLog('diag', 'editedWaveform path (checks 2–3b)', {
+        check2_policy_inlineStitch: false,
+        check2_policy_parentEditAxisOnly: precomputedWaveformIsEditAxis,
+        check3b_cutSig: cutSig,
+        check3b_mergedCutCount: mergedCutRanges.length,
+        check3b_rawPeakPixels: rawPx,
+        check3b_effectivePeakPixels: editedPx,
+        check3b_pixelDeltaVsRaw: rawPx != null && editedPx != null ? editedPx - rawPx : null
+      })
+      timelineEditLog('waveform-diag', 'edited waveform path vs cuts', {
+        precomputedWaveformIsEditAxis: precomputedWaveformIsEditAxis,
+        mergedCutCount: mergedCutRanges.length,
+        cutSig,
+        editedSig: editedWaveformSig,
+        rawPeakPixels: rawPx,
+        effectivePeakPixels: editedPx
+      })
+    }, [precomputedWaveformJson, mergedCutRanges, precomputedWaveformIsEditAxis, editedWaveformJson, editedWaveformSig])
 
     /** zoomview 가 줄 끝 이후까지 그릴 때 오른쪽을 덮어 실제로 안 보이게 */
     const [zoomEndClipPx, setZoomEndClipPx] = useState(0)
@@ -924,8 +1154,6 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       }
     }, [activeLineIndex])
 
-    useImperativeHandle(ref, () => ({ onWaveMountDirty: bumpPortal }), [bumpPortal])
-
     useLayoutEffect(() => {
       void portalRev
       if (activeLineIndex === null) {
@@ -954,10 +1182,65 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       return () => ro.disconnect()
     }, [activeLineIndex, bumpPortal, waveMountByLineRef])
 
-    const mountLayoutKey = `${portalRev}|${activeLineIndex}|${portalHost ? '1' : '0'}|${rowsSig}`
-
     /** 줌 스크롤·리핏 시 단어 구간 % 재계산 — marker DOM 라인이 파형에 붙게 */
     const [zoomViewTick, setZoomViewTick] = useState(0)
+
+    const mountLayoutKey = `${portalRev}|${activeLineIndex}|${portalHost ? '1' : '0'}|${rowsSig}`
+
+    const syncPlayheadLineFromEditSec = useCallback((editT: number) => {
+      const peaks = peaksRef.current
+      const zv = peaks?.views.getView('zoomview')
+      const el = playheadLineRef.current
+      if (typeof editT !== 'number' || !Number.isFinite(editT) || !zv || !el) {
+        el?.style.setProperty('opacity', '0')
+        el?.style.setProperty('visibility', 'hidden')
+        return
+      }
+      const t0 = zv.getStartTime()
+      const t1 = zv.getEndTime()
+      const span = t1 - t0
+      if (!(span > 1e-9)) {
+        el.style.setProperty('opacity', '0')
+        el.style.setProperty('visibility', 'hidden')
+        return
+      }
+      const pct = clampPx(((editT - t0) / span) * 100, 0, 100)
+      const visible =
+        isPlayingWaveRef.current ||
+        (activeWordIdRef.current !== null && cutSelectionRef.current?.kind !== 'marker')
+      el.style.left = `${pct}%`
+      if (visible) {
+        el.style.setProperty('opacity', '1')
+        el.style.setProperty('visibility', 'visible')
+      } else {
+        el.style.setProperty('opacity', '0')
+        el.style.setProperty('visibility', 'hidden')
+      }
+    }, [])
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        onWaveMountDirty: bumpPortal,
+        syncPlayheadFromEditSec: syncPlayheadLineFromEditSec
+      }),
+      [bumpPortal, syncPlayheadLineFromEditSec]
+    )
+
+    useLayoutEffect(() => {
+      const r = playheadEditSecRef
+      if (!r) return
+      syncPlayheadLineFromEditSec(r.current)
+    }, [
+      peaksReady,
+      mountLayoutKey,
+      zoomViewTick,
+      cutSelection?.kind,
+      activeWordId,
+      isPlaying,
+      playheadEditSecRef,
+      syncPlayheadLineFromEditSec
+    ])
 
     useEffect(() => {
       const peaks = peaksRef.current
@@ -1050,9 +1333,18 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       }
     }, [mountLayoutKey, portalHost])
 
+    useLayoutEffect(() => {
+      const placeholder = zoomPlaceholderRef.current
+      const persistent = persistentZoomRef.current
+      if (!placeholder || !persistent) return
+      if (persistent.parentElement !== placeholder) {
+        placeholder.replaceChildren(persistent)
+      }
+    }, [portalHost, mountLayoutKey, activeLineIndex])
+
     /** Peaks setZoom(seconds) 는 `_getScale` 에 view `_width` 가 들어가므로, 호출 직전에 항상 컨테이너 폭을 동기화한다. */
     const syncZoomContainersFromDom = useCallback((peaks: PeaksInstance) => {
-      safeFitPeaksContainerView(peaks, 'zoomview', zoomRef.current)
+      safeFitPeaksContainerView(peaks, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
       safeFitPeaksContainerView(peaks, 'overview', overviewRef.current)
     }, [])
 
@@ -1067,12 +1359,14 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           waveformCardBounds != null
             ? computeLineZoomWindowFromCardBounds(waveformCardBounds.start, waveformCardBounds.end, {
                 mediaDurationSec: mediaCap ?? undefined,
-                clipTrailingToLineEnd: true
+                clipTrailingToLineEnd: true,
+                clipLeadingToLineStart: true
               })
             : row?.words?.length
               ? computeLineZoomWindow(row.words, {
                   mediaDurationSec: mediaCap ?? undefined,
-                  clipTrailingToLineEnd: true
+                  clipTrailingToLineEnd: true,
+                  clipLeadingToLineStart: true
                 })
               : null
         if (!win) return
@@ -1082,6 +1376,14 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
             : row?.words?.length
               ? Math.max(...row.words.map((w) => w.end))
               : win.lineEnd
+        const zv = peaks.views.getView('zoomview')
+        try {
+          zv?.setZoom?.(win.span)
+          zv?.setWheelMode?.('none', { captureVerticalScroll: false })
+          zv?.enableAutoScroll?.(false)
+        } catch {
+          /* ignore */
+        }
         applyZoomThenClampEndBeforeOrAt(peaks, {
           windowStart: win.windowStart,
           spanSeconds: win.span,
@@ -1098,6 +1400,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
      */
     const focusWordAtTime = useCallback(
       (word: Word) => {
+        activeWordSnapshotRef.current = { id: word.id, start: word.start, end: word.end, word: word.word }
         const peaks = peaksRef.current
         if (!peaks) return
         if (activeLineIndex === null || activeLineIndex < 0) return
@@ -1113,11 +1416,13 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           waveformCardBounds != null
             ? computeLineZoomWindowFromCardBounds(waveformCardBounds.start, waveformCardBounds.end, {
                 mediaDurationSec: mediaCap ?? undefined,
-                clipTrailingToLineEnd: true
+                clipTrailingToLineEnd: true,
+                clipLeadingToLineStart: true
               })
             : computeLineZoomWindow(row.words, {
                 mediaDurationSec: mediaCap ?? undefined,
-                clipTrailingToLineEnd: true
+                clipTrailingToLineEnd: true,
+                clipLeadingToLineStart: true
               })
         if (!win) return
 
@@ -1125,14 +1430,59 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           waveformCardBounds != null ? waveformCardBounds.end : Math.max(...row.words.map((w) => w.end))
 
         const zw = zoomRef.current?.clientWidth ?? 0
-        const dedupeSig = `${word.id}|${win.windowStart.toFixed(5)}|${win.span.toFixed(5)}|${zw}`
+        const dedupeSig = `${word.id}|${word.start.toFixed(5)}|${word.end.toFixed(5)}|${win.windowStart.toFixed(5)}|${win.span.toFixed(5)}|${zw}`
         if (lastFocusZoomSigRef.current === dedupeSig) {
+          wfLog('diag', 'focusWordAtTime skipped (dedupe sig) — no seek/zoom repeat', { dedupeSig })
           queueMicrotask(() => publishZoomViewRange())
           return
         }
         lastFocusZoomSigRef.current = dedupeSig
 
-        peaks.player.seek(toPeaksTime(word.start, peaks))
+        const seekTarget = toPeaksTime(word.start, peaks)
+        const holdByTime = performance.now() < autoFocusSeekBlockUntilRef.current
+        const holdByStabilization = waitingAutoFocusStabilizationRef.current
+        const firstWordStartInRow = Math.min(...row.words.map((wi) => wi.start))
+        const padImpliedEditSec = win.lineStart - win.windowStart
+        const diagZoomLine = {
+          check1_grayBeforeYellow_editSec_visibleBeforeLineStart: Math.max(0, padImpliedEditSec),
+          check1_grayBeforeYellow_editSec_visibleBeforeActiveWord: Math.max(0, word.start - win.windowStart),
+          check1_note:
+            '[windowStart..lineStart) 구간 회색 파형 = 문장 줌 패딩(편집 축)--첫 노란 단어 시작 전 구간 포함 가능',
+          lineStart_edit: win.lineStart,
+          lineEnd_edit: win.lineEnd,
+          windowStart_edit: win.windowStart,
+          windowEnd_edit: win.windowEnd,
+          activeWord_edit: { start: word.start, end: word.end },
+          firstWordStart_edit: firstWordStartInRow,
+          zoomLineSpan_edit: win.span,
+          zoomFromCardBounds: waveformCardBounds != null,
+          cardBounds_edit: waveformCardBounds,
+          zoomPad_formula: 'max(0.08, lineSpan*0.04) from lineZoomWindow',
+          mediaCapSec: mediaCap,
+          peaksPlayerDurationSec: dur
+        }
+        wfLog('diag', 'zoom vs line/word (checks 1 & 2)', diagZoomLine)
+        timelineEditLog('waveform-diag', 'focus zoom window vs line/word', diagZoomLine)
+
+        if (suppressAutoFocusSeek || holdByTime || holdByStabilization) {
+          wfLog('seek', 'focusWordAtTime seek suppressed(transaction/focus guard)', {
+            wordId: word.id,
+            seekTo: seekTarget,
+            suppressAutoFocusSeek,
+            holdByTime,
+            holdByStabilization
+          })
+          timelineEditLog('playback', 'waveform focusWordAtTime 시크 억제(transaction/focus guard)', {
+            lineIndex: activeLineIndex,
+            wordId: word.id,
+            seekTo: seekTarget,
+            suppressAutoFocusSeek,
+            holdByTime,
+            holdByStabilization
+          })
+        } else {
+          peaks.player.seek(seekTarget)
+        }
         applyZoomThenClampEndBeforeOrAt(peaks, {
           windowStart: toPeaksTime(win.windowStart, peaks),
           spanSeconds: toPeaksTime(win.windowStart + win.span, peaks) - toPeaksTime(win.windowStart, peaks),
@@ -1142,7 +1492,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         const visibleSpan = zv ? zv.getEndTime() - zv.getStartTime() : -1
         wfLog('seek', 'focusWordAtTime', {
           wordId: word.id,
-          seekTo: toPeaksTime(word.start, peaks),
+          seekTo: seekTarget,
           lineStart: win.lineStart,
           lineEnd: win.lineEnd,
           windowStart: win.windowStart,
@@ -1154,9 +1504,75 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           sentenceZoom: true,
           zoomFromCardBounds: waveformCardBounds != null
         })
+        wfLog('diag', 'focusWordAtTime zoomview actual span (check 1)', {
+          zoomviewStartSec: zv?.getStartTime(),
+          zoomviewEndSec: zv?.getEndTime(),
+          visibleSpanSec: visibleSpan
+        })
+        timelineEditLog('waveform-diag', 'focusWordAtTime zoomview span', {
+          zoomviewStartSec: zv?.getStartTime(),
+          zoomviewEndSec: zv?.getEndTime(),
+          visibleSpanSec: visibleSpan
+        })
         queueMicrotask(() => publishZoomViewRange())
       },
-      [activeLineIndex, waveformCardBounds, publishZoomViewRange, syncZoomContainersFromDom]
+      [activeLineIndex, waveformCardBounds, publishZoomViewRange, syncZoomContainersFromDom, suppressAutoFocusSeek]
+    )
+    const focusScheduleRafRef = useRef<number | null>(null)
+    const focusScheduleTimerRef = useRef<number | null>(null)
+    const resizeRefitDebounceRef = useRef<number | null>(null)
+    const scheduleFocusActiveWord = useCallback(
+      (reason: string, delayMs = 0): void => {
+        if (isPlayingWaveRef.current) {
+          wfLog('view', 'focus scheduler skipped(playing)', { reason, delayMs })
+          return
+        }
+        const run = (): void => {
+          focusScheduleRafRef.current = null
+          const p = peaksRef.current
+          const li = activeLineIndexRef.current
+          if (!p || li === null) return
+          const wid = activeWordIdRef.current
+          const w = wid != null ? rowsRef.current[li]?.words?.find((x) => x.id === wid) : undefined
+          if (w) {
+            focusWordAtTime(w)
+          } else {
+            applyCardAlignedZoomView(p)
+            queueMicrotask(() => publishZoomViewRangeRef.current())
+          }
+          wfLog('view', 'focus scheduler run', { reason, delayMs, hasWord: Boolean(w) })
+        }
+        if (focusScheduleTimerRef.current != null) {
+          window.clearTimeout(focusScheduleTimerRef.current)
+          focusScheduleTimerRef.current = null
+        }
+        if (focusScheduleRafRef.current != null) {
+          cancelAnimationFrame(focusScheduleRafRef.current)
+          focusScheduleRafRef.current = null
+        }
+        if (delayMs > 0) {
+          focusScheduleTimerRef.current = window.setTimeout(() => {
+            focusScheduleTimerRef.current = null
+            focusScheduleRafRef.current = requestAnimationFrame(run)
+          }, delayMs)
+          return
+        }
+        focusScheduleRafRef.current = requestAnimationFrame(run)
+      },
+      [focusWordAtTime, applyCardAlignedZoomView]
+    )
+    useEffect(
+      () => () => {
+        if (focusScheduleTimerRef.current != null) {
+          window.clearTimeout(focusScheduleTimerRef.current)
+          focusScheduleTimerRef.current = null
+        }
+        if (focusScheduleRafRef.current != null) {
+          cancelAnimationFrame(focusScheduleRafRef.current)
+          focusScheduleRafRef.current = null
+        }
+      },
+      []
     )
 
     /**
@@ -1213,28 +1629,33 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       update()
       peaks.on('zoomview.update', update)
       const ro = new ResizeObserver(() => {
-        const p = peaksRef.current
-        const z = zoomRef.current
-        if (p && z && activeLineIndexRef.current !== null) {
-          safeFitPeaksContainerView(p, 'zoomview', z)
-          safeFitPeaksContainerView(p, 'overview', overviewRef.current)
-          const li = activeLineIndexRef.current
-          const wid = activeWordIdRef.current
-          const editingWord =
-            wid != null ? rowsRef.current[li]?.words?.find((x) => x.id === wid) : undefined
-          if (editingWord) {
-            focusWordAtTime(editingWord)
-          } else {
-            applyCardAlignedZoomView(p)
+        const run = (): void => {
+          const p = peaksRef.current
+          const z = zoomRef.current
+          if (p && z && activeLineIndexRef.current !== null) {
+            safeFitPeaksContainerView(p, 'zoomview', z)
+            safeFitPeaksContainerView(p, 'overview', overviewRef.current)
+            scheduleFocusActiveWord('resize-observer')
           }
-          queueMicrotask(() => publishZoomViewRangeRef.current())
+          update()
         }
-        update()
+        if (resizeRefitDebounceRef.current != null) {
+          window.clearTimeout(resizeRefitDebounceRef.current)
+        }
+        const delayMs = isPlayingWaveRef.current ? 140 : 56
+        resizeRefitDebounceRef.current = window.setTimeout(() => {
+          resizeRefitDebounceRef.current = null
+          run()
+        }, delayMs)
       })
       ro.observe(el)
       return () => {
         peaks.off('zoomview.update', update)
         ro.disconnect()
+        if (resizeRefitDebounceRef.current != null) {
+          window.clearTimeout(resizeRefitDebounceRef.current)
+          resizeRefitDebounceRef.current = null
+        }
         setZoomEndClipPx(0)
       }
     }, [
@@ -1242,8 +1663,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       mountLayoutKey,
       activeLineIndex,
       rowsSig,
-      focusWordAtTime,
-      applyCardAlignedZoomView
+      scheduleFocusActiveWord
     ])
 
     useLayoutEffect(() => {
@@ -1253,34 +1673,26 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       const w = row?.words.find((x) => x.id === activeWordId)
       if (w) {
         wfLog('seek', 'layout: seek after peaksReady/activeWord', { lineIndex: activeLineIndex, wordId: activeWordId })
-        safeFitPeaksContainerView(peaks, 'zoomview', zoomRef.current)
+        safeFitPeaksContainerView(peaks, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
         safeFitPeaksContainerView(peaks, 'overview', overviewRef.current)
-        focusWordAtTime(w)
+        scheduleFocusActiveWord('active-word-change')
       } else {
         wfLog('seek', 'layout: word not found for seek', { activeLineIndex, activeWordId })
       }
-    }, [activeLineIndex, activeWordId, focusWordAtTime, peaksReady, rowsSig])
+    }, [activeLineIndex, activeWordId, peaksReady, rowsSig, scheduleFocusActiveWord])
 
     useLayoutEffect(() => {
       const peaks = peaksRef.current
       if (!peaks || !peaksReady) return
 
       const refitZoomSizeOnly = (): void => {
+        if (isPlayingWaveRef.current) return
         try {
           const p = peaksRef.current
           if (!p || activeLineIndexRef.current === null) return
-          safeFitPeaksContainerView(p, 'zoomview', zoomRef.current)
+          safeFitPeaksContainerView(p, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
           safeFitPeaksContainerView(p, 'overview', overviewRef.current)
-          const li = activeLineIndexRef.current
-          const wid = activeWordIdRef.current
-          const ew =
-            wid != null ? rowsRef.current[li]?.words?.find((x) => x.id === wid) : undefined
-          if (ew) {
-            focusWordAtTime(ew)
-          } else {
-            applyCardAlignedZoomView(p)
-          }
-          queueMicrotask(() => publishZoomViewRangeRef.current())
+          scheduleFocusActiveWord('layout-refit-zoom-only')
           wfLog('view', 'zoom refit (애니메이션 후 폭→줌 재적용)', {
             zw: zoomRef.current?.clientWidth ?? 0,
             zh: zoomRef.current?.clientHeight ?? 0
@@ -1292,6 +1704,11 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
 
       const runFit = (): void => {
         try {
+          if (isPlayingWaveRef.current) {
+            safeFitPeaksContainerView(peaks, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
+            safeFitPeaksContainerView(peaks, 'overview', overviewRef.current)
+            return
+          }
           const editingWord =
             activeLineIndex !== null && activeWordId !== null
               ? rowsRef.current[activeLineIndex]?.words?.find((x) => x.id === activeWordId)
@@ -1301,16 +1718,11 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
            * 반드시 fitToContainer 로 최종 _width 확정 후 setZoom — 순서 바뀌면 왼쪽 1/3만 파형이 있는 현상.
            */
           if (activeLineIndex !== null) {
-            safeFitPeaksContainerView(peaks, 'zoomview', zoomRef.current)
+            safeFitPeaksContainerView(peaks, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
             safeFitPeaksContainerView(peaks, 'overview', overviewRef.current)
-            if (editingWord) {
-              focusWordAtTime(editingWord)
-            } else {
-              applyCardAlignedZoomView(peaks)
-            }
-            queueMicrotask(() => publishZoomViewRangeRef.current())
+            scheduleFocusActiveWord('layout-run-fit')
           } else {
-            safeFitPeaksContainerView(peaks, 'zoomview', zoomRef.current)
+            safeFitPeaksContainerView(peaks, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
             safeFitPeaksContainerView(peaks, 'overview', overviewRef.current)
           }
           wfLog('view', 'zoom/overview refit', {
@@ -1326,29 +1738,23 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       const id = requestAnimationFrame(() => {
         requestAnimationFrame(runFit)
       })
-      /** 아코디언·레이아웃 안정화용 재적용 — 지연을 키우면 더블클릭 직후 체감이 ~1초까지 늘어남 */
-      const t = window.setTimeout(runFit, 48)
-      /** 아코디언 전환 후 seek 없이 스테이지만 너비 동기화 */
-      const t2 = window.setTimeout(refitZoomSizeOnly, 110)
-      const t3 = window.setTimeout(refitZoomSizeOnly, 200)
-      const t4 = window.setTimeout(refitZoomSizeOnly, 360)
+      /** 레이아웃 안정화 후 1회만 추가 refit */
+      const t = window.setTimeout(refitZoomSizeOnly, 140)
       return () => {
         cancelAnimationFrame(id)
         window.clearTimeout(t)
-        window.clearTimeout(t2)
-        window.clearTimeout(t3)
-        window.clearTimeout(t4)
       }
     }, [
       activeLineIndex,
       activeWordId,
       peaksReady,
       mountLayoutKey,
-      focusWordAtTime,
-      applyCardAlignedZoomView
+      scheduleFocusActiveWord
     ])
 
     const peaksInitGenRef = useRef(0)
+    /** 직전 동기화 flat 단어 — id·순서 동일할 때 removeAll 대신 segment.update */
+    const lastSyncedFlatWordsRef = useRef<Word[] | null>(null)
     /** applyWordsToPeaks(전량) 직후 Peaks 에 반영된 활성 단어 id — 같은 줄에서 선택만 바뀔 때 증분 갱신에 사용 */
     const appliedSegmentHighlightWordIdRef = useRef<number | null>(null)
 
@@ -1508,6 +1914,16 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         const prevFlat = flattenWords(rowsRef.current).sort((a, b) => a.start - b.start)
         const currentIndex = prevFlat.findIndex((w) => String(w.id) === String(changedSeg.id ?? ''))
         if (currentIndex < 0) return
+        const activeLineIndex = activeLineIndexRef.current
+        const activeRow = activeLineIndex == null ? null : rowsRef.current[activeLineIndex]
+        const rowWords = activeRow?.words ?? []
+        const cardBounds =
+          rowWords.length > 0
+            ? {
+                start: rowWords[0].start,
+                end: rowWords[rowWords.length - 1].end
+              }
+            : undefined
         const flat = applyDirectionalAdjustResplit({
           words: prevFlat,
           currentIndex,
@@ -1515,7 +1931,8 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           newSegment: {
             startTime: fromPeaksTime(changedSeg.startTime, inst),
             endTime: fromPeaksTime(changedSeg.endTime, inst)
-          }
+          },
+          cardBounds
         })
         const nextRows = assignFlatWordsToRows(flat, rowsRef.current)
         onRowsChangeRef.current(nextRows)
@@ -1536,13 +1953,14 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         const row = nextRows[li]
         const w = row?.words?.find((x) => x.id === wid)
         if (!row?.words?.length || !w) return
-        safeFitPeaksContainerView(inst, 'zoomview', zoomRef.current)
+        safeFitPeaksContainerView(inst, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
         safeFitPeaksContainerView(inst, 'overview', overviewRef.current)
         const dur = inst.player.getDuration()
         const mediaCap = Number.isFinite(dur) && dur > 0 ? dur : null
         const win = computeLineZoomWindow(row.words, {
           mediaDurationSec: mediaCap ?? undefined,
-          clipTrailingToLineEnd: true
+          clipTrailingToLineEnd: true,
+          clipLeadingToLineStart: true
         })
         if (!win) return
         const maxEnd = Math.max(...row.words.map((w) => w.end))
@@ -1599,7 +2017,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           requestAnimationFrame(runPeaksInit)
           return
         }
-        const zoomEl = zoomRef.current
+        const zoomEl = persistentZoomRef.current ?? zoomRef.current
         const ovEl = overviewRef.current
         if (!zoomEl || !ovEl) {
           wfLog('peaks', 'Peaks.init 대기 (refs)', { rafWait })
@@ -1786,7 +2204,8 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
             appliedSegmentHighlightWordIdRef.current = activeWordIdRef.current
 
             const zv = peaks.views.getView('zoomview')
-            zv?.setSegmentDragMode(activeWordIdRef.current !== null ? 'no-overlap' : 'overlap')
+            // 시간조절(좌/우 핸들) 제한 해제: 단어 편집 중에도 overlap 허용
+            zv?.setSegmentDragMode('overlap')
             try {
               /** scroll 모드는 드래그 시 파형이 이동하므로 항상 insert-segment 유지 */
               zv?.setWaveformDragMode('insert-segment')
@@ -1825,6 +2244,41 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
               duration: dur,
               zoomView: Boolean(peaks.views.getView('zoomview')),
               overviewView: Boolean(peaks.views.getView('overview'))
+            })
+            const mediaWall = mediaDurationSecPropRef.current
+            wfLog('diag', 'Peaks duration vs HTML video.duration (check 3)', {
+              check3_exactDurationFromJsonSec: exactDuration,
+              check3_peaksPlayerDurationSec: dur,
+              check3_mediaDurationSecProp: mediaWall ?? null,
+              check3_deltaSec_peaksPlayerMinusMedia:
+                mediaWall != null && mediaWall > 0 && dur > 0 ? dur - mediaWall : null,
+              check3_deltaSec_peaksMinusExactJson:
+                exactDuration > 0 && dur > 0 ? dur - exactDuration : null,
+              check3_peaksRoundedMs: dur > 0 ? Math.round(dur * 1000) : null,
+              check3_mediaRoundedMs: mediaWall != null && mediaWall > 0 ? Math.round(mediaWall * 1000) : null,
+              precomputedWaveformIsEditAxis,
+              cutSig: cutDiagSigRef.current,
+              mergedCutCount: mergedCutRanges.length,
+              finalJsonPeakPixels: finalJson ? Math.floor(finalJson.length) : null
+            })
+            timelineEditLog('waveform-diag', 'Peaks.init duration vs media prop', {
+              exactDurationFromJsonSec: exactDuration,
+              peaksPlayerDurationSec: dur,
+              mediaDurationSecProp: mediaWall ?? null,
+              deltaSec_peaksPlayerMinusMedia:
+                mediaWall != null && mediaWall > 0 && dur > 0 ? dur - mediaWall : null,
+              deltaSec_peaksPlayerMinusExactJson:
+                exactDuration > 0 && dur > 0 ? dur - exactDuration : null,
+              precomputedWaveformIsEditAxis,
+              cutSig: cutDiagSigRef.current,
+              mergedCutCount: mergedCutRanges.length
+            })
+            onPeaksDurationComparedToMediaRef.current?.({
+              peaksDurationSec: dur,
+              mediaDurationSec: mediaWall,
+              deltaSec:
+                mediaWall != null && mediaWall > 0 && dur > 0 ? dur - mediaWall : null,
+              exactTimelineDurationSec: exactDuration > 0 ? exactDuration : null
             })
 
             lastFocusZoomSigRef.current = ''
@@ -1899,7 +2353,8 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       waveformOpen,
       precomputedPeaksJsonFileUrl,
       precomputedWaveformSig,
-      editedWaveformSig
+      editedWaveformSig,
+      precomputedWaveformIsEditAxis
     ])
 
     /** 포털 타깃(줄) 이동 후 Konva 스테이지가 안 그려지는 경우 — fit + batchDraw */
@@ -1907,7 +2362,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       const p = peaksRef.current
       if (!p || !peaksReady || !portalHost) return
       try {
-        safeFitPeaksContainerView(p, 'zoomview', zoomRef.current)
+        safeFitPeaksContainerView(p, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
         safeFitPeaksContainerView(p, 'overview', overviewRef.current)
         const zv = p.views.getView('zoomview') as unknown as { getStage?: () => { batchDraw?: () => void } }
         zv?.getStage?.()?.batchDraw?.()
@@ -1924,7 +2379,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         const p = peaksRef.current
         if (!p) return
         try {
-          safeFitPeaksContainerView(p, 'zoomview', zoomRef.current)
+          safeFitPeaksContainerView(p, 'zoomview', persistentZoomRef.current ?? zoomRef.current)
           safeFitPeaksContainerView(p, 'overview', overviewRef.current)
           const zv = p.views.getView('zoomview') as unknown as {
             getStage?: () => { batchDraw?: () => void }
@@ -1939,6 +2394,12 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
     }, [portalHost, peaksReady])
 
     useEffect(() => {
+      if (!peaksReady) {
+        lastSyncedFlatWordsRef.current = null
+      }
+    }, [peaksReady])
+
+    useEffect(() => {
       const peaks = peaksRef.current
       if (!peaks || !peaksReady) return
       /**
@@ -1948,17 +2409,20 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
        */
       if (isDraggingRef.current && activeTool !== 'cut') return
       if (cutMarkerDraggingRef.current) return
-      applyWordsToPeaks(
+      const mapped = (sec: number) => toPeaksTime(sec, peaks)
+      const mode = syncFlatWordsToPeaksIncremental(
         peaks,
+        lastSyncedFlatWordsRef.current,
         flatWords,
         rowsRef.current,
         activeLineIndex,
         activeWordId,
         activeTool,
         cutSelectionRef.current,
-        (sec) => toPeaksTime(sec, peaks)
+        mapped
       )
-      wfLog('segments', 'applyWordsToPeaks', { wordCount: flatWords.length })
+      lastSyncedFlatWordsRef.current = flatWords.map((w) => ({ ...w }))
+      wfLog('segments', 'applyWordsToPeaks', { wordCount: flatWords.length, mode })
       appliedSegmentHighlightWordIdRef.current = activeWordId
     }, [wordsSig, rowsSig, flatWords, peaksReady, activeLineIndex, activeTool, cutSelection])
 
@@ -2018,34 +2482,36 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
 
     useEffect(() => {
       if (!audioContextRef.current) return
-      void audioContextRef.current.resume().then(
-        () => wfLog('audio', 'AudioContext.resume', { state: audioContextRef.current?.state }),
-        () => wfLog('audio', 'AudioContext.resume rejected')
-      )
+      void audioContextRef.current.resume().catch(() => {})
     }, [activeLineIndex, activeWordId])
 
-    const stopOneShotPlayback = useCallback((): void => {
-      // App(videoRef) 단일 경로 재생으로 전환되어 내부 one-shot 상태를 유지하지 않는다.
-    }, [])
+    const activeWordSnapshotRef = useRef<{ id: number; start: number; end: number; word: string } | null>(null)
 
     const playSelectedWordOnce = useCallback((): void => {
       const li = activeLineIndexRef.current
       const wid = activeWordIdRef.current
       if (li === null || wid === null) return
+      if (isPlaying) return
       const row = rowsRef.current[li]
-      const w = row?.words?.find((x) => x.id === wid)
+      let w = row?.words?.find((x) => x.id === wid)
+      if (!w) {
+        const snap = activeWordSnapshotRef.current
+        if (snap && row?.words?.length) {
+          w = row.words.find((x) => Math.abs(x.start - snap.start) < 0.05 && Math.abs(x.end - snap.end) < 0.05)
+        }
+      }
       if (!w || !(w.end > w.start + 1e-4)) return
-
-      stopOneShotPlayback()
-
+      const wordText = typeof w.word === 'string' ? w.word : typeof w.text === 'string' ? w.text : null
       wfLog('playback', 'one-shot delegated to app video path', {
         wordId: w.id,
+        wordText,
+        lineIndex: li,
         editStart: w.start,
         editEnd: w.end,
         cutCount: mergedCutRanges.length
       })
-      onPlayEditRange?.(w.start, w.end)
-    }, [stopOneShotPlayback, mergedCutRanges, onPlayEditRange])
+      onPlayEditRange?.(w.start, w.end, { wordId: w.id, wordText, lineIndex: li })
+    }, [mergedCutRanges, onPlayEditRange, isPlaying])
 
     useEffect(() => {
       const onKey = (e: KeyboardEvent): void => {
@@ -2060,42 +2526,6 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       window.addEventListener('keydown', onKey, true)
       return () => window.removeEventListener('keydown', onKey, true)
     }, [playSelectedWordOnce])
-
-    useEffect(() => {
-      if (activeWordId === null) {
-        stopOneShotPlayback()
-      }
-    }, [activeWordId, stopOneShotPlayback])
-
-    useEffect(
-      () => () => {
-        stopOneShotPlayback()
-      },
-      [stopOneShotPlayback]
-    )
-
-    useEffect(() => {
-      const editT = playheadEditSec
-      const peaks = peaksRef.current
-      const zv = peaks?.views.getView('zoomview')
-      if (typeof editT !== 'number' || !Number.isFinite(editT) || !zv) {
-        setPlayheadLinePct(null)
-        return
-      }
-      const t0 = zv.getStartTime()
-      const t1 = zv.getEndTime()
-      const span = t1 - t0
-      if (!(span > 1e-9)) {
-        setPlayheadLinePct(null)
-        return
-      }
-      const pct = ((editT - t0) / span) * 100
-      if (!Number.isFinite(pct)) {
-        setPlayheadLinePct(null)
-        return
-      }
-      setPlayheadLinePct(clampPx(pct, 0, 100))
-    }, [playheadEditSec, peaksReady, mountLayoutKey])
 
     const cutMarkerVisualSec =
       cutHandlePreviewSec ??
@@ -2278,7 +2708,13 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
               : clampMarkerTimeToWordBounds(peaks, wid, w, (w.start + w.end) / 2, fromPeaksTime)
         } else {
           const rect = wrap.getBoundingClientRect()
-          const raw = cutTimeSecFromZoomClientX(clientX, rect, peaks, fromPeaksTime)
+          const raw = cutTimeSecFromZoomClientX(
+            clientX,
+            rect,
+            peaks,
+            fromPeaksTime,
+            getWordCutBoundsSec(peaks, wid, w, fromPeaksTime)
+          )
           finalT =
             raw == null
               ? cutSelectionRef.current?.kind === 'marker'
@@ -2311,7 +2747,13 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           /* ignore */
         }
         const rect = wrap.getBoundingClientRect()
-        const raw = cutTimeSecFromZoomClientX(e.clientX, rect, peaks, fromPeaksTime)
+        const raw = cutTimeSecFromZoomClientX(
+          e.clientX,
+          rect,
+          peaks,
+          fromPeaksTime,
+          getWordCutBoundsSec(peaks, wid, w, fromPeaksTime)
+        )
         if (raw == null) return
         const next = clampMarkerTimeToWordBounds(peaks, wid, w, raw, fromPeaksTime)
         cutSelectionRef.current = { kind: 'marker', time: next }
@@ -2339,7 +2781,13 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         const w = row?.words?.find((x) => x.id === wid)
         if (!w) return
         const rect = wrap.getBoundingClientRect()
-        const raw = cutTimeSecFromZoomClientX(e.clientX, rect, peaks, fromPeaksTime)
+        const raw = cutTimeSecFromZoomClientX(
+          e.clientX,
+          rect,
+          peaks,
+          fromPeaksTime,
+          getWordCutBoundsSec(peaks, wid, w, fromPeaksTime)
+        )
         if (raw == null) return
         const next = clampMarkerTimeToWordBounds(peaks, wid, w, raw, fromPeaksTime)
         cutSelectionRef.current = { kind: 'marker', time: next }
@@ -2556,10 +3004,10 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         zv.enableSegmentDragging(false)
         ov?.enableSeek?.(allowWaveSeek)
         /**
-         * insert-segment 모드에서는 세그먼트 위 클릭 시 삽입 세그먼트가 생기며 드래그가 이어져
-         * 컷 포인트처럼 보이는 선이 마우스를 계속 따라간다 — 단어 편집 중엔 no-overlap 으로 삽입 경로 차단.
+         * 시간조절 핸들은 경계 제한을 두지 않고 자유 드래그를 허용한다.
+         * (자르기 점선 클램프는 별도 로직으로 계속 유지)
          */
-        zv.setSegmentDragMode(activeWordId !== null ? 'no-overlap' : 'overlap')
+        zv.setSegmentDragMode('overlap')
         applyZoomViewStageDragSuppression(zv, activeWordId !== null)
         /** DOM 컷 라인 사용 시 Konva 재생 헤드가 전역 seek 에 묶여 마우스를 따라가 보이는 현상 방지 */
         const hideKonvaPlayhead = activeWordId !== null && cutSelection?.kind === 'marker'
@@ -2757,7 +3205,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
               className="relative isolate h-72 w-full min-w-0 overflow-hidden rounded-lg border-x-0 border-y border-vrew-border bg-[#0c1018]"
             >
               <div
-                ref={zoomRef}
+                ref={zoomPlaceholderRef}
                 className={`relative z-0 h-72 w-full min-w-0 ${activeWordId !== null ? 'cursor-default' : 'cursor-ew-resize'}`}
               />
               {zoomEndClipPx > 0.5 ? (
@@ -2775,13 +3223,11 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
                 className="pointer-events-none absolute inset-0 z-[100] transform-gpu"
                 style={{ transform: 'translateZ(0.02px)' }}
               >
-                {playheadLinePct != null &&
-                (isPlaying || (activeWordId !== null && cutSelection?.kind !== 'marker')) ? (
-                  <div
-                    className="absolute inset-y-0 w-px bg-yellow-300/95"
-                    style={{ left: `${playheadLinePct}%` }}
-                  />
-                ) : null}
+                <div
+                  ref={playheadLineRef}
+                  className="absolute inset-y-0 w-px bg-yellow-300/95"
+                  style={{ left: '0%', opacity: 0, visibility: 'hidden' }}
+                />
               </div>
               {activeLineIndex !== null &&
               activeWordId !== null &&

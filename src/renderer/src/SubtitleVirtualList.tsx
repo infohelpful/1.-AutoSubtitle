@@ -7,7 +7,8 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type KeyboardEvent
+  type KeyboardEvent,
+  type MutableRefObject
 } from 'react'
 import { flushSync } from 'react-dom'
 import { LayoutGroup, motion } from 'framer-motion'
@@ -54,13 +55,13 @@ function wordChipSlotStyle(w: { start: number; end: number }, tw: LineZoomWindow
 
 export type SubtitleVirtualListProps = {
   subtitles: SubtitleLine[]
-  activeSubtitleIndex: number | null
-  playheadSec: number
+  activeSubtitleIndexRef: MutableRefObject<number | null>
+  playheadSecRef: MutableRefObject<number>
   isPlaying: boolean
   mediaFileUrl: string | null
   onSubtitleCardClick: (e: MouseEvent<HTMLElement>, startSec: number) => void
   onCardNavigate: (startSec: number) => void
-  onRequestPausePlayback: () => void
+  onRequestPausePlayback: (reason: string) => void
   onWordBlockClick: (startSec: number) => void
   onWaveformSeekAndPlay: (sec: number) => void
   splitSubtitleAtWord: (index: number, wordIndex: number) => void
@@ -96,8 +97,8 @@ export type SubtitleVirtualListProps = {
 /** `List` 의 `rowProps` — `index` / `style` / `ariaAttributes` 는 List가 주입 */
 export type SubtitleListRowProps = {
   subtitles: SubtitleLine[]
-  activeSubtitleIndex: number | null
-  playheadSec: number
+  activeSubtitleIndexRef: MutableRefObject<number | null>
+  playheadSecRef: MutableRefObject<number>
   isPlaying: boolean
   onSubtitleCardClick: SubtitleVirtualListProps['onSubtitleCardClick']
   onCardNavigate: SubtitleVirtualListProps['onCardNavigate']
@@ -137,13 +138,16 @@ export type SubtitleListRowProps = {
   peaksZoomViewRange?: PeaksZoomViewRange | null
 }
 
+const shouldDeleteAudioForWords = (words: Array<{ isSilence?: boolean }> | undefined): boolean =>
+  Boolean(words && words.length > 0 && words.every((w) => Boolean(w.isSilence)))
+
 function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
   const {
     index,
     style,
     subtitles,
-    activeSubtitleIndex,
-    playheadSec,
+    activeSubtitleIndexRef,
+    playheadSecRef,
     isPlaying,
     onSubtitleCardClick,
     onCardNavigate,
@@ -181,7 +185,6 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
   const requestFocusCaret = requestFocusWord
   const row = subtitles[index]
   if (!row) return null
-  const isActive = activeSubtitleIndex === index
   const [caretIndex, setCaretIndex] = useState(0)
   const [caretVisible, setCaretVisible] = useState(false)
   const [caretBlink, setCaretBlink] = useState(false)
@@ -191,7 +194,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
   const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null)
   const articleRef = useRef<HTMLElement | null>(null)
   const waveformMountRef = useRef<HTMLDivElement | null>(null)
-  /** 마우스로 단어/캐럿 또는 카드 빈 곳을 눌렀을 때만 Space로 시크+재생. 그 외 Space는 재생/일시정지 토글 */
+  /** Space: 의도(wholeLine/caret)가 있으면 해당 지점에서 즉시 재생(seek+play). 그 외는 재생/일시정지 토글 */
   const spaceSeekIntentRef = useRef<'none' | 'caret' | 'wholeLine'>('none')
   /** 방향키로 재생을 멈추며 이미 캐럿을 옮긴 경우, pause 직후 playhead 동기화를 하지 않음 */
   const skipPlayheadCaretSyncOnPauseRef = useRef(false)
@@ -573,26 +576,41 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     if (!isPlaying) setKeyboardPauseCaret(false)
   }, [isPlaying])
 
+  useLayoutEffect(() => {
+    const t = playheadSecRef.current
+    const playing = isPlaying
+    const mount = articleRef.current
+    if (!mount) return
+    mount.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
+      const s = parseFloat(el.dataset.wordStart ?? el.getAttribute('data-word-start') ?? 'NaN')
+      const e = parseFloat(el.dataset.wordEnd ?? el.getAttribute('data-word-end') ?? 'NaN')
+      if (!Number.isFinite(s) || !Number.isFinite(e)) return
+      el.classList.toggle('subtitle-word-chip--active', playing && t >= s && t < e)
+    })
+  }, [wordRail, index, playheadSecRef])
+
   useEffect(() => {
-    const words = wordRail
-    const wi = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
-    if (!isPlaying) return
-    if (keyboardPauseCaret) return
+    if (!isPlaying || keyboardPauseCaret) return
+    const id = window.setInterval(() => {
+      const playheadSec = playheadSecRef.current
+      const words = wordRail
+      const wi = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
 
-    const root = articleRef.current
-    const focused = document.activeElement as HTMLElement | null
-    if (root && focused && root.contains(focused)) {
-      // 재생 헤드 동기화가 textarea caretIndex·포커스를 매 프레임 덮어쓰면 방향키/편집 증상이 그대로 남음
-      if (focused.closest('[data-subtitle-edit]')) return
-      if (focused.closest('.subtitle-word-row')) return
-    }
+      const root = articleRef.current
+      const focused = document.activeElement as HTMLElement | null
+      if (root && focused && root.contains(focused)) {
+        if (focused.closest('[data-subtitle-edit]')) return
+        if (focused.closest('.subtitle-word-row')) return
+      }
 
-    setCaretVisible(false)
-    setCaretBlink(false)
-    if (wi >= 0) setCaretIndex(wi)
-    const activeEl = document.activeElement as HTMLElement | null
-    if (activeEl?.id?.startsWith(`subtitle-caret-${index}-`)) activeEl.blur()
-  }, [index, isPlaying, playheadSec, wordRail, keyboardPauseCaret])
+      setCaretVisible(false)
+      setCaretBlink(false)
+      if (wi >= 0) setCaretIndex(wi)
+      const activeEl = document.activeElement as HTMLElement | null
+      if (activeEl?.id?.startsWith(`subtitle-caret-${index}-`)) activeEl.blur()
+    }, 32)
+    return () => window.clearInterval(id)
+  }, [index, isPlaying, wordRail, keyboardPauseCaret, playheadSecRef])
 
   const clearSelection = () => setSelectionAnchor(null)
   const clearRowCaretState = useCallback(
@@ -794,6 +812,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
   /** playhead가 속한 단어 블록 바로 앞의 캐럿 인덱스(재생 중 방향키 기준점) */
   const caretIndexBeforePlayheadWord = (): number => {
     const words = wordRail
+    const playheadSec = playheadSecRef.current
     if (words.length === 0) return 0
     const inside = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
     if (inside >= 0) return inside
@@ -807,7 +826,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     const justPaused = prevIsPlayingRef.current && !isPlaying
     prevIsPlayingRef.current = isPlaying
     if (!justPaused) return
-    if (activeSubtitleIndex !== index) return
+    if (activeSubtitleIndexRef.current !== index) return
     if (skipPlayheadCaretSyncOnPauseRef.current) {
       skipPlayheadCaretSyncOnPauseRef.current = false
       return
@@ -820,6 +839,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     const words = wordRail
     if (words.length === 0) return
 
+    const playheadSec = playheadSecRef.current
     const inside = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
     let snap: number
     if (inside >= 0) snap = inside
@@ -841,14 +861,14 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
         el?.focus({ preventScroll: true })
       })
     })
-  }, [activeSubtitleIndex, index, isPlaying, playheadSec, wordRail])
+  }, [activeSubtitleIndexRef, index, isPlaying, wordRail, playheadSecRef])
 
   const onCaretKeyDown = (e: KeyboardEvent<HTMLButtonElement>, ci: number) => {
     e.stopPropagation()
     if (e.key === ' ' || e.code === 'Space') {
       e.preventDefault()
       if (isPlaying) {
-        onRequestPausePlayback()
+        onTogglePlayback()
         return
       }
       if (spaceSeekIntentRef.current === 'caret') {
@@ -865,7 +885,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       if (isPlaying) {
         skipPlayheadCaretSyncOnPauseRef.current = true
         setKeyboardPauseCaret(true)
-        onRequestPausePlayback()
+        onRequestPausePlayback('row-caret-arrow-nav')
       }
     }
     if (e.key === 'Home') {
@@ -978,7 +998,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
         const to = Math.max(selStart, selEnd)
         const words = row.words ?? []
         const seekSec = words[Math.max(0, Math.min(from, words.length - 1))]?.start ?? row.start
-        if (to > from && words[from] && words[to - 1]) {
+        if (to > from && words[from] && words[to - 1] && shouldDeleteAudioForWords(words.slice(from, to))) {
           onDeleteAudioRange(words[from].start, words[to - 1].end)
         }
         deleteWordRangeAt(index, from, to)
@@ -995,7 +1015,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       const seekSec = words[Math.max(0, Math.min(ci - 1, words.length - 1))]?.start ?? row.start
       if (ci > 0) {
         const leftWord = words[ci - 1]
-        if (leftWord) onDeleteAudioRange(leftWord.start, leftWord.end)
+        if (leftWord?.isSilence) onDeleteAudioRange(leftWord.start, leftWord.end)
         backspaceWordAt(index, ci)
         onCardNavigate(seekSec)
         registerCardFocus(index)
@@ -1016,7 +1036,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
         const to = Math.max(selStart, selEnd)
         const words = row.words ?? []
         const seekSec = words[Math.max(0, Math.min(from, words.length - 1))]?.start ?? row.start
-        if (to > from && words[from] && words[to - 1]) {
+        if (to > from && words[from] && words[to - 1] && shouldDeleteAudioForWords(words.slice(from, to))) {
           onDeleteAudioRange(words[from].start, words[to - 1].end)
         }
         deleteWordRangeAt(index, from, to)
@@ -1033,7 +1053,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       const seekSec = words[Math.min(ci, Math.max(0, words.length - 1))]?.start ?? row.start
       if (ci < words.length) {
         const targetWord = words[ci]
-        if (targetWord) onDeleteAudioRange(targetWord.start, targetWord.end)
+        if (targetWord?.isSilence) onDeleteAudioRange(targetWord.start, targetWord.end)
         deleteWordAt(index, ci)
         onCardNavigate(seekSec)
         registerCardFocus(index)
@@ -1066,7 +1086,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     if (e.key === ' ' || e.code === 'Space') {
       e.preventDefault()
       if (isPlaying) {
-        onRequestPausePlayback()
+        onTogglePlayback()
         return
       }
       const intent = spaceSeekIntentRef.current
@@ -1089,7 +1109,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       if (isPlaying) {
         skipPlayheadCaretSyncOnPauseRef.current = true
         setKeyboardPauseCaret(true)
-        onRequestPausePlayback()
+        onRequestPausePlayback('row-card-arrow-nav')
       }
     }
     if (e.key === 'ArrowRight') {
@@ -1184,7 +1204,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       <article
         ref={articleRef}
         id={`subtitle-card-${index}`}
-        className={`subtitle-card subtitle-card--virtual${isActive ? ' subtitle-card--active' : ''}`}
+        className="subtitle-card subtitle-card--virtual"
         tabIndex={0}
         onMouseDownCapture={(e) => {
           const t = e.target as HTMLElement
@@ -1195,7 +1215,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
           const tryActivateFirstCaret = (): boolean => {
             if (wordRail.length === 0) return false
             e.preventDefault()
-            if (isPlaying) onRequestPausePlayback()
+            if (isPlaying) onRequestPausePlayback('row-mousedown-caret-activate')
             clearSelection()
             activateCaretAt(0, true)
             return true
@@ -1286,7 +1306,6 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
               }`}
             >
               {wordRail.map((rw, wi) => {
-                const isWordActive = isPlaying && playheadSec >= rw.start && playheadSec < rw.end
                 const chipWordId = vrewRows?.[index]?.words?.[wi]?.id
                 const wordMotionKey =
                   chipWordId != null ? `wid-${chipWordId}` : `w-${index}-${rw.start}-${rw.end}`
@@ -1314,12 +1333,14 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                       id={`subtitle-word-${index}-${wi}`}
                       type="button"
                       tabIndex={-1}
+                      data-start={rw.start}
+                      data-end={rw.end}
                       data-word-start={rw.start}
                       data-word-end={rw.end}
                       {...(chipWordId != null ? ({ 'data-word-id': String(chipWordId) } as const) : {})}
                       data-waveform-active-word-chip={isActiveWaveformChip ? '1' : undefined}
                       data-waveform-expanded-row-chip={timelineLayoutThisRow ? '1' : undefined}
-                      className={`subtitle-word-chip subtitle-word-chip--proportional${isWordActive ? ' subtitle-word-chip--active' : ''}${rw.isSilence ? ' subtitle-word-chip--silence' : ''}`}
+                      className={`subtitle-word-chip subtitle-word-chip--proportional${rw.isSilence ? ' subtitle-word-chip--silence' : ''}`}
                       onMouseEnter={() => {
                         setCaretIndex(wi)
                         showStaticCaret()
@@ -1352,7 +1373,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                           }
 
                           if (isPlaying) {
-                            onRequestPausePlayback()
+                            onRequestPausePlayback('word-chip-click-wave-active')
                           }
                           clearSelection()
                           activateCaretAt(wi, true)
@@ -1360,7 +1381,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                         }
                         onWordBlockClick(rw.start)
                         if (isPlaying) {
-                          onRequestPausePlayback()
+                          onRequestPausePlayback('word-chip-click')
                         }
                         clearSelection()
                         activateCaretAt(wi, true)
@@ -1370,11 +1391,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                         // 더블클릭의 두 번째 mousedown(detail>1)에서 preventDefault 하면 dblclick이 막힐 수 있음
                         if (e.detail > 1) return
                         e.preventDefault()
-                        if (isPlaying) {
-                          onRequestPausePlayback()
-                        }
-                        clearSelection()
-                        activateCaretAt(wi, true)
+                        // intent 단일화: pause/seek/caret 활성은 onClick 경로에서만 처리
                       }}
                       onDoubleClick={(e) => {
                         if (activeChipCloseTimerRef.current != null) {
@@ -1498,7 +1515,6 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
 export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
   const { subtitles: subtitlesFromContext } = useSubtitleData()
   const subtitles = subtitlesFromContext.length > 0 ? subtitlesFromContext : props.subtitles
-  const { activeSubtitleIndex } = props
   const listRef = useListRef(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [size, setSize] = useState({ w: 0, h: 0 })
@@ -1650,11 +1666,12 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       if (target?.closest('.subtitle-card')) return
       if (subtitles.length === 0) return
       e.preventDefault()
-      if (props.isPlaying) props.onRequestPausePlayback()
-      const ai = activeSubtitleIndex
+      if (props.isPlaying) props.onRequestPausePlayback('global-arrow-nav')
+      const ai = props.activeSubtitleIndexRef.current
+      const ph = props.playheadSecRef.current
       if (ai !== null && ai >= 0 && ai < subtitles.length) {
         const words = subtitles[ai]?.words ?? []
-        const wi = words.findIndex((w) => props.playheadSec >= w.start && props.playheadSec < w.end)
+        const wi = words.findIndex((w) => ph >= w.start && ph < w.end)
         const caret = wi >= 0 ? wi : 0
         requestFocusCaret(ai, caret)
         return
@@ -1663,13 +1680,13 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     }
     window.addEventListener('keydown', onGlobalArrow)
     return () => window.removeEventListener('keydown', onGlobalArrow)
-  }, [activeSubtitleIndex, props.isPlaying, props.onRequestPausePlayback, props.playheadSec, requestFocusCaret, subtitles])
+  }, [props.activeSubtitleIndexRef, props.playheadSecRef, props.isPlaying, props.onRequestPausePlayback, requestFocusCaret, subtitles])
 
   const rowProps = useMemo(
     () => ({
       subtitles,
-      activeSubtitleIndex: props.activeSubtitleIndex,
-      playheadSec: props.playheadSec,
+      activeSubtitleIndexRef: props.activeSubtitleIndexRef,
+      playheadSecRef: props.playheadSecRef,
       isPlaying: props.isPlaying,
       mediaFileUrl: props.mediaFileUrl,
       onSubtitleCardClick: props.onSubtitleCardClick,
@@ -1707,8 +1724,8 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     }),
     [
       subtitles,
-      props.activeSubtitleIndex,
-      props.playheadSec,
+      props.activeSubtitleIndexRef,
+      props.playheadSecRef,
       props.isPlaying,
       props.mediaFileUrl,
       props.onSubtitleCardClick,

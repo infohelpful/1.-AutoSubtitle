@@ -103,14 +103,26 @@ export function drawWaveformCanvas(
   ctx.lineWidth = Math.max(1, dpr)
   ctx.lineJoin = 'round'
 
+  /**
+   * 무음 구간(피크 데이터 min/max 가 모두 0)이라도 중심선(midY) 에 얇은 가로 띠가 보이도록
+   * 모든 막대의 최소 세로 두께를 1 CSS px 이상으로 강제한다 — 그렇지 않으면 0 길이 stroke 이
+   * 그려져 화면이 텅 비어 보인다.
+   */
+  const minBarPx = Math.max(1, Math.round(dpr))
+
   for (let x = 0; x < wPx; x += 1) {
     const t = winStart + ((x + 0.5) / wPx) * span
     const pi = mediaSecToPeakPixelIndex(metrics, t)
     const i = pi * 2
     const mn = (data[i] ?? 0) / 127
     const mx = (data[i + 1] ?? 0) / 127
-    const y1Raw = midY + Math.min(mn, mx) * ampScale
-    const y2Raw = midY + Math.max(mn, mx) * ampScale
+    let y1Raw = midY + Math.min(mn, mx) * ampScale
+    let y2Raw = midY + Math.max(mn, mx) * ampScale
+    if (y2Raw - y1Raw < minBarPx) {
+      const cy = (y1Raw + y2Raw) * 0.5
+      y1Raw = cy - minBarPx * 0.5
+      y2Raw = cy + minBarPx * 0.5
+    }
     const y1 = Math.min(drawBottom, Math.max(drawTop, y1Raw))
     const y2 = Math.min(drawBottom, Math.max(drawTop, y2Raw))
     let muted = false

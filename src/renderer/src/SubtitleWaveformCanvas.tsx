@@ -179,6 +179,13 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
     const [editRange, setEditRange] = useState<{ start: number; end: number } | null>(null)
     /** 자르기·재생 시작 라인 (편집축 초) — 항상 `editRange` 안에서만 이동 */
     const [cutSec, setCutSec] = useState<number | null>(null)
+    /**
+     * 현재 드래그 중인 라인 — 드래그 중인 라인은 뒷쪽 파형이 보이도록 거의 투명하게 표시.
+     * (사용자가 길이/자르기 위치를 조절하면서 막대 모양을 시각적으로 확인할 수 있게 함)
+     */
+    const [draggingHandle, setDraggingHandle] = useState<
+      'trimStart' | 'trimEnd' | 'cut' | null
+    >(null)
     /** 한 번의 드래그에서 좌·우로 단어 경계 넘김 확장 시도 횟수(대부분 1회면 충분) */
     const expandLeftTokensRef = useRef(4)
     const expandRightTokensRef = useRef(4)
@@ -524,6 +531,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         } catch {
           /* ignore */
         }
+        setDraggingHandle(which === 'start' ? 'trimStart' : 'trimEnd')
         /** 경계 밖으로 이만큼(px) 더 끌어야 뷰가 확장된다 */
         const BRAKE_PX_OVERSHOOT = 18
 
@@ -591,6 +599,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           window.removeEventListener('pointermove', move)
           window.removeEventListener('pointerup', up)
           window.removeEventListener('pointercancel', up)
+          setDraggingHandle(null)
         }
         window.addEventListener('pointermove', move)
         window.addEventListener('pointerup', up)
@@ -648,6 +657,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         } catch {
           /* ignore */
         }
+        setDraggingHandle('cut')
         const move = (ev: PointerEvent): void => {
           const t = pointerToTimeOnStrip(ev.clientX)
           const er = editRangeRef.current
@@ -667,6 +677,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
           window.removeEventListener('pointermove', move)
           window.removeEventListener('pointerup', up)
           window.removeEventListener('pointercancel', up)
+          setDraggingHandle(null)
         }
         window.addEventListener('pointermove', move)
         window.addEventListener('pointerup', up)
@@ -1085,6 +1096,9 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
                       {(['start', 'end'] as const).map((which) => {
                         const pct =
                           which === 'start' ? trimHandlePct.startPct : trimHandlePct.endPct
+                        const isDraggingThis =
+                          (which === 'start' && draggingHandle === 'trimStart') ||
+                          (which === 'end' && draggingHandle === 'trimEnd')
                         return (
                           <div
                             key={which}
@@ -1094,8 +1108,14 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
                             role="slider"
                             aria-label={which === 'start' ? '구간 시작' : '구간 끝'}
                           >
-                            <div className="pointer-events-none absolute inset-y-0 left-1/2 w-[2px] -translate-x-1/2 bg-white/95 shadow-[0_0_6px_rgba(255,255,255,0.5)]" />
-                            <div className="pointer-events-none absolute left-1/2 top-1/2 flex h-6 w-3.5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-[3px] border border-slate-900/80 bg-white shadow-md">
+                            <div
+                              className="pointer-events-none absolute inset-y-0 left-1/2 w-[2px] -translate-x-1/2 bg-white/95 shadow-[0_0_6px_rgba(255,255,255,0.5)] transition-opacity duration-75"
+                              style={{ opacity: isDraggingThis ? 0.25 : 1 }}
+                            />
+                            <div
+                              className="pointer-events-none absolute left-1/2 top-1/2 flex h-6 w-3.5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-[3px] border border-slate-900/80 bg-white shadow-md transition-opacity duration-75"
+                              style={{ opacity: isDraggingThis ? 0.3 : 1 }}
+                            >
                               <span className="block h-3 w-[1px] bg-slate-500/80" />
                             </div>
                           </div>
@@ -1115,13 +1135,17 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
                         aria-label="자르기·재생 시작 라인"
                       >
                         <div
-                          className="pointer-events-none absolute inset-y-1 left-1/2 -translate-x-1/2"
+                          className="pointer-events-none absolute inset-y-1 left-1/2 -translate-x-1/2 transition-opacity duration-75"
                           style={{
                             width: 0,
-                            borderLeft: '2px dashed rgb(56 189 248)'
+                            borderLeft: '2px dashed rgb(56 189 248)',
+                            opacity: draggingHandle === 'cut' ? 0.25 : 1
                           }}
                         />
-                        <div className="pointer-events-none absolute left-1/2 top-1/2 flex h-6 w-3.5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-[3px] border border-sky-700 bg-sky-400 shadow-md">
+                        <div
+                          className="pointer-events-none absolute left-1/2 top-1/2 flex h-6 w-3.5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-[3px] border border-sky-700 bg-sky-400 shadow-md transition-opacity duration-75"
+                          style={{ opacity: draggingHandle === 'cut' ? 0.35 : 1 }}
+                        >
                           <span className="block h-3 w-[1px] bg-white/70" />
                         </div>
                       </div>

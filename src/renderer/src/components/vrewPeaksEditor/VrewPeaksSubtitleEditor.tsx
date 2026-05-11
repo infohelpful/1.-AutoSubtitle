@@ -28,6 +28,13 @@ function flattenWords(rows: SubtitleRow[]): Word[] {
   return rows.flatMap((r) => r.words).sort((a, b) => a.start - b.start)
 }
 
+/** 단어 칩 툴팁 — start/end 가 NaN/undefined 일 때 `toFixed` 가 던지지 않도록 안전화 */
+function formatWordTimeRangeTitle(w: Word): string {
+  const a = Number.isFinite(w.start) ? (w.start as number).toFixed(2) : '—'
+  const b = Number.isFinite(w.end) ? (w.end as number).toFixed(2) : '—'
+  return `${a}s – ${b}s`
+}
+
 function applyWordsToPeaks(peaks: PeaksInstance, list: Word[]): void {
   peaks.segments.removeAll()
   for (const w of list) {
@@ -114,7 +121,7 @@ export function VrewPeaksSubtitleEditor({
   const rowWaveMountRef = useRef<Map<string, HTMLDivElement | null>>(new Map())
 
   const [activeRowId, setActiveRowId] = useState<string | null>(null)
-  const [activeWordId, setActiveWordId] = useState<number | null>(null)
+  const [activeWordId, setActiveWordId] = useState<string | null>(null)
   /** Bumps when parking mounts or row waveform mount nodes change so portal target recomputes */
   const [portalRev, setPortalRev] = useState(0)
   /** 포털 타깃은 렌더 중 useMemo(ref 맵)로 계산하면 활성 행 전환 직후 한 프레임 parking에 붙어 파동이 안 보일 수 있음 → 커밋 후 확정 */
@@ -149,30 +156,6 @@ export function VrewPeaksSubtitleEditor({
     const maxEnd = flatWords.reduce((m, w) => Math.max(m, w.end), 0)
     return Math.max(60, Math.ceil(maxEnd) + 25)
   }, [flatWords])
-
-  const mountLoggedRef = useRef(false)
-  useEffect(() => {
-    if (mountLoggedRef.current) return
-    mountLoggedRef.current = true
-    wfLog(
-      'lifecycle',
-      'VrewPeaksSubtitleEditor mount',
-      {
-        rowCount: rows.length,
-        flatWordCount: flatWords.length,
-        silentDurationSec,
-        audioUrl: audioUrl ?? '(silent wav)'
-      }
-    )
-    void window.api
-      .logWaveformDebug('lifecycle', 'waveform.log 위치는 userData/logs/waveform.log (아래 path 참고)')
-      .then((r) => {
-        wfLog('lifecycle', 'logPath', r.path)
-      })
-      .catch(() => {
-        wfLog('lifecycle', 'logWaveformDebug IPC unavailable (비 Electron 환경일 수 있음)')
-      })
-  }, [rows.length, flatWords.length, silentDurationSec, audioUrl])
 
   useEffect(() => {
     rowsRef.current = rows
@@ -584,7 +567,7 @@ export function VrewPeaksSubtitleEditor({
                   <button
                     key={w.id}
                     type="button"
-                    title={`${w.start.toFixed(2)}s – ${w.end.toFixed(2)}s`}
+                    title={formatWordTimeRangeTitle(w)}
                     className={`max-w-[140px] truncate rounded-md border px-2.5 py-1.5 text-left text-sm transition ${
                       isOpen && activeWordId === w.id
                         ? 'border-vrew-accent bg-vrew-panel ring-1 ring-vrew-accent'

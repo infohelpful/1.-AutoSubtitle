@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildTimelineClips,
   createTimelineMapping,
+  jumpVideoPastClipTailIfNeeded,
   mapMediaToProgramSec,
   mapProgramToMediaSec,
   programDurationSec,
@@ -83,11 +84,53 @@ describe('buildTimelineClips + mapProgramToMediaSec / mapMediaToProgramSec', () 
   })
 })
 
+describe('mapMediaToProgramSec — 삭제 미디어 구간(클립 밖)', () => {
+  it('삭제로 비워진 미디어 구간 안이면 다음 클립 editStart', () => {
+    const cuts: CutRange[] = [{ start: 1, end: 2 }]
+    const clips = buildTimelineClips(cuts, 10)
+    expect(mapMediaToProgramSec(1.5, clips)).toBeCloseTo(1, 5)
+  })
+
+  it('선두 삭제 후 첫 미디어 이전 — 편집 축으로 선형 보간', () => {
+    const cuts: CutRange[] = [{ start: 0, end: 1 }]
+    const clips = buildTimelineClips(cuts, 10)
+    expect(clips[0]!.mediaStart).toBeGreaterThan(0)
+    expect(mapMediaToProgramSec(0.3, clips)).toBeCloseTo(Math.max(0, 0 + (0.3 - clips[0]!.mediaStart)), 5)
+  })
+})
+
 describe('skipCutRangeAt', () => {
   it('삭제 구간 내부 시간을 밖으로 밀어냄', () => {
     const cuts: CutRange[] = [{ start: 1, end: 2 }]
     const t = skipCutRangeAt(1.5, cuts)
     expect(t).toBeGreaterThanOrEqual(2 + 2e-4 - 1e-9)
+  })
+})
+
+describe('jumpVideoPastClipTailIfNeeded', () => {
+  it('클립 끝 직전이면 다음 클립의 mediaStart 로 점프', () => {
+    const cuts: CutRange[] = [{ start: 1, end: 2 }]
+    const clips = buildTimelineClips(cuts, 10)
+    const r = jumpVideoPastClipTailIfNeeded(0.99, clips, 0.02)
+    expect(r.jumped).toBe(true)
+    if (r.jumped) {
+      expect(r.toMediaSec).toBeCloseTo(2, 5)
+      expect(r.fromClipId).toBe(1)
+      expect(r.toClipId).toBe(2)
+    }
+  })
+
+  it('클립 중간이면 점프하지 않음', () => {
+    const cuts: CutRange[] = [{ start: 1, end: 2 }]
+    const clips = buildTimelineClips(cuts, 10)
+    expect(jumpVideoPastClipTailIfNeeded(0.3, clips, 0.02).jumped).toBe(false)
+  })
+
+  it('마지막 클립 꼬리는 점프하지 않음', () => {
+    const cuts: CutRange[] = [{ start: 1, end: 2 }]
+    const clips = buildTimelineClips(cuts, 10)
+    // 마지막 클립의 mediaEnd ≈ 10
+    expect(jumpVideoPastClipTailIfNeeded(9.99, clips, 0.02).jumped).toBe(false)
   })
 })
 

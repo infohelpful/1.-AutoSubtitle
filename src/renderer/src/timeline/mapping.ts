@@ -159,13 +159,35 @@ export function mapProgramToMediaSec(programSec: number, clips: TimelineClip[]):
 
 /**
  * 원본 미디어 초 → 프로그램(편집) 초
+ *
+ * 클립 `[mediaStart, mediaEnd)` 에 속하지 않으면 예전에는 항상 `last.timelineEnd` 로 떨어져
+ * 삭제 구간 안의 미디어 시각(디코더가 잠깐 그 구간을 보고할 때)에서 편집 헤드가 타임라인 끝으로 튀는 버그가 있었다.
+ * 삭제로 비워진 미디어 구간 → 다음 살아 있는 클립의 `editStart`; 첫 클립 이전 → 편집 축으로 선형 보간 `max(0, editStart + (t - mediaStart))`; 마지막 이후만 끝으로 클램프.
  */
 export function mapMediaToProgramSec(mediaSec: number, clips: TimelineClip[]): number {
   const t = Math.max(0, mediaSec)
   if (clips.length === 0) return t
   const c = findClipByMediaSec(t, clips)
   if (c) return c.editStart + (t - c.mediaStart)
+
+  const first = clips[0]!
   const last = clips[clips.length - 1]!
+
+  if (t < first.mediaStart) {
+    return Math.max(0, first.editStart + (t - first.mediaStart))
+  }
+  if (t >= last.mediaEnd) {
+    return last.timelineEnd
+  }
+
+  for (let i = 0; i < clips.length - 1; i += 1) {
+    const a = clips[i]!
+    const b = clips[i + 1]!
+    if (t >= a.mediaEnd && t < b.mediaStart) {
+      return b.editStart
+    }
+  }
+
   return last.timelineEnd
 }
 
@@ -219,4 +241,35 @@ export function createTimelineMapping(
 export function programDurationSec(clips: TimelineClip[]): number {
   if (clips.length === 0) return 0
   return clips[clips.length - 1]!.timelineEnd
+}
+
+export type JumpVideoResult =
+  | { jumped: false }
+  | { jumped: true; fromMediaSec: number; toMediaSec: number; fromClipId: number; toClipId: number }
+
+/**
+ * 비디오 마스터 재생: 비디오의 미디어 시각이 현재 클립의 `mediaEnd - tailSec` 안으로 들어왔다면
+ * 다음 클립의 `mediaStart` 로 점프 (Jump-Cut). 마지막 클립이거나 클립 안이 아니면 `jumped:false`.
+ *
+ * `tailSec` 기본값은 한 프레임(≈ 16ms)보다 약간 큰 0.02s — 디코더가 같은 키프레임에 머무는 끝점 회피.
+ */
+export function jumpVideoPastClipTailIfNeeded(
+  currentMediaSec: number,
+  clips: TimelineClip[],
+  tailSec = 0.02
+): JumpVideoResult {
+  if (clips.length === 0) return { jumped: false }
+  const cur = findClipByMediaSec(currentMediaSec, clips)
+  if (!cur) return { jumped: false }
+  const remaining = cur.mediaEnd - currentMediaSec
+  if (remaining > tailSec) return { jumped: false }
+  const next = clips.find((c) => c.id === cur.id + 1)
+  if (!next) return { jumped: false }
+  return {
+    jumped: true,
+    fromMediaSec: currentMediaSec,
+    toMediaSec: next.mediaStart,
+    fromClipId: cur.id,
+    toClipId: next.id
+  }
 }

@@ -2,11 +2,18 @@ import { SILENCE_PLACEHOLDER_TEXT } from './wordContract'
 
 /** Python 사이드카(Faster-Whisper) 및 UI 공통 자막 줄 형식 */
 export type SubtitleWord = {
+  /**
+   * 원본 미디어 파일 기준 절대 시각(초). EDL 정책: 삭제·리플로 절대 바뀌지 않음.
+   * 편집(프로그램) 축 시간이 필요한 곳(Peaks 줌·세그먼트)은 `mapMediaToEditSec` 같은
+   * 매핑을 통해서만 변환해 쓰고, 자막 상태에는 항상 원본 미디어 시각만 저장한다.
+   */
   start: number
   end: number
   word: string
   /** true: gap-fill 등으로 삽입된 무음 구간(표시용 `word`는 보통 `??`) */
   isSilence?: boolean
+  /** true: 비파괴 삭제(tombstone). 배열·타임스탬프는 유지하되 표시·재생·내보내기에서 제외 */
+  isDeleted?: boolean
 }
 
 export type SubtitleLine = {
@@ -14,6 +21,51 @@ export type SubtitleLine = {
   end: number
   text: string
   words?: SubtitleWord[]
+}
+
+/** 화면 표시·내보내기용 — `isDeleted` tombstone 과 무음 더미를 제외한 단어들 */
+export function visibleSubtitleWords(
+  words: readonly SubtitleWord[] | undefined
+): SubtitleWord[] {
+  if (!words || words.length === 0) return []
+  return words.filter((w) => !w.isDeleted && !w.isSilence)
+}
+
+/** 목록·내보내기용 — 삭제·무음 플레이스홀더는 제외한 표시 문자열 */
+export function displayTextFromSubtitleWords(
+  words: readonly SubtitleWord[] | undefined
+): string {
+  if (!words || words.length === 0) return ''
+  return visibleSubtitleWords(words)
+    .map((w) => w.word)
+    .join(' ')
+    .trim()
+}
+
+/** SRT/VTT/ASS/번인 IPC 큐용 — `{ start, end, text }` 만 남기되, tombstone 으로 좁힌다. */
+export type SubtitleCueLineForExport = { start: number; end: number; text: string }
+
+export function subtitleCueLinesForExport(
+  lines: readonly SubtitleLine[]
+): SubtitleCueLineForExport[] {
+  const out: SubtitleCueLineForExport[] = []
+  for (const line of lines) {
+    const hasWords = Array.isArray(line.words) && line.words.length > 0
+    if (hasWords) {
+      const vis = visibleSubtitleWords(line.words)
+      if (vis.length === 0) continue
+      const start = Math.min(...vis.map((w) => w.start))
+      const end = Math.max(...vis.map((w) => w.end))
+      const text = displayTextFromSubtitleWords(line.words) || (line.text ?? '').trim()
+      if (text.length === 0) continue
+      out.push({ start, end, text })
+    } else {
+      const text = (line.text ?? '').trim()
+      if (text.length === 0) continue
+      out.push({ start: line.start, end: line.end, text })
+    }
+  }
+  return out
 }
 
 function isRecord(x: unknown): x is Record<string, unknown> {
@@ -40,8 +92,12 @@ export function parseSubtitleLines(raw: unknown): SubtitleLine[] {
         w.isSilence === true ||
         (typeof (w as { is_silence?: unknown }).is_silence === 'boolean' &&
           (w as { is_silence?: boolean }).is_silence === true)
+      const isDeleted =
+        w.isDeleted === true ||
+        (typeof (w as { is_deleted?: unknown }).is_deleted === 'boolean' &&
+          (w as { is_deleted?: boolean }).is_deleted === true)
       if (!Number.isFinite(ws) || !Number.isFinite(we)) continue
-      if (ww.trim().length === 0 && !isSilence) continue
+      if (ww.trim().length === 0 && !isSilence && !isDeleted) continue
       const tw = ww.trim()
       const entry: SubtitleWord = {
         start: ws,
@@ -49,6 +105,7 @@ export function parseSubtitleLines(raw: unknown): SubtitleLine[] {
         word: isSilence ? SILENCE_PLACEHOLDER_TEXT : tw.length > 0 ? tw : '??'
       }
       if (isSilence) entry.isSilence = true
+      if (isDeleted) entry.isDeleted = true
       words.push(entry)
     }
     if (!Number.isFinite(start) || !Number.isFinite(end)) continue

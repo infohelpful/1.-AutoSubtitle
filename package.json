@@ -20,7 +20,8 @@
     "konva": "^9.3.22",
     "peaks.js": "^4.0.0",
     "react-window": "^2.2.7",
-    "waveform-data": "^4.5.2"
+    "waveform-data": "^4.5.2",
+    "zustand": "^5.0.13"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

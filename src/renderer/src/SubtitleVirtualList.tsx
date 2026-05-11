@@ -17,10 +17,20 @@ import type { RowComponentProps } from 'react-window'
 import type { MouseEvent } from 'react'
 
 import type { SubtitleLine } from '../../shared/subtitles'
+import type { JsonWaveformData } from '../../shared/waveformJson'
+import {
+  nearestValidStorageCaret,
+  renderableCaretToStorageCaret,
+  stepStorageCaretByRenderable,
+  storageCaretToRenderableCaret,
+  visibleWordStorageIndices
+} from '../../shared/subtitleWordCaretMap'
 import type { SubtitleRow } from './components/vrewPeaksEditor/types'
 import type { PeaksZoomViewRange } from './SubtitleWaveformPeaks'
 import { computeLineZoomWindowFromCardBounds, type LineZoomWindowResult } from './lineZoomWindow'
 import { useSubtitleData } from './subtitleDataContext'
+import { peaksJsonRawDataLength } from './wordCanvas/peaksSentenceSlice'
+import { SentenceLineWaveformCanvas } from './waveform/SentenceLineWaveformCanvas'
 
 const WORD_LAYOUT_SPRING = { type: 'spring' as const, stiffness: 380, damping: 34 }
 /** 파형 타임라인 펼침 — 칩 너비·위치 전환을 조금 더 부드럽게 */
@@ -35,6 +45,8 @@ type WordRailItem = {
   end: number
   label: string
   isSilence?: boolean
+  /** `row.words` 배열 인덱스 — tombstone(`isDeleted`) 은 렌더에서 제외해도 API·캐럿은 스토리지 인덱스 기준 */
+  storageIndex: number
 }
 
 function wordChipSlotStyle(w: { start: number; end: number }, tw: LineZoomWindowResult): CSSProperties {
@@ -81,7 +93,7 @@ export type SubtitleVirtualListProps = {
   waveformEnabled?: boolean
   registerWaveMount?: (lineIndex: number, el: HTMLDivElement | null) => void
   waveformExpandedLineIndex?: number | null
-  waveformActiveWordId?: number | null
+  waveformActiveWordId?: string | null
   onWaveformWordDoubleClick?: (lineIndex: number, wordIndex: number) => void
   /** 파형 펼침 줄에서 단어 칩 단일 클릭 — 활성 단어는 접기, 그 외 단어는 포커스만 이동 */
   onWaveformExpandedLineWordClick?: (lineIndex: number, wordIndex: number) => void
@@ -92,6 +104,10 @@ export type SubtitleVirtualListProps = {
   mediaDurationSec?: number
   /** Peaks zoomview 실제 구간 — 있으면 칹 %는 이 축을 따름(zoomLevels 양자화 일치) */
   peaksZoomViewRange?: PeaksZoomViewRange | null
+  /** 문장 카드 로컬 파형 — 원본 미디어 피크(JSON); 줄 단위 canvas 슬라이스만 그림(전역 스티치 X) */
+  waveformPeaksJson?: JsonWaveformData | null
+  /** 피크 길이 힌트(초) — App 의 `durationSec` 와 동일 정책 (`exactTimelineDurationSecFromWaveformJson` 보조) */
+  waveformMediaDurationHintSec?: number
 }
 
 /** `List` 의 `rowProps` — `index` / `style` / `ariaAttributes` 는 List가 주입 */
@@ -129,13 +145,15 @@ export type SubtitleListRowProps = {
   waveformEnabled?: boolean
   registerWaveMount?: (lineIndex: number, el: HTMLDivElement | null) => void
   waveformExpandedLineIndex?: number | null
-  waveformActiveWordId?: number | null
+  waveformActiveWordId?: string | null
   onWaveformWordDoubleClick?: (lineIndex: number, wordIndex: number) => void
   onWaveformExpandedLineWordClick?: SubtitleVirtualListProps['onWaveformExpandedLineWordClick']
   vrewRows?: SubtitleRow[]
   onWaveformMountLayout?: SubtitleVirtualListProps['onWaveformMountLayout']
   mediaDurationSec?: number
   peaksZoomViewRange?: PeaksZoomViewRange | null
+  waveformPeaksJson?: JsonWaveformData | null
+  waveformMediaDurationHintSec?: number
 }
 
 const shouldDeleteAudioForWords = (words: Array<{ isSilence?: boolean }> | undefined): boolean =>
@@ -180,7 +198,9 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     vrewRows,
     onWaveformMountLayout,
     mediaDurationSec,
-    peaksZoomViewRange
+    peaksZoomViewRange,
+    waveformPeaksJson,
+    waveformMediaDurationHintSec
   } = props
   const requestFocusCaret = requestFocusWord
   const row = subtitles[index]
@@ -213,45 +233,43 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     setSubtitleTextDraft(null)
   }, [row.text, row.start, row.end, index])
 
+  /**
+   * 렌더링 단위 레일 — **tombstone(`isDeleted`) 제외**, 각 칩은 원본 `row.words` 의 `storageIndex` 보존.
+   *
+   * - 칩의 visual index `wi` 는 **렌더 가능 캐럿(renderable)** 축.
+   * - App 으로 보내는 모든 콜백(`deleteWordAt/Range`, `splitSubtitleAtWord`, `onWaveformWordDoubleClick`, ...) 은
+   *   **`rw.storageIndex`** 를 사용 — App.tsx 는 항상 원본 배열 인덱스를 기준으로 동작한다.
+   * - 키보드 네비게이션은 visible 슬롯을 따라 이동하지만, 상태로 저장되는 `caretIndex` / `selectionAnchor` 는
+   *   `subtitleWordCaretMap` 의 `renderableCaretToStorageCaret` 매핑으로 **storage caret** 으로 정규화한다.
+   *
+   * vrew 경로(silence gap-fill 더미)는 의도적으로 제거 — gap-fill 은 삭제 시 자동으로 꺼지고
+   * (`setGapFillWhenBuildingVrew(false)`), 칩은 자막 SSOT(`row.words`) 와 1:1 로만 그린다.
+   */
   const wordRail = useMemo((): WordRailItem[] => {
     const sw = row.words ?? []
-    const vr = vrewRows?.[index]?.words
-    if (waveformEnabled && vr && vr.length > 0) {
-      return vr.map((w) => ({
+    const out: WordRailItem[] = []
+    for (let i = 0; i < sw.length; i++) {
+      const w = sw[i]!
+      if (w.isDeleted === true) continue
+      out.push({
         start: w.start,
         end: w.end,
-        label: w.isSilence ? (w.text.trim() || '??') : w.text,
-        isSilence: w.isSilence
-      }))
+        label: w.isSilence ? (String(w.word).trim() || '??') : w.word,
+        isSilence: w.isSilence,
+        storageIndex: i
+      })
     }
-    return sw.map((w) => ({
-      start: w.start,
-      end: w.end,
-      label: w.isSilence ? (String(w.word).trim() || '??') : w.word,
-      isSilence: w.isSilence
-    }))
-  }, [waveformEnabled, vrewRows, index, row.words])
+    return out
+  }, [row.words])
 
-  /** vrew 레일 캐럿 ci → 자막 줄에서 splitSubtitleAtWord 에 넘길 인덱스 */
-  const subtitleSplitIndexFromRailCaret = useCallback(
-    (ci: number): number => {
-      const subs = row.words ?? []
-      if (subs.length === 0 || ci <= 0) return 0
-      if (ci >= wordRail.length) return subs.length
-      const bt = (wordRail[ci - 1]!.end + wordRail[ci]!.start) / 2
-      for (let j = 1; j < subs.length; j++) {
-        const mid = (subs[j - 1]!.end + subs[j]!.start) / 2
-        if (bt <= mid) return j
-      }
-      return subs.length
-    },
-    [row.words, wordRail]
-  )
-
+  /** row.words 가 줄어들거나 tombstone 이 늘면 캐럿/선택 앵커를 유효 경계로 스냅 */
   useEffect(() => {
-    const n = wordRail.length
-    setCaretIndex((prev) => Math.max(0, Math.min(prev, n)))
-  }, [wordRail])
+    const sw = row.words ?? []
+    setCaretIndex((prev) => nearestValidStorageCaret(sw, Math.max(0, Math.min(prev, sw.length))))
+    setSelectionAnchor((prev) =>
+      prev === null ? prev : nearestValidStorageCaret(sw, Math.max(0, Math.min(prev, sw.length)))
+    )
+  }, [row.words])
 
   /**
    * 파형이 열린 줄: Peaks 실제 zoomview 구간과 줄 구간을 맞춘다.
@@ -289,10 +307,48 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     return lineTw
   }, [wordRail, mediaDurationSec, peaksZoomViewRange, waveformExpandedLineIndex, index])
 
-  /** 파형이 열린 줄만 시간축(%)·가로 스크롤 — 그 외는 줄바꿈 읽기 모드 */
-  const timelineLayoutThisRow = Boolean(
+  /**
+   * 문장 카드 로컬 파형 canvas — **항상 원본 미디어 축** 단어 시간 min/max 로 잘라 그린다.
+   * - 단어 삭제(`isDeleted: true`) 토글은 같은 줄의 `row.words` 만 바뀌므로 이 카드의 effect 하나만 다시 돌고
+   *   전역 `stitchWaveformJsonByCuts` 호출과는 분리된다 (O(1) 로컬 갱신).
+   * - 파형이 펼쳐진 줄(메인 Peaks 인스턴스가 그리는 중) 에서는 시각적 중복을 피해 캔버스를 끄지 않는다 —
+   *   캔버스는 `z-0 absolute bottom-0` 로 단어 칩 뒤에 깔리므로 텍스트 가독성을 해치지 않는다.
+   */
+  const lineWaveformWindow = useMemo((): { start: number; end: number } | null => {
+    const ws = row.words ?? []
+    if (ws.length === 0) return null
+    let s = Number.POSITIVE_INFINITY
+    let e = Number.NEGATIVE_INFINITY
+    for (const w of ws) {
+      const a = Math.min(w.start, w.end)
+      const b = Math.max(w.start, w.end)
+      if (a < s) s = a
+      if (b > e) e = b
+    }
+    if (!Number.isFinite(s) || !Number.isFinite(e) || !(e > s)) return null
+    return { start: s, end: e }
+  }, [row.words])
+
+  /** 피크 JSON 동등 비교 지문 — 객체 자체가 안 바뀌어도 길이 바뀌면 강제 redraw */
+  const peaksDataSig = useMemo(
+    () => peaksJsonRawDataLength(waveformPeaksJson ?? null),
+    [waveformPeaksJson]
+  )
+
+  /**
+   * 이 줄에서 파형이 펼쳐졌는가 — 파형 패널 마운트·활성 칩 매칭·캐럿 오버레이 숨김에만 사용.
+   * (단어 칩 레이아웃에는 영향 주지 않음 — 더블클릭 전후로 칩 크기·줄바꿈은 그대로 유지)
+   */
+  const waveformExpandedThisRow = Boolean(
     waveformEnabled && waveformExpandedLineIndex === index
   )
+  /**
+   * 단어 줄을 시간축 비율(%) 레이아웃으로 둘 것인가 — 항상 false.
+   * 파형이 열려도 칩은 compact(줄바꿈) 모드를 그대로 유지해, 단어 블록 크기가 파형 패널 폭에
+   * 끌려 커지지 않도록 한다. (예전에는 `waveformEnabled && waveformExpandedLineIndex === index`
+   * 일 때 true 였고, 그게 단어 칩이 시간 비율로 넓어지는 원인이었음.)
+   */
+  const timelineLayoutThisRow = false
 
   const wordRowOuterRef = useRef<HTMLDivElement>(null)
   const wordRowInnerRef = useRef<HTMLDivElement>(null)
@@ -520,10 +576,13 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     [waveformEnabled, waveformExpandedLineIndex, index, registerWaveMount, row.words?.length]
   )
 
-  const wordTimeSig = useMemo(
-    () => wordRail.map((w) => `${w.start}|${w.end}`).join(';'),
-    [wordRail]
-  )
+  /** 캐럿 측정 invalidation 키 — tombstone 토글 시에도 변하도록 row.words 전부를 포함 */
+  const wordTimeSig = useMemo(() => {
+    const sw = row.words ?? []
+    return sw
+      .map((w) => `${w.start}|${w.end}|${w.isDeleted === true ? 'd' : 'a'}`)
+      .join(';')
+  }, [row.words])
 
   /** 파형 마운트는 단어 행과 동일 부모 폭(w-full). 타임라인·미디어 길이 바뀔 때 Peaks fit 동기화 */
   useLayoutEffect(() => {
@@ -561,6 +620,74 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       registerWaveMount?.(index, null)
     }
   }, [index, registerWaveMount])
+
+  /**
+   * 활성 단어 칩 중앙에 파형 패널을 정렬한다.
+   * - 더블클릭한 칩의 가로 중앙 좌표를 기준으로 패널이 가운데 정렬되도록 `--subwave-panel-left-px` CSS 변수를
+   *   파형 마운트(`subtitle-waveform-mount`)에 기록한다.
+   * - 카드 좌/우 경계를 벗어나면 가능한 만큼 좌·우 가까이 붙도록 `[0, mountW - panelW]` 로 클램프한다.
+   * - 활성 칩을 찾을 수 없으면 변수 제거 → 패널은 기본 `margin: auto` 로 가운데 정렬된다.
+   */
+  useLayoutEffect(() => {
+    if (!(waveformEnabled && waveformExpandedLineIndex === index)) return
+    const mount = waveformMountRef.current
+    const card = articleRef.current
+    if (!mount || !card) return
+
+    const PANEL_MAX_PX = 336
+
+    const applyOffset = (): void => {
+      const mountRect = mount.getBoundingClientRect()
+      if (mountRect.width <= 0) return
+
+      let chipEl: HTMLElement | null = null
+      if (waveformActiveWordId != null) {
+        try {
+          chipEl = card.querySelector(
+            `[data-word-id="${CSS.escape(String(waveformActiveWordId))}"]`
+          ) as HTMLElement | null
+        } catch {
+          chipEl = null
+        }
+      }
+      if (!chipEl) {
+        chipEl = card.querySelector(
+          '[data-waveform-active-word-chip="1"]'
+        ) as HTMLElement | null
+      }
+      if (!chipEl) {
+        mount.style.removeProperty('--subwave-panel-left-px')
+        return
+      }
+
+      const chipRect = chipEl.getBoundingClientRect()
+      const chipCenterPx = (chipRect.left + chipRect.right) / 2 - mountRect.left
+      const panelWidth = Math.min(mountRect.width, PANEL_MAX_PX)
+      const ideal = chipCenterPx - panelWidth / 2
+      const maxLeft = Math.max(0, mountRect.width - panelWidth)
+      const clamped = Math.max(0, Math.min(maxLeft, ideal))
+      mount.style.setProperty('--subwave-panel-left-px', `${Math.round(clamped)}px`)
+    }
+
+    applyOffset()
+
+    const ro = new ResizeObserver(() => applyOffset())
+    ro.observe(mount)
+    ro.observe(card)
+    const onWin = (): void => applyOffset()
+    window.addEventListener('resize', onWin)
+    return () => {
+      ro.disconnect()
+      window.removeEventListener('resize', onWin)
+      mount.style.removeProperty('--subwave-panel-left-px')
+    }
+  }, [
+    waveformEnabled,
+    waveformExpandedLineIndex,
+    index,
+    waveformActiveWordId,
+    wordRail
+  ])
 
   useEffect(() => {
     setCaretVisible(false)
@@ -647,27 +774,40 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     window.requestAnimationFrame(() => articleRef.current?.focus())
   }
 
-  const activateCaretAt = (ci: number, blink: boolean, armSpaceSeek = true) => {
+  /**
+   * `storageCaret` 을 활성화한다.
+   * - 상태로 저장하는 `caretIndex` 는 storage 축(`row.words` 인덱스).
+   * - DOM caret 버튼은 visible 슬롯마다 하나씩 그려지므로(id=`subtitle-caret-${row}-${renderableCaret}`),
+   *   포커스는 visible 슬롯 인덱스(renderable)로 한다.
+   * - 빈 줄(보이는 단어 없음) 이거나 storage 가 유효 경계가 아니면 `nearestValidStorageCaret` 로 스냅.
+   */
+  const activateCaretAt = (storageCaret: number, blink: boolean, armSpaceSeek = true) => {
+    const subs = row.words ?? []
+    const safe = nearestValidStorageCaret(subs, storageCaret)
+    const rc = storageCaretToRenderableCaret(subs, safe)
     if (armSpaceSeek) spaceSeekIntentRef.current = 'caret'
-    setCaretIndex(ci)
+    setCaretIndex(safe)
     setCaretVisible(true)
     setCaretBlink(blink)
     setRowHasFocus(true)
-    setFocusedCaretIndex(ci)
+    setFocusedCaretIndex(rc)
     setHoveredCaretIndex(null)
     window.requestAnimationFrame(() => {
-      const el = document.getElementById(`subtitle-caret-${index}-${ci}`) as HTMLButtonElement | null
+      const el = document.getElementById(`subtitle-caret-${index}-${rc}`) as HTMLButtonElement | null
       const active = document.activeElement as HTMLElement | null
       if (el && active?.id !== el.id) el.focus({ preventScroll: true })
     })
   }
-  const syncCaretFromFocus = (ci: number) => {
+  /** caret 버튼이 직접 포커스되면 → visible 슬롯(`renderableCaret`)로부터 storage caret 동기화 */
+  const syncCaretFromFocus = (renderableCaret: number) => {
+    const subs = row.words ?? []
+    const storage = renderableCaretToStorageCaret(subs, renderableCaret)
     spaceSeekIntentRef.current = 'caret'
-    setCaretIndex(ci)
+    setCaretIndex(storage)
     setCaretVisible(true)
     setCaretBlink(true)
     setRowHasFocus(true)
-    setFocusedCaretIndex(ci)
+    setFocusedCaretIndex(renderableCaret)
     setHoveredCaretIndex(null)
   }
   const showKeyboardCaret = () => {
@@ -799,26 +939,44 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     void nextCaret
   }
 
-  const playAtCaret = (nextCaret: number) => {
-    const words = wordRail
-    if (words.length === 0) {
+  /** `storageCaret`: row.words 인덱스 기준. 0..row.words.length. 가장 가까운 보이는 단어부터 재생. */
+  const playAtCaret = (storageCaret: number) => {
+    const subs = row.words ?? []
+    if (subs.length === 0) {
       onWaveformSeekAndPlay(row.start)
       return
     }
-    const wi = Math.max(0, Math.min(nextCaret, words.length - 1))
-    onWaveformSeekAndPlay(words[wi].start)
+    // 보이는 단어가 하나도 없으면 줄 시작에서 시작
+    const visIdx = visibleWordStorageIndices(subs)
+    if (visIdx.length === 0) {
+      onWaveformSeekAndPlay(row.start)
+      return
+    }
+    const c = Math.max(0, Math.min(storageCaret, subs.length))
+    // storage caret c → 보이는 단어 중 c 이상 첫 번째(즉, 캐럿 오른쪽의 단어). 없으면 마지막 보이는 단어.
+    let pick = visIdx.find((i) => i >= c)
+    if (pick == null) pick = visIdx[visIdx.length - 1]!
+    onWaveformSeekAndPlay(subs[pick]!.start)
   }
 
-  /** playhead가 속한 단어 블록 바로 앞의 캐럿 인덱스(재생 중 방향키 기준점) */
+  /** playhead가 속한 (보이는) 단어 블록의 **앞** 경계 storage caret — 재생 중 방향키 기준점 */
   const caretIndexBeforePlayheadWord = (): number => {
-    const words = wordRail
+    const subs = row.words ?? []
+    if (subs.length === 0) return 0
     const playheadSec = playheadSecRef.current
-    if (words.length === 0) return 0
-    const inside = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
-    if (inside >= 0) return inside
-    const beforeNext = words.findIndex((w) => playheadSec < w.start)
-    if (beforeNext >= 0) return beforeNext
-    return words.length
+    // 보이는 단어 안에 playhead 가 있으면 그 단어 앞 storage 캐럿
+    for (let i = 0; i < subs.length; i++) {
+      const w = subs[i]!
+      if (w.isDeleted === true) continue
+      if (playheadSec >= w.start && playheadSec < w.end) return i
+    }
+    // 그 외 — playhead 앞에 처음 오는 보이는 단어
+    for (let i = 0; i < subs.length; i++) {
+      const w = subs[i]!
+      if (w.isDeleted === true) continue
+      if (playheadSec < w.start) return i
+    }
+    return subs.length
   }
 
   const prevIsPlayingRef = useRef(isPlaying)
@@ -836,35 +994,50 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     const ae = document.activeElement as HTMLElement | null
     if (ae && root?.contains(ae) && ae.closest('[data-subtitle-edit]')) return
 
-    const words = wordRail
-    if (words.length === 0) return
+    const subs = row.words ?? []
+    if (subs.length === 0) return
 
+    // storage caret = playhead 가 속한 보이는 단어 앞 (== `caretIndexBeforePlayheadWord` 동일 정책)
     const playheadSec = playheadSecRef.current
-    const inside = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
-    let snap: number
-    if (inside >= 0) snap = inside
-    else {
-      const beforeNext = words.findIndex((w) => playheadSec < w.start)
-      if (beforeNext >= 0) snap = beforeNext
-      else snap = words.length
+    let snap = subs.length
+    for (let i = 0; i < subs.length; i++) {
+      const w = subs[i]!
+      if (w.isDeleted === true) continue
+      if (playheadSec >= w.start && playheadSec < w.end) {
+        snap = i
+        break
+      }
+      if (playheadSec < w.start) {
+        snap = i
+        break
+      }
     }
+    snap = nearestValidStorageCaret(subs, snap)
+    const focusRc = storageCaretToRenderableCaret(subs, snap)
 
     setCaretIndex(snap)
-    setFocusedCaretIndex(snap)
+    setFocusedCaretIndex(focusRc)
     setRowHasFocus(true)
     setCaretVisible(true)
     setCaretBlink(true)
     spaceSeekIntentRef.current = 'caret'
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        const el = document.getElementById(`subtitle-caret-${index}-${snap}`) as HTMLElement | null
+        // DOM id 는 visible 슬롯(renderable) 축
+        const el = document.getElementById(`subtitle-caret-${index}-${focusRc}`) as HTMLElement | null
         el?.focus({ preventScroll: true })
       })
     })
-  }, [activeSubtitleIndexRef, index, isPlaying, wordRail, playheadSecRef])
+  }, [activeSubtitleIndexRef, index, isPlaying, row.words, playheadSecRef])
 
-  const onCaretKeyDown = (e: KeyboardEvent<HTMLButtonElement>, ci: number) => {
+  /**
+   * `renderableCi`: 캐럿 버튼이 위치한 visible 슬롯 인덱스 (0..visible.length).
+   * 상태로 저장하는 caret 은 storage 축이며, 이동은 visible 단어 경계를 따른다.
+   */
+  const onCaretKeyDown = (e: KeyboardEvent<HTMLButtonElement>, renderableCi: number) => {
     e.stopPropagation()
+    const subs = row.words ?? []
+    const ci = renderableCaretToStorageCaret(subs, renderableCi)
     if (e.key === ' ' || e.code === 'Space') {
       e.preventDefault()
       if (isPlaying) {
@@ -898,11 +1071,10 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     }
     if (e.key === 'End') {
       e.preventDefault()
-      const n = wordRail.length
       clearSelection()
       showKeyboardCaret()
-      activateCaretAt(n, true)
-      seekAtCaret(n)
+      activateCaretAt(subs.length, true)
+      seekAtCaret(0)
       return
     }
     if (e.key === 'ArrowDown') {
@@ -928,13 +1100,14 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     if (e.key === 'ArrowRight') {
       e.preventDefault()
       showKeyboardCaret()
-      const n = wordRail.length
+      const visN = wordRail.length
       if (isPlaying) {
         clearSelection()
-        const snap = caretIndexBeforePlayheadWord()
-        if (snap < n) {
-          activateCaretAt(snap, true)
-          seekAtCaret(snap)
+        const snapStorage = caretIndexBeforePlayheadWord()
+        const snapRc = storageCaretToRenderableCaret(subs, snapStorage)
+        if (snapRc < visN) {
+          activateCaretAt(snapStorage, true)
+          seekAtCaret(0)
         } else {
           setCaretVisible(false)
           setCaretBlink(false)
@@ -947,9 +1120,10 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       } else {
         clearSelection()
       }
-      if (ci < n) {
-        activateCaretAt(ci + 1, true)
-        seekAtCaret(ci + 1)
+      if (renderableCi < visN) {
+        const nextStorage = stepStorageCaretByRenderable(subs, ci, 1)
+        activateCaretAt(nextStorage, true)
+        seekAtCaret(0)
       } else {
         setCaretVisible(false)
         setCaretBlink(false)
@@ -962,9 +1136,9 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       showKeyboardCaret()
       if (isPlaying) {
         clearSelection()
-        const snap = Math.max(0, caretIndexBeforePlayheadWord() - 1)
-        activateCaretAt(snap, true)
-        seekAtCaret(snap)
+        const snapStorage = stepStorageCaretByRenderable(subs, caretIndexBeforePlayheadWord(), -1)
+        activateCaretAt(snapStorage, true)
+        seekAtCaret(0)
         return
       }
       if (e.shiftKey) {
@@ -972,13 +1146,16 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       } else {
         clearSelection()
       }
-      if (ci > 0) {
-        activateCaretAt(ci - 1, true)
-        seekAtCaret(ci - 1)
+      if (renderableCi > 0) {
+        const prevStorage = stepStorageCaretByRenderable(subs, ci, -1)
+        activateCaretAt(prevStorage, true)
+        seekAtCaret(0)
       } else {
         const prevWords = subtitles[index - 1]?.words ?? []
         if (index > 0) {
-          requestFocusCaret(index - 1, prevWords.length)
+          // 이전 줄의 끝 caret(renderable) = 그 줄의 보이는 단어 개수
+          const prevVisN = visibleWordStorageIndices(prevWords).length
+          requestFocusCaret(index - 1, prevVisN)
         }
       }
       return
@@ -987,7 +1164,8 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       e.preventDefault()
       clearSelection()
       showKeyboardCaret()
-      splitSubtitleAtWord(index, subtitleSplitIndexFromRailCaret(ci))
+      // `ci` 가 storage 축이라 그대로 `splitSubtitleAtWord` 분리 지점으로 사용
+      splitSubtitleAtWord(index, ci)
       window.setTimeout(() => requestFocusCaret(index + 1, 0), 0)
       return
     }
@@ -1012,14 +1190,17 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       clearSelection()
       showKeyboardCaret()
       const words = row.words ?? []
-      const seekSec = words[Math.max(0, Math.min(ci - 1, words.length - 1))]?.start ?? row.start
-      if (ci > 0) {
-        const leftWord = words[ci - 1]
+      // 캐럿 왼쪽에서 가장 가까운 **보이는** 단어를 찾아 삭제 (tombstone 은 건너뜀)
+      let leftIdx = ci - 1
+      while (leftIdx >= 0 && words[leftIdx]?.isDeleted === true) leftIdx -= 1
+      const seekSec = words[Math.max(0, leftIdx)]?.start ?? row.start
+      if (leftIdx >= 0) {
+        const leftWord = words[leftIdx]
         if (leftWord?.isSilence) onDeleteAudioRange(leftWord.start, leftWord.end)
-        backspaceWordAt(index, ci)
+        backspaceWordAt(index, leftIdx + 1)
         onCardNavigate(seekSec)
         registerCardFocus(index)
-        window.setTimeout(() => requestFocusCaret(index, ci - 1), 0)
+        window.setTimeout(() => requestFocusCaret(index, leftIdx), 0)
       } else if (index > 0) {
         const prevWordLen = subtitles[index - 1]?.words?.length ?? 0
         backspaceWordAt(index, ci)
@@ -1050,14 +1231,17 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       clearSelection()
       showKeyboardCaret()
       const words = row.words ?? []
-      const seekSec = words[Math.min(ci, Math.max(0, words.length - 1))]?.start ?? row.start
-      if (ci < words.length) {
-        const targetWord = words[ci]
+      // 캐럿 오른쪽에서 가장 가까운 **보이는** 단어를 찾아 삭제 (tombstone 은 건너뜀)
+      let rightIdx = ci
+      while (rightIdx < words.length && words[rightIdx]?.isDeleted === true) rightIdx += 1
+      const seekSec = words[Math.min(rightIdx, Math.max(0, words.length - 1))]?.start ?? row.start
+      if (rightIdx < words.length) {
+        const targetWord = words[rightIdx]
         if (targetWord?.isSilence) onDeleteAudioRange(targetWord.start, targetWord.end)
-        deleteWordAt(index, ci)
+        deleteWordAt(index, rightIdx)
         onCardNavigate(seekSec)
         registerCardFocus(index)
-        window.setTimeout(() => requestFocusCaret(index, Math.min(ci, Math.max(0, words.length - 1))), 0)
+        window.setTimeout(() => requestFocusCaret(index, rightIdx), 0)
       } else if (index < subtitles.length - 1) {
         deleteWordAt(index, ci)
         onCardNavigate(subtitles[index + 1]?.start ?? seekSec)
@@ -1114,60 +1298,71 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     }
     if (e.key === 'ArrowRight') {
       e.preventDefault()
-      const n = wordRail.length
+      const subs = row.words ?? []
+      const visN = wordRail.length
       if (isPlaying) {
-        const snap = caretIndexBeforePlayheadWord()
-        if (n === 0 || snap >= n) {
+        const snapStorage = caretIndexBeforePlayheadWord()
+        const snapRc = storageCaretToRenderableCaret(subs, snapStorage)
+        if (visN === 0 || snapRc >= visN) {
           setCaretVisible(false)
           setCaretBlink(false)
           requestFocusRow(index, 0)
         } else {
-          setCaretIndex(snap)
+          setCaretIndex(snapStorage)
+          setFocusedCaretIndex(snapRc)
           showKeyboardCaret()
-          requestFocusCaret(index, snap)
-          seekAtCaret(snap)
+          requestFocusCaret(index, snapStorage)
+          seekAtCaret(0)
         }
         return
       }
-      if (n === 0 || caretIndex >= n) {
+      const curRc = storageCaretToRenderableCaret(subs, caretIndex)
+      if (visN === 0 || curRc >= visN) {
         setCaretVisible(false)
         setCaretBlink(false)
         requestFocusRow(index, 0)
       } else {
-        const next = Math.min(caretIndex + 1, n)
-        setCaretIndex(next)
+        const nextStorage = stepStorageCaretByRenderable(subs, caretIndex, 1)
+        setCaretIndex(nextStorage)
+        setFocusedCaretIndex(storageCaretToRenderableCaret(subs, nextStorage))
         showKeyboardCaret()
-        requestFocusCaret(index, next)
-        seekAtCaret(next)
+        requestFocusCaret(index, nextStorage)
+        seekAtCaret(0)
       }
       return
     }
     if (e.key === 'ArrowLeft') {
       e.preventDefault()
+      const subs = row.words ?? []
       if (isPlaying) {
-        const snap = Math.max(0, caretIndexBeforePlayheadWord() - 1)
-        setCaretIndex(snap)
+        const snapStorage = stepStorageCaretByRenderable(subs, caretIndexBeforePlayheadWord(), -1)
+        setCaretIndex(snapStorage)
+        setFocusedCaretIndex(storageCaretToRenderableCaret(subs, snapStorage))
         showKeyboardCaret()
-        requestFocusCaret(index, snap)
-        seekAtCaret(snap)
+        requestFocusCaret(index, snapStorage)
+        seekAtCaret(0)
         return
       }
-      if (caretIndex > 0) {
-        const prev = caretIndex - 1
-        setCaretIndex(prev)
+      const curRc = storageCaretToRenderableCaret(subs, caretIndex)
+      if (curRc > 0) {
+        const prevStorage = stepStorageCaretByRenderable(subs, caretIndex, -1)
+        setCaretIndex(prevStorage)
+        setFocusedCaretIndex(storageCaretToRenderableCaret(subs, prevStorage))
         showKeyboardCaret()
-        requestFocusCaret(index, prev)
-        seekAtCaret(prev)
+        requestFocusCaret(index, prevStorage)
+        seekAtCaret(0)
       } else if (index > 0) {
-        const prevLen = subtitles[index - 1]?.words?.length ?? 0
+        const prevWords = subtitles[index - 1]?.words ?? []
+        const prevEndStorage = prevWords.length
         showKeyboardCaret()
-        requestFocusCaret(index - 1, prevLen)
+        requestFocusCaret(index - 1, prevEndStorage)
       }
       return
     }
     if (e.key === 'Home') {
       e.preventDefault()
       setCaretIndex(0)
+      setFocusedCaretIndex(0)
       showKeyboardCaret()
       requestFocusCaret(index, 0)
       seekAtCaret(0)
@@ -1175,11 +1370,13 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     }
     if (e.key === 'End') {
       e.preventDefault()
-      const n = wordRail.length
-      setCaretIndex(n)
+      const subs = row.words ?? []
+      const endStorage = subs.length
+      setCaretIndex(endStorage)
+      setFocusedCaretIndex(wordRail.length)
       showKeyboardCaret()
-      requestFocusCaret(index, n)
-      seekAtCaret(n)
+      requestFocusCaret(index, endStorage)
+      seekAtCaret(0)
       return
     }
     if (e.key === 'ArrowDown') {
@@ -1272,7 +1469,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
           <div className="subtitle-card-media-rail flex w-full min-w-0 flex-col">
           <div
             ref={wordRowOuterRef}
-            className={`subtitle-word-row subtitle-word-row--wave-seamless ${
+            className={`relative subtitle-word-row subtitle-word-row--wave-seamless ${
               timelineLayoutThisRow
                 ? 'subtitle-word-row--time-proportional subtitle-word-row--wave-fit subtitle-word-row--timeline'
                 : 'subtitle-word-row--compact'
@@ -1289,10 +1486,15 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
               }
             }}
           >
+            {/*
+              줄 카드 뒤 미니 파형(canvas) — 사용자 요청으로 숨김.
+              `SentenceLineWaveformCanvas` 컴포넌트와 매핑 유틸은 그대로 유지(언제든 복귀 가능).
+              `waveformPeaksJson` · `lineWaveformWindow` · `peaksDataSig` 메모도 유지: 추후 토글 추가 시 재사용.
+            */}
             <LayoutGroup id={`subtitle-word-line-${index}`}>
             <div
               ref={wordRowInnerRef}
-              className={`subtitle-word-row-scale-inner ${
+              className={`relative z-[1] subtitle-word-row-scale-inner ${
                 timelineLayoutThisRow
                   ? 'subtitle-word-row-scale-inner--timeline'
                   : 'subtitle-word-row-scale-inner--compact'
@@ -1306,11 +1508,16 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
               }`}
             >
               {wordRail.map((rw, wi) => {
+                // `wi` = renderable(visible) 인덱스, `rw.storageIndex` = `row.words` 원본 인덱스
+                // vrew rows 는 동일하게 visible-only 로 빌드되므로 `wi` 로 매칭(1:1)
                 const chipWordId = vrewRows?.[index]?.words?.[wi]?.id
+                const storageWi = rw.storageIndex
                 const wordMotionKey =
-                  chipWordId != null ? `wid-${chipWordId}` : `w-${index}-${rw.start}-${rw.end}`
+                  chipWordId != null
+                    ? `wid-${chipWordId}`
+                    : `w-${index}-${storageWi}-${rw.start}-${rw.end}`
                 const isActiveWaveformChip =
-                  timelineLayoutThisRow &&
+                  waveformExpandedThisRow &&
                   waveformActiveWordId != null &&
                   chipWordId === waveformActiveWordId
                 return (
@@ -1330,7 +1537,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                       layout={timelineLayoutThisRow}
                       initial={false}
                       transition={timelineLayoutThisRow ? WORD_LAYOUT_SPRING_TIMELINE : WORD_LAYOUT_SPRING}
-                      id={`subtitle-word-${index}-${wi}`}
+                      id={`subtitle-word-${index}-${storageWi}`}
                       type="button"
                       tabIndex={-1}
                       data-start={rw.start}
@@ -1339,10 +1546,11 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                       data-word-end={rw.end}
                       {...(chipWordId != null ? ({ 'data-word-id': String(chipWordId) } as const) : {})}
                       data-waveform-active-word-chip={isActiveWaveformChip ? '1' : undefined}
-                      data-waveform-expanded-row-chip={timelineLayoutThisRow ? '1' : undefined}
+                      data-waveform-expanded-row-chip={waveformExpandedThisRow ? '1' : undefined}
                       className={`subtitle-word-chip subtitle-word-chip--proportional${rw.isSilence ? ' subtitle-word-chip--silence' : ''}`}
                       onMouseEnter={() => {
-                        setCaretIndex(wi)
+                        // 칩 앞 caret 슬롯 — storage 축 = storageWi
+                        setCaretIndex(storageWi)
                         showStaticCaret()
                         setHoveredCaretIndex(wi)
                       }}
@@ -1365,18 +1573,18 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                           /** detail>=2 는 더블클릭의 두 번째 click — 접기 타이머를 걸면 안 됨 */
                           if (isWaveActiveChip && e.detail === 1) {
                             activeChipCloseTimerRef.current = setTimeout(() => {
-                              onWaveformExpandedLineWordClick(index, wi)
+                              onWaveformExpandedLineWordClick(index, storageWi)
                               activeChipCloseTimerRef.current = null
                             }, 280)
                           } else if (!isWaveActiveChip) {
-                            onWaveformExpandedLineWordClick(index, wi)
+                            onWaveformExpandedLineWordClick(index, storageWi)
                           }
 
                           if (isPlaying) {
                             onRequestPausePlayback('word-chip-click-wave-active')
                           }
                           clearSelection()
-                          activateCaretAt(wi, true)
+                          activateCaretAt(storageWi, true)
                           return
                         }
                         onWordBlockClick(rw.start)
@@ -1384,7 +1592,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                           onRequestPausePlayback('word-chip-click')
                         }
                         clearSelection()
-                        activateCaretAt(wi, true)
+                        activateCaretAt(storageWi, true)
                       }}
                       onMouseDown={(e) => {
                         // 클릭하면 해당 단어 "앞" 위치로 커서를 고정한다.
@@ -1401,13 +1609,13 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                         if (!waveformEnabled || !onWaveformWordDoubleClick) return
                         e.preventDefault()
                         e.stopPropagation()
-                        onWaveformWordDoubleClick(index, wi)
+                        onWaveformWordDoubleClick(index, storageWi)
                       }}
                       title={`${formatTimecode(rw.start)} ~ ${formatTimecode(rw.end)}`}
                     >
                       <span
                         className={
-                          hasSelection && wi >= selStart && wi < selEnd
+                          hasSelection && storageWi >= selStart && storageWi < selEnd
                             ? 'subtitle-word-chip-text subtitle-word-chip-text--selected'
                             : 'subtitle-word-chip-text'
                         }
@@ -1419,9 +1627,13 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                 )
               })}
             </div>
-            {!timelineLayoutThisRow ? (
+            {!waveformExpandedThisRow ? (
             <div className="subtitle-word-carets-overlay" aria-hidden={false}>
               {Array.from({ length: wordRail.length + 1 }, (_, k) => {
+                // `k` = renderable(visible) 슬롯 인덱스. 0..wordRail.length
+                // 클릭/포커스/Caret 상태는 storage caret 으로 변환해 SSOT 유지
+                const subs = row.words ?? []
+                const storageK = renderableCaretToStorageCaret(subs, k)
                 const n = wordRail.length
                 const edgeStyle = getWordCaretEdgeStyle(k, n)
                 const ty = measuredCaretTopPx?.[k]
@@ -1440,7 +1652,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                     tabIndex={0}
                     onClick={() => {
                       if (k > 0) clearSelection()
-                      activateCaretAt(k, true)
+                      activateCaretAt(storageK, true)
                     }}
                     onFocus={() => {
                       syncCaretFromFocus(k)
@@ -1449,7 +1661,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                       setCaretVisible(true)
                       setCaretBlink(false)
                       setHoveredCaretIndex(k)
-                      setCaretIndex(k)
+                      setCaretIndex(storageK)
                     }}
                     onKeyDown={(e) => onCaretKeyDown(e, k)}
                     aria-label={`단어 사이 커서 ${k}`}
@@ -1595,8 +1807,13 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     [subtitles.length, requestFocusRow]
   )
 
-  const requestFocusCaret = useCallback((cardIndex: number, caretIndex: number) => {
-    if (cardIndex < 0 || caretIndex < 0) return
+  /**
+   * `storageCaret`: 대상 카드의 `row.words` 인덱스(0..length).
+   * DOM caret 버튼은 visible 슬롯만 그리므로(`subtitle-caret-${row}-${renderableCaret}`),
+   * storage → renderable 매핑 후 그 id 를 포커스한다.
+   */
+  const requestFocusCaret = useCallback((cardIndex: number, storageCaret: number) => {
+    if (cardIndex < 0 || storageCaret < 0) return
     const row = subtitles[cardIndex]
     const crossedIntoOtherCard = lastCardFocusRef.current !== cardIndex
     if (row && crossedIntoOtherCard) {
@@ -1614,9 +1831,12 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
         return
       }
     }
+    const targetWords = row?.words ?? []
+    const safe = nearestValidStorageCaret(targetWords, storageCaret)
+    const rc = storageCaretToRenderableCaret(targetWords, safe)
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        const el = document.getElementById(`subtitle-caret-${cardIndex}-${caretIndex}`) as HTMLButtonElement | null
+        const el = document.getElementById(`subtitle-caret-${cardIndex}-${rc}`) as HTMLButtonElement | null
         if (!el) return
         el.focus({ preventScroll: true })
       })
@@ -1720,7 +1940,9 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       vrewRows: props.vrewRows,
       onWaveformMountLayout: props.onWaveformMountLayout,
       mediaDurationSec: props.mediaDurationSec,
-      peaksZoomViewRange: props.peaksZoomViewRange
+      peaksZoomViewRange: props.peaksZoomViewRange,
+      waveformPeaksJson: props.waveformPeaksJson,
+      waveformMediaDurationHintSec: props.waveformMediaDurationHintSec
     }),
     [
       subtitles,
@@ -1755,6 +1977,8 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.onWaveformMountLayout,
       props.mediaDurationSec,
       props.peaksZoomViewRange,
+      props.waveformPeaksJson,
+      props.waveformMediaDurationHintSec,
       requestFocusRow,
       navigateSubtitleField,
       requestFocusCaret,

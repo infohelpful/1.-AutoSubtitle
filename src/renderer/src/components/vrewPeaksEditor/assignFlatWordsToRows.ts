@@ -6,7 +6,7 @@ import type { SubtitleRow, Word } from './types'
 export function assignFlatWordsToRows(flat: Word[], prevRows: SubtitleRow[]): SubtitleRow[] {
   if (prevRows.length === 0) return prevRows
 
-  const idToRowId = new Map<number, string>()
+  const idToRowId = new Map<string, string>()
   for (const row of prevRows) {
     for (const w of row.words) idToRowId.set(w.id, row.id)
   }

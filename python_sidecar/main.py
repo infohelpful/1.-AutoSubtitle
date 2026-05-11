@@ -498,10 +498,10 @@ def _rpc_write(obj: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
-# 무음 삽입 vs 미세 간격(stitch): 이 임계값 이상이면 "?? " 블록 삽입, 미만이면 이전 cue의 end를 다음 start에 맞춤
+# 무음 삽입 vs 미세 간격(stitch): 이 임계값 이상이면 "-- " 블록 삽입, 미만이면 이전 cue의 end를 다음 start에 맞춤
 _GAP_THRESHOLD_SEC = 0.1
-# STT 직후 무음 구간 자동 삽입 시 단일 플레이스홀더(텍스트는 사용자 지정 "?? ")
-_SILENCE_GAP_TEXT = "?? "
+# STT 직후 무음 구간 자동 삽입 시 단일 플레이스홀더 — 렌더러 `SILENCE_PLACEHOLDER_TEXT` 와 동일
+_SILENCE_GAP_TEXT = "-- "
 _UNKNOWN_WORD_LABEL = "???"
 
 
@@ -513,7 +513,7 @@ def _silence_gap_cue(start: float, end: float) -> dict[str, Any]:
         s, e = min(s, e), max(s, e)
         if not (e > s):
             s, e = 0.0, max(0.01, e)
-    token = _SILENCE_GAP_TEXT.strip() or "??"
+    token = _SILENCE_GAP_TEXT.strip() or "--"
     return {
         "start": s,
         "end": e,
@@ -572,7 +572,7 @@ def _normalize_cue_words_and_empty_text(c: dict[str, Any]) -> dict[str, Any] | N
 def _fill_unvoiced_gaps(raw_cues: list[dict[str, Any]], total_dur: float) -> list[dict[str, Any]]:
     """
     STT 직후: prev_end(초기 0) ~ 각 세그먼트 start 사이를 점검.
-    - 간격 >= 0.1s → `?? ` 무음 블록 1행 삽입
+    - 간격 >= 0.1s → `--` 무음 블록 1행 삽입
     - 간격 0.1s 미만 → 무음 대신 *이전* cue의 end를 현재 start에 맞춤(끊김 제거)
     - total_dur > 0이면 마지막 세그먼트 end ~ 영상 끝도 동일 규칙으로 맞춤(빈틈 없이)
     """

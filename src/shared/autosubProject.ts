@@ -1,6 +1,9 @@
 import type { CutRange } from './ipc'
 import type { SubtitleLine } from './subtitles'
 import { parseSubtitleLines } from './subtitles'
+import { parseVirtualTimeline, type VirtualTimelineBlock } from './virtualTimeline'
+
+export type { VirtualTimelineBlock }
 
 export const AUTOSUB_FILE_FORMAT = 'autosubtitle-project' as const
 export const AUTOSUB_VERSION = 1 as const
@@ -28,6 +31,8 @@ export type AutosubProjectFileV1 = {
   cutRanges: CutRange[]
   subtitleStyle: AutosubProjectStyleV1
   subtitles: SubtitleLine[]
+  /** 가상 타임라인 블록(비파괴 삭제 tombstone + 활성 스냅샷) — 없으면 구버전 프로젝트 */
+  virtualTimeline?: VirtualTimelineBlock[]
 }
 
 function isRecord(x: unknown): x is Record<string, unknown> {
@@ -99,6 +104,9 @@ export function parseAutosubProjectFile(raw: unknown):
   const subtitleStyle = parseStyle(raw.subtitleStyle)
   if (!subtitleStyle) return { ok: false, reason: 'subtitleStyle이 올바르지 않습니다.' }
   const subtitles = parseSubtitleLines(raw.subtitles)
+  const vtRaw = raw.virtualTimeline
+  const virtualTimelineParsed =
+    vtRaw !== undefined && vtRaw !== null ? parseVirtualTimeline(vtRaw) : undefined
   const data: AutosubProjectFileV1 = {
     format: AUTOSUB_FILE_FORMAT,
     version: AUTOSUB_VERSION,
@@ -107,6 +115,9 @@ export function parseAutosubProjectFile(raw: unknown):
     cutRanges,
     subtitleStyle,
     subtitles
+  }
+  if (virtualTimelineParsed && virtualTimelineParsed.length > 0) {
+    data.virtualTimeline = virtualTimelineParsed
   }
   return { ok: true, data }
 }

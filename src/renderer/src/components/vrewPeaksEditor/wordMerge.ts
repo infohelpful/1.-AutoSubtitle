@@ -1,6 +1,13 @@
 import type { Segment } from 'peaks.js'
 import type { SubtitleRow, Word } from './types'
 
+function randomBlockSuffix(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `${Date.now()}_${Math.floor(Math.random() * 1e6)}`
+}
+
 const EPS = 1e-4
 
 /** Merge adjacent cues when end overlaps next start (after end-handle drag across boundary). */
@@ -42,17 +49,12 @@ export function wordsFromPeaksSegments(segments: Segment[], prevWords: Word[]): 
   const sorted = [...segments].sort((a, b) => a.startTime - b.startTime)
   const next: Word[] = sorted.map((s) => {
     const idStr = s.id !== undefined ? String(s.id) : ''
-    const prev = prevWords.find((w) => String(w.id) === idStr)
+    const prev = prevWords.find((w) => w.id === idStr)
     const text =
       typeof s.labelText === 'string' && s.labelText.length > 0 ? s.labelText : (prev?.text ?? '')
-    let idNum = prev?.id
-    if (idNum === undefined && idStr) {
-      const n = Number(idStr)
-      idNum = Number.isFinite(n) ? n : Date.now()
-    }
-    if (idNum === undefined) idNum = Date.now()
+    const id = prev?.id ?? (idStr || `block_orphan_${randomBlockSuffix()}`)
     return {
-      id: idNum,
+      id,
       text,
       start: s.startTime,
       end: s.endTime,

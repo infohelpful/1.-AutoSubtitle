@@ -15,7 +15,7 @@
  *
  * ## Gap-fill (무음 더미)
  * - **임계값**: `DEFAULT_GAP_THRESHOLD_SEC` (기본 0.2초) 이상인 빈 구간에 더미를 삽입한다.
- * - **더미 텍스트**: `SILENCE_PLACEHOLDER_TEXT` (`??`).
+ * - **더미 텍스트**: `SILENCE_PLACEHOLDER_TEXT` (`--`).
  * - **삽입 위치**: (1) 줄 시작 ~ 첫 단어 시작, (2) 인접 단어 사이, (3) 마지막 단어 끝 ~ 줄 끝 (옵션으로 경계 포함).
  * - **편집 후 재실행**: 기본값 `stripPreviousSilences: true` 이면,
  *   저장된 배열에서 `isSilence: true` 항목을 제거한 뒤 다시 gap-fill 하여 **동일 정책으로 재생성**(멱등에 가깝게)한다.
@@ -31,7 +31,7 @@ export const FLOAT_EPS = 1e-4
 export const DEFAULT_GAP_THRESHOLD_SEC = 0.2
 
 /** 무음 더미에 표시할 문자열 */
-export const SILENCE_PLACEHOLDER_TEXT = '??'
+export const SILENCE_PLACEHOLDER_TEXT = '--'
 
 export type FillGapsOptions = {
   /** 기본 `DEFAULT_GAP_THRESHOLD_SEC` */
@@ -73,7 +73,8 @@ export function fillGapsInSubtitleWords(
   const includeLineBoundaries = options?.includeLineBoundaries ?? true
   const stripPreviousSilences = options?.stripPreviousSilences ?? true
 
-  const raw = stripPreviousSilences ? line.words.filter((w) => !w.isSilence) : [...line.words]
+  const nonDeleted = line.words.filter((w) => !w.isDeleted)
+  const raw = stripPreviousSilences ? nonDeleted.filter((w) => !w.isSilence) : [...nonDeleted]
 
   const cleaned: SubtitleWord[] = raw
     .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start + FLOAT_EPS)
@@ -159,7 +160,8 @@ export function validateSubtitleLineWords(line: {
     errors.push('line: end must be >= start')
   }
 
-  const words = [...(line.words ?? [])].sort((a, b) => a.start - b.start || a.end - b.end)
+  const allWords = [...(line.words ?? [])].sort((a, b) => a.start - b.start || a.end - b.end)
+  const words = allWords.filter((w) => !w.isDeleted)
 
   for (let i = 0; i < words.length; i++) {
     const w = words[i]

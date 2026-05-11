@@ -26,8 +26,16 @@ export function toWaveformLogDetail(u: unknown): unknown {
 }
 
 /**
- * Renderer → main process → `%AppData%/AutoSubtitle/logs/waveform.log` (실제 경로는 앱 이름에 따름).
- * Electron이 아닌 환경에서는 콘솔만 출력합니다.
+ * 디스크(`waveform.log`)에 기록할 scope 화이트리스트 — 오디오·파형 파이프라인만 유지.
+ * 외 scope(`seek`/`diag`/`view`/`segments`/`lifecycle`/`playback`/`connector`/`ui` 등)는 호출은 유지하되
+ * IPC 송신을 막아 파일 폭증을 차단한다.
+ */
+const WF_LOG_FILE_SCOPES = new Set<string>(['peaks', 'audio'])
+
+/**
+ * Renderer → (조건부) main process → `%AppData%/AutoSubtitle/logs/waveform.log`.
+ * 콘솔(`console.debug`)은 모든 scope 에 대해 그대로 출력 — 디버깅 가능.
+ * 디스크 기록은 `WF_LOG_FILE_SCOPES` 에 속한 scope 만.
  */
 export function wfLog(scope: string, message: string, ...details: unknown[]): void {
   let normalized: unknown[]
@@ -36,13 +44,15 @@ export function wfLog(scope: string, message: string, ...details: unknown[]): vo
   } catch (e) {
     normalized = [{ type: 'Error', message: e instanceof Error ? e.message : String(e) }]
   }
-  try {
-    const api = typeof window !== 'undefined' ? window.api : undefined
-    if (api?.logWaveformDebug) {
-      void api.logWaveformDebug(scope, message, ...normalized)
+  if (WF_LOG_FILE_SCOPES.has(scope)) {
+    try {
+      const api = typeof window !== 'undefined' ? window.api : undefined
+      if (api?.logWaveformDebug) {
+        void api.logWaveformDebug(scope, message, ...normalized)
+      }
+    } catch {
+      /* preload 없음 */
     }
-  } catch {
-    /* preload 없음 */
   }
   if (typeof console !== 'undefined' && console.debug) {
     console.debug(`[waveform:${scope}]`, message, ...normalized)

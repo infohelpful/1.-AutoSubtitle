@@ -9,7 +9,7 @@ import {
 import type { Word } from './components/vrewPeaksEditor/types'
 
 const w = (id: number, start: number, end: number): Word => ({
-  id,
+  id: `block_1_${id}`,
   text: 'a',
   start,
   end

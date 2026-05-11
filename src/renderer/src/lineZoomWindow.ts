@@ -60,3 +60,54 @@ export function computeLineZoomWindow(
   const lineEnd = Math.max(...words.map((w) => w.end))
   return computeLineZoomWindowFromCardBounds(lineStart, lineEnd, options)
 }
+
+/**
+ * **단어 더블클릭 — “선택 단어 + ±1 이웃” 컨텍스트 줌 창** (`SubtitleWaveformCanvas` 전용).
+ *
+ * 기본 창: `words[wi-1].start` ~ `words[wi+1].end` (이웃이 없으면 활성 단어 자체로 폴백).
+ * 확장: `expandLeft` · `expandRight` 만큼 양옆에 단어를 더 포함 (드래그가 경계를 살짝 넘을 때마다 +1).
+ *
+ * @returns `null` — words 가 비었거나 인덱스가 범위 밖일 때
+ */
+export function computeWordContextWindow(
+  words: readonly { start: number; end: number }[],
+  activeWordIndex: number,
+  expandLeft = 0,
+  expandRight = 0,
+  options?: { mediaDurationSec?: number | null }
+): LineZoomWindowResult | null {
+  if (!words.length) return null
+  if (activeWordIndex < 0 || activeWordIndex >= words.length) return null
+
+  const expL = Math.max(0, Math.floor(expandLeft))
+  const expR = Math.max(0, Math.floor(expandRight))
+
+  const lo = Math.max(0, activeWordIndex - 1 - expL)
+  const hi = Math.min(words.length - 1, activeWordIndex + 1 + expR)
+
+  const lineStart = words[lo]!.start
+  const lineEnd = words[hi]!.end
+
+  const dur =
+    options?.mediaDurationSec != null &&
+    Number.isFinite(options.mediaDurationSec) &&
+    options.mediaDurationSec > 0
+      ? options.mediaDurationSec
+      : Number.POSITIVE_INFINITY
+
+  // 작은 패딩 — 줄 전체 폴백(`computeLineZoomWindowFromCardBounds`) 대비 절반 정도로만,
+  // 활성 단어 경계가 캔버스 가장자리에 딱 붙어 보이지 않도록.
+  const span = Math.max(lineEnd - lineStart, 0.001)
+  const pad = Math.max(0.04, span * 0.02)
+  const windowStart = Math.max(0, lineStart - pad)
+  const windowEnd = Math.min(dur, lineEnd + pad)
+  const finalEnd =
+    windowEnd <= windowStart + 1e-6 ? Math.min(dur, windowStart + 0.12) : windowEnd
+  return {
+    lineStart,
+    lineEnd,
+    windowStart,
+    windowEnd: finalEnd,
+    span: Math.max(finalEnd - windowStart, 1e-6)
+  }
+}

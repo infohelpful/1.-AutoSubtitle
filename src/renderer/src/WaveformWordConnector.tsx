@@ -1,7 +1,11 @@
 import { createPortal } from 'react-dom'
 import type { MutableRefObject, ReactPortal } from 'react'
-import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { PeaksInstance } from 'peaks.js'
+import { wfLog } from './components/vrewPeaksEditor/waveformDebugLog'
+
+/** Canvas 스텁 등 Peaks 없는 경로에서 ref 타입만 맞출 때 사용 */
+export type PeaksConnectorLike = PeaksInstance
 
 export type WaveformWordConnectorProps = {
   activeLineIndex: number | null
@@ -11,13 +15,18 @@ export type WaveformWordConnectorProps = {
   overlayVisible: boolean
   /** overlay·자막 데이터 동기화 시 선 재계산 */
   layoutKey: string
+  /**
+   * 편집축 줌 창 [start,end] — Peaks zoomview 준비 전에도 단어 경계를 같은 시간→픽셀 식으로 그린다.
+   * 칩 DOM 픽셀 폴백과 기준 충돌을 줄이기 위해 부모가 유지한다. null 이면 칩 폴백으로 떨어진다.
+   */
+  connectorEditZoomRef?: MutableRefObject<{ start: number; end: number } | null>
 }
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n))
 }
 
-type WordChipDomMeta = { start: number; end: number; wordId: number | null }
+type WordChipDomMeta = { start: number; end: number; wordId: string | null }
 
 /** 칩 DOM 순서대로 — data-word-start/end; data-word-id 로 Peaks 세그먼트와 매칭 */
 function listWordChipMetaFromDom(lineIndex: number): WordChipDomMeta[] {
@@ -33,18 +42,19 @@ function listWordChipMetaFromDom(lineIndex: number): WordChipDomMeta[] {
     const e = Number(de)
     if (!Number.isFinite(s) || !Number.isFinite(e)) continue
     const idRaw = el.dataset.wordId
-    const wid = idRaw !== undefined && idRaw !== '' ? Number(idRaw) : NaN
     out.push({
       start: s,
       end: e,
-      wordId: Number.isFinite(wid) ? wid : null
+      wordId: idRaw !== undefined && idRaw !== '' ? idRaw : null
     })
   }
   return out
 }
 
 /**
- * 길이 조절 드래그 중에는 칩 DOM 타임스탬프가 아직 반영 안 됨 — Peaks 세그먼트가 진실값
+ * 길이 조절 드래그 중에는 칩 DOM 타임스탬프가 아직 반영 안 됨 — Peaks 세그먼트가 진실값.
+ * Peaks 준비 상태에서 wordId 에 해당하는 세그먼트가 없으면 그 칩은 ‘유령’(삭제·스티치 직후
+ * DOM 미동기) — 옛 좌표로 폴백하면 잘린 무음 위치에 세로선이 남으므로 그 칩 자체를 건너뛴다.
  */
 function resolveWordTimesForConnectorLine(
   lineIndex: number,
@@ -55,12 +65,17 @@ function resolveWordTimesForConnectorLine(
   if (!peaksReady || !peaks) {
     return chips.map(({ start, end }) => ({ start, end }))
   }
-  return chips.map(({ start, end, wordId }) => {
-    if (wordId == null) return { start, end }
-    const seg = peaks.segments.getSegment(String(wordId))
-    if (!seg) return { start, end }
-    return { start: seg.startTime, end: seg.endTime }
-  })
+  const out: { start: number; end: number }[] = []
+  for (const { start, end, wordId } of chips) {
+    if (wordId == null) {
+      out.push({ start, end })
+      continue
+    }
+    const seg = peaks.segments.getSegment(wordId)
+    if (!seg) continue
+    out.push({ start: seg.startTime, end: seg.endTime })
+  }
+  return out
 }
 
 function subtitleWordRowBottomPx(lineIndex: number): number {
@@ -154,8 +169,10 @@ export function WaveformWordConnector({
   zoomRef,
   peaksReady,
   overlayVisible,
-  layoutKey
+  layoutKey,
+  connectorEditZoomRef
 }: WaveformWordConnectorProps): ReactPortal | null {
+  const connectorLogSigRef = useRef<string>('')
   const [wordBoundarySegments, setWordBoundarySegments] = useState<VSegment[]>([])
   const [vp, setVp] = useState(() => ({
     w: typeof window !== 'undefined' ? window.innerWidth : 0,
@@ -183,36 +200,91 @@ export function WaveformWordConnector({
     const plotW = zr.width
     const peaks = peaksRef.current
     const words = resolveWordTimesForConnectorLine(activeLineIndex, peaks, peaksReady)
+    const r4 = (x: number): number => Math.round(x * 10000) / 10000
 
+    const paintTimeMap = (
+      t0: number,
+      t1: number,
+      logKind: 'edit-axis zoom window' | 'Peaks zoomview'
+    ): VSegment[] | null => {
+      const span = t1 - t0
+      if (!(span > 1e-9) || words.length === 0) return null
+      const xAt = (t: number) => plotLeft + ((t - t0) / span) * plotW
+      const y1 = zr.top
+      const rowBottom = subtitleWordRowBottomPx(activeLineIndex)
+      const y2 = Math.max(rowBottom > 0 ? rowBottom : zr.bottom, zr.bottom)
+      const segs: VSegment[] = []
+      const boundaryTs = wordConnectorBoundaryTimes(words)
+      for (const t of boundaryTs) {
+        segs.push({
+          x: clamp(xAt(t), plotLeft, plotLeft + plotW),
+          y1,
+          y2
+        })
+      }
+      const sig = `${logKind}|${activeLineIndex}|${words.length}|${boundaryTs.length}|${r4(t0)}|${r4(t1)}|${boundaryTs.map(r4).join(',')}`
+      if (sig !== connectorLogSigRef.current) {
+        connectorLogSigRef.current = sig
+        wfLog('connector', `word boundary vertical lines (${logKind})`, {
+          activeLineIndex,
+          wordCount: words.length,
+          wordTimesFromSegments: words.map((w) => ({
+            start: r4(w.start),
+            end: r4(w.end)
+          })),
+          boundaryTimesSec: boundaryTs.map(r4),
+          segmentCount: segs.length,
+          zoomviewVisibleSec: { start: r4(t0), end: r4(t1), span: r4(span) }
+        })
+      }
+      return mergeVerticalSegmentsByPixelProximity(segs)
+    }
+
+    /** 1순위: 부모(편집축) 줌 창 — Peaks 준비 전에도 동일 시간→픽셀 식 */
+    const editWin = connectorEditZoomRef?.current ?? null
+    if (editWin && editWin.end > editWin.start + 1e-9) {
+      const built = paintTimeMap(editWin.start, editWin.end, 'edit-axis zoom window')
+      if (built) {
+        setWordBoundarySegments(built)
+        return
+      }
+    }
+
+    /** 2순위: Peaks zoomview — 부모 ref 가 아직 비어 있고 Peaks가 준비된 경우 */
     if (peaksReady && words.length > 0) {
       const zv = peaks?.views.getView('zoomview')
       if (zv) {
         const t0 = zv.getStartTime()
         const t1 = zv.getEndTime()
-        const span = t1 - t0
-        if (span > 1e-9) {
-          const xAt = (t: number) => plotLeft + ((t - t0) / span) * plotW
-          const y1 = zr.top
-          const rowBottom = subtitleWordRowBottomPx(activeLineIndex)
-          const y2 = Math.max(rowBottom > 0 ? rowBottom : zr.bottom, zr.bottom)
-          const segs: VSegment[] = []
-          for (const t of wordConnectorBoundaryTimes(words)) {
-            segs.push({
-              x: clamp(xAt(t), plotLeft, plotLeft + plotW),
-              y1,
-              y2
-            })
-          }
-          setWordBoundarySegments(mergeVerticalSegmentsByPixelProximity(segs))
+        const built = paintTimeMap(t0, t1, 'Peaks zoomview')
+        if (built) {
+          setWordBoundarySegments(built)
           return
         }
       }
     }
 
-    setWordBoundarySegments(
-      mergeVerticalSegmentsByPixelProximity(dedupeSegmentsByX(buildSegmentsFromChipRects(activeLineIndex, zr)))
+    /** 3순위: 칩 DOM 픽셀 폴백 — 시간 매핑 둘 다 못 잡힐 때만 */
+    const fallbackSegs = mergeVerticalSegmentsByPixelProximity(
+      dedupeSegmentsByX(buildSegmentsFromChipRects(activeLineIndex, zr))
     )
-  }, [overlayVisible, activeLineIndex, peaksReady, peaksRef, zoomRef])
+    const sigFallback = `chips|${activeLineIndex}|${fallbackSegs.length}|${peaksReady ? '1' : '0'}|${words.length}`
+    if (sigFallback !== connectorLogSigRef.current) {
+      connectorLogSigRef.current = sigFallback
+      wfLog('connector', 'word boundary vertical lines (chip DOM fallback)', {
+        activeLineIndex,
+        peaksReady,
+        wordCountFromResolver: words.length,
+        segmentCount: fallbackSegs.length,
+        zoomRectPx: {
+          left: Math.round(zr.left),
+          right: Math.round(zr.right),
+          width: Math.round(zr.width)
+        }
+      })
+    }
+    setWordBoundarySegments(fallbackSegs)
+  }, [overlayVisible, activeLineIndex, peaksReady, peaksRef, zoomRef, connectorEditZoomRef])
 
   useLayoutEffect(() => {
     refresh()
@@ -319,8 +391,15 @@ export function WaveformWordConnector({
 
   if (typeof document === 'undefined') return null
 
-  if (wordBoundarySegments.length === 0) return null
+  /**
+   * 단어 경계 세로선 — 사용자 요청으로 제거.
+   * 컴포넌트(레이아웃 계산·이벤트 구독) 자체는 유지하되 SVG 렌더만 비워둔다 (추후 토글로 복귀 가능).
+   * `wordBoundarySegments` 계산은 그대로 두어도 paint 부담은 사실상 0.
+   */
+  void wordBoundarySegments
+  return null
 
+  /* legacy SVG (보관용):
   const strokeBoundary = 'rgba(82, 89, 102, 0.92)'
 
   return createPortal(
@@ -339,7 +418,7 @@ export function WaveformWordConnector({
     >
       {wordBoundarySegments.map((s, i) => (
         <line
-          key={`wb-${i}-${s.x.toFixed(1)}`}
+          key={`wb-${i}-${Number.isFinite(s.x) ? s.x.toFixed(1) : i}`}
           x1={s.x}
           y1={s.y1}
           x2={s.x}
@@ -352,4 +431,5 @@ export function WaveformWordConnector({
     </svg>,
     document.body
   )
+  */
 }

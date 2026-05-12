@@ -74,7 +74,18 @@ export function computeWordContextWindow(
   activeWordIndex: number,
   expandLeft = 0,
   expandRight = 0,
-  options?: { mediaDurationSec?: number | null }
+  options?: {
+    mediaDurationSec?: number | null
+    /**
+     * 편집축 기준 — 창의 좌측을 최소 이 시각까지 포함하도록 넓힌다.
+     * 줄의 첫 단어에서 이전 줄 마지막 단어와 cross-line merge 할 때,
+     * 그렇지 않으면 `pointerToTimeOnStrip` 의 최소값이 이전 단어의 `end` 보다 오른쪽에 남아
+     * 재합병이 불가능해진다.
+     */
+    extendWindowStartToIncludeSec?: number | null
+    /** 대칭 — 줄의 마지막 단어에서 다음 줄 첫 단어와 merge (end 엣지) */
+    extendWindowEndToIncludeSec?: number | null
+  }
 ): LineZoomWindowResult | null {
   if (!words.length) return null
   if (activeWordIndex < 0 || activeWordIndex >= words.length) return null
@@ -99,8 +110,16 @@ export function computeWordContextWindow(
   // 활성 단어 경계가 캔버스 가장자리에 딱 붙어 보이지 않도록.
   const span = Math.max(lineEnd - lineStart, 0.001)
   const pad = Math.max(0.04, span * 0.02)
-  const windowStart = Math.max(0, lineStart - pad)
-  const windowEnd = Math.min(dur, lineEnd + pad)
+  let windowStart = Math.max(0, lineStart - pad)
+  const extL = options?.extendWindowStartToIncludeSec
+  if (extL != null && Number.isFinite(extL)) {
+    windowStart = Math.min(windowStart, Math.max(0, extL - pad))
+  }
+  let windowEnd = Math.min(dur, lineEnd + pad)
+  const extR = options?.extendWindowEndToIncludeSec
+  if (extR != null && Number.isFinite(extR)) {
+    windowEnd = Math.max(windowEnd, Math.min(dur, extR + pad))
+  }
   const finalEnd =
     windowEnd <= windowStart + 1e-6 ? Math.min(dur, windowStart + 0.12) : windowEnd
   return {

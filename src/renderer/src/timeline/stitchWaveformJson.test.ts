@@ -4,8 +4,11 @@ import type { CutRange } from '../../../shared/ipc'
 import {
   buildMediaKeepRangesAfterCuts,
   cutRangesSignature,
+  cutRemovedIntervalsExpandOnly,
   exactTimelineDurationSecFromWaveformJson,
-  stitchWaveformJsonByCuts
+  stitchWaveformJsonByCuts,
+  stitchWaveformJsonExpandCutsIncremental,
+  stitchedEditAxisDurationSecFromCuts
 } from './stitchWaveformJson'
 
 function makeJson(pixels: number, spp: number, sr: number): JsonWaveformData {
@@ -67,6 +70,62 @@ describe('exactTimelineDurationSecFromWaveformJson', () => {
       data
     } as JsonWaveformData
     expect(exactTimelineDurationSecFromWaveformJson(j, 938)).toBeCloseTo(938, 3)
+  })
+})
+
+describe('stitchedEditAxisDurationSecFromCuts', () => {
+  it('전체 스티치 JSON 의 exact 타임라인 길이와 일치', () => {
+    const sr = 48000
+    const spp = 480
+    const mediaSec = 10
+    const pixels = Math.ceil((mediaSec * sr) / spp)
+    const j = makeJson(pixels, spp, sr)
+    const cuts: CutRange[] = [{ start: 2, end: 4 }]
+    const stitched = stitchWaveformJsonByCuts(j, cuts, mediaSec)!
+    const fromJson = exactTimelineDurationSecFromWaveformJson(stitched, mediaSec)
+    const fromCuts = stitchedEditAxisDurationSecFromCuts(j, cuts, mediaSec, mediaSec)
+    expect(fromCuts).not.toBeNull()
+    expect(fromJson).not.toBeNull()
+    expect(fromCuts!).toBeCloseTo(fromJson!, 9)
+  })
+})
+
+describe('stitchWaveformJsonExpandCutsIncremental', () => {
+  it('컷만 늘어날 때 전체 스티치와 동일한 픽셀 길이', () => {
+    const sr = 48000
+    const spp = 480
+    const mediaSec = 10
+    const pixels = Math.ceil((mediaSec * sr) / spp)
+    const j = makeJson(pixels, spp, sr)
+    const a: CutRange[] = [{ start: 2, end: 4 }]
+    const b: CutRange[] = [
+      { start: 2, end: 4 },
+      { start: 6, end: 7 }
+    ]
+    expect(cutRemovedIntervalsExpandOnly(a, b)).toBe(true)
+    const fullA = stitchWaveformJsonByCuts(j, a, mediaSec)!
+    const inc = stitchWaveformJsonExpandCutsIncremental(fullA, a, j, b, mediaSec)
+    expect(inc).not.toBeNull()
+    const fullB = stitchWaveformJsonByCuts(j, b, mediaSec)!
+    expect(inc!.length).toBe(fullB.length)
+    expect(inc!.data?.length).toBe(fullB.data?.length)
+    expect(inc!.data).toEqual(fullB.data)
+  })
+
+  it('삭제 되돌리기(컷 축소)면 incremental 불가 → null', () => {
+    const sr = 48000
+    const spp = 480
+    const mediaSec = 10
+    const pixels = Math.ceil((mediaSec * sr) / spp)
+    const j = makeJson(pixels, spp, sr)
+    const a: CutRange[] = [
+      { start: 2, end: 4 },
+      { start: 6, end: 7 }
+    ]
+    const b: CutRange[] = [{ start: 2, end: 4 }]
+    expect(cutRemovedIntervalsExpandOnly(a, b)).toBe(false)
+    const fullA = stitchWaveformJsonByCuts(j, a, mediaSec)!
+    expect(stitchWaveformJsonExpandCutsIncremental(fullA, a, j, b, mediaSec)).toBeNull()
   })
 })
 

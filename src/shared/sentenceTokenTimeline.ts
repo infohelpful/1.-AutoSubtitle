@@ -14,6 +14,8 @@ export interface TimelineToken {
   is_deleted?: boolean
   /** gap-fill 무음 더미 — `SubtitleWord.isSilence` 와 동기 */
   isSilence?: boolean
+  /** 자르기 분할 흔적 — `SubtitleWord.splitChain` 라운드트립 보존용 */
+  splitChain?: string
 }
 
 /** 문장 = 토큰 배열 */

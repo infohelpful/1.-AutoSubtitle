@@ -1,5 +1,7 @@
 import {
+  startTransition,
   useCallback,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -13,7 +15,7 @@ import {
 import type { JsonWaveformData } from 'peaks.js'
 
 import type { CutRange, DepsStatus, ExportFormat, GpuRuntimeStatus, TranscribeMode } from '../../shared/ipc'
-import type { SubtitleLine, SubtitleWord } from '../../shared/subtitles'
+import { parseSubtitleLines, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
 import {
   AUTOSUB_FILE_FORMAT,
   AUTOSUB_VERSION,
@@ -47,8 +49,8 @@ import {
   playbackIntervalsFromSubtitleLines
 } from '../../shared/playbackIntervals'
 import { applyProgramTimeRangeTombstoneCutToSubtitleLines } from '../../shared/subtitleTombstoneCut'
-import { parseSubtitleLines } from '../../shared/subtitles'
 import { getSubtitleBoxChromeInline } from '../../shared/subtitleBoxChrome'
+import { splitWordTextAtMediaCut } from '../../shared/subtitleWordTextSplit'
 import { mergeEmptySubtitleWithPrevious, splitSubtitleLine } from './subtitleEditOps'
 import { SubtitleVirtualList } from './SubtitleVirtualList'
 import { SubtitleDataProvider } from './subtitleDataContext'
@@ -58,6 +60,7 @@ import {
   type SubtitleWaveformPeaksHandle
 } from './SubtitleWaveformPeaks'
 import type { SubtitleRow } from './components/vrewPeaksEditor/types'
+import { makeRowWordBlockId } from './components/vrewPeaksEditor/blockIds'
 import {
   mergeVrewRowsIntoSubtitleLines,
   subtitleLinesToVrewRows,
@@ -69,11 +72,17 @@ import {
   snapTimelineSec
 } from '../../shared/timelineCollapse'
 import { timelineEditLog } from './timelineEditLog'
+import { wfLog } from './components/vrewPeaksEditor/waveformDebugLog'
 import {
+  cutRemovedIntervalsExpandOnly,
   cutRangesSignature,
   exactTimelineDurationSecFromWaveformJson,
-  stitchWaveformJsonByCuts
+  stitchWaveformJsonByCuts,
+  stitchWaveformJsonExpandCutsIncremental,
+  stitchedEditAxisDurationSecFromCuts
 } from './timeline/stitchWaveformJson'
+import { StitchedPeaksJsonLruCache } from './timeline/stitchedPeaksJsonCache'
+import { cutRangeShallowEqual, useStableArrayReference } from './useStableArrayReference'
 import {
   createTimelineMapping,
   jumpVideoPastClipTailIfNeeded,
@@ -970,6 +979,11 @@ export default function App(): ReactElement {
       ) => void)
     | null
   >(null)
+  /**
+   * `clearOneShotSession` 의 최신 클로저 핸들. `useEffect` 1회 등록 콜백(예: WebAudio onScheduleEnded)
+   * 안에서 latest 클로저로 안전하게 호출하기 위함이다.
+   */
+  const clearOneShotSessionRef = useRef<((reason: string) => void) | null>(null)
   const masterAudioRef = useRef<HTMLAudioElement | null>(null)
   const webAudioMasterPlaybackRef = useRef<WebAudioMasterPlayback | null>(null)
   const deleteOpSeqRef = useRef(0)
@@ -1053,6 +1067,21 @@ export default function App(): ReactElement {
   const [waveformPeaksJsonData, setWaveformPeaksJsonData] = useState<JsonWaveformData | null>(null)
   /** 원본 피크 JSON 비동기 로드 중 — 완료 전에는 컨테이너 duration 으로 상한을 두지 않음 */
   const [waveformPeaksJsonLoading, setWaveformPeaksJsonLoading] = useState(false)
+  /**
+   * Stitched Peaks JSON LRU 캐시 — `(srcKey, cutSig) → JsonWaveformData`.
+   *
+   * - **Exact hit**: 같은 시그니처가 캐시에 있으면 **이전 reference 그대로** 반환 → `stitchedWaveformJsonComputed`
+   *   소비처(`timelineMediaEndHint` / 자식 metrics / hydrate · 디버그 로그 effect 등) cascade 가 통째로 스킵된다.
+   *   Undo/Redo 처럼 직전 시그니처로 되돌아갈 때 사실상 0ms.
+   * - **Miss + expansion-only**: MRU 항목의 컷이 새 컷의 부분집합이면 `stitchWaveformJsonExpandCutsIncremental`
+   *   로 splice (이전 단일 슬롯 캐시 경로 유지).
+   * - **Full fallback**: 위 두 경로가 안 되면 `stitchWaveformJsonByCuts` 로 전체 계산 후 캐시 등록.
+   *
+   * 메모리: 출력 픽셀 데이터 ~6MB/entry. 기본 maxBytes 64MB · maxEntries 8.
+   */
+  const stitchedPeaksJsonCacheRef = useRef<StitchedPeaksJsonLruCache>(
+    new StitchedPeaksJsonLruCache({ maxEntries: 8, maxBytes: 64 * 1024 * 1024 })
+  )
   const [timelineAxisMismatch, setTimelineAxisMismatch] = useState<string | null>(null)
   const [isPlaying, setIsPlaying] = useState(false)
   useEffect(() => {
@@ -1180,10 +1209,56 @@ export default function App(): ReactElement {
     }
   }, [])
   useEffect(() => {
-    webAudioMasterPlaybackRef.current = new WebAudioMasterPlayback()
+    const engine = new WebAudioMasterPlayback()
+    webAudioMasterPlaybackRef.current = engine
+    /**
+     * **WebAudio 자연 종료 콜백 — oneShotSession 정리의 단일 결정점.**
+     * 짧은 슬라이스(예: 97ms 단어) 재생 시, startup verify 타이머(180ms) 가 발화하기 전에
+     * BufferSource 가 자연 종료되어 `isPlaying()` 만으로는 RAF/verify 어느 쪽도 종료를 못 잡고
+     * `oneShotSessionRef` 가 `state:"playing"` 인 채 영구 잔존하여 이후 클릭이 전부
+     * `dispatchPlayRangeIntentFromWaveform → queued` 로 막히는 경합이 있었다. 엔진이 직접 통지하는
+     * 이 콜백이 정리의 단일 결정점이고, `reason==='stopped'` (외부 stopPlayback) 의 경우엔
+     * 이미 다른 경로에서 정리되므로 여기서는 `'natural'` 만 처리.
+     */
+    engine.setOnScheduleEnded((scheduleId, reason) => {
+      if (reason !== 'natural') return
+      const lingering = oneShotSessionRef.current
+      if (!lingering || lingering.state !== 'playing') return
+      const endMedia = previewEndMediaSecRef.current ?? lingering.end
+      oneShotSessionRef.current = { ...lingering, state: 'done' }
+      try {
+        playbackCommandRouterRef.current.finishRange(playbackSessionIdRef.current)
+      } catch {
+        /* ignore router-finalize errors so cleanup always runs */
+      }
+      playbackSessionIdRef.current = 0
+      try {
+        /**
+         * `soft:false` 로 가드를 완전히 풀면 자연 종료 직후 idle drift guard 가 즉시 비디오를
+         * pause/seek 해 다른 effect 와 경합 → "Maximum update depth exceeded" 가 뜨는 회귀가
+         * 있었다. `finalizePlaybackStop` 본체에서 가드 길이를 짧게(120ms) 유지하므로 다시 soft:true 로.
+         */
+        finalizePlaybackStopRef.current?.('webaudio natural end', { mediaSec: endMedia, soft: true })
+      } catch {
+        /* ignore */
+      }
+      try {
+        clearOneShotSessionRef.current?.('webaudio natural end')
+      } catch {
+        /* ignore */
+      }
+      wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio 자연 종료 콜백 — one-shot 정리', {
+        scheduleId,
+        sessionId: lingering.id,
+        sessionEndMediaSec: lingering.end
+      })
+    })
     return () => {
-      webAudioMasterPlaybackRef.current?.dispose()
-      webAudioMasterPlaybackRef.current = null
+      engine.setOnScheduleEnded(null)
+      engine.dispose()
+      if (webAudioMasterPlaybackRef.current === engine) {
+        webAudioMasterPlaybackRef.current = null
+      }
     }
   }, [])
 
@@ -1232,7 +1307,8 @@ export default function App(): ReactElement {
       // 활성 guard에는 최대 +320ms만 추가 연장한다.
       const cappedExtendUntil = curUntil > now ? Math.min(requestedUntil, curUntil + 120) : requestedUntil
       deleteGuardUntilRef.current = Math.max(curUntil, cappedExtendUntil)
-      waveformFocusBlockUntilRef.current = Math.max(waveformFocusBlockUntilRef.current, deleteGuardUntilRef.current + 350)
+      /** 삭제 직후 파형 포커스만 막음 — +350ms 는 체감 지연이 커서 +120ms 로 축소 (가드 본체는 `deleteGuardUntil` 로 유지) */
+      waveformFocusBlockUntilRef.current = Math.max(waveformFocusBlockUntilRef.current, deleteGuardUntilRef.current + 120)
       // 삭제 트랜잭션마다 파형 auto-focus seek 차단 토큰을 갱신한다.
       setWaveformAutoSeekBlockToken((v) => v + 1)
       timelineEditLog('word-delete', 'delete guard armed', {
@@ -1385,15 +1461,38 @@ export default function App(): ReactElement {
     () => sentenceTokenTimelineToSubtitleLines(sentenceTokenTimeline),
     [sentenceTokenTimeline]
   )
+  const subtitlesRef = useRef(subtitles)
+  subtitlesRef.current = subtitles
   const [silenceSplitPending, setSilenceSplitPending] = useState(false)
   const silenceSplitRunKeyRef = useRef<string | null>(null)
   const autoWordRealignRunKeyRef = useRef<string | null>(null)
-  const undoStackRef = useRef<SubtitleLine[][]>([])
-  const redoStackRef = useRef<SubtitleLine[][]>([])
+  /**
+   * Undo/Redo 항목은 **세 state 한 묶음** 으로 저장한다.
+   * - `subtitles`: 단어 tombstone(isDeleted) 토글·split·merge 등 자막 그래프 자체의 스냅샷
+   * - `virtualTimelineDeleted`: 가상 타임라인 삭제 구간(파형 stitch 입력)
+   * - `cutRanges`: 하드 타임라인 컷 (오디오 파동에서의 time-range 자르기)
+   *
+   * 이전엔 `subtitles` 만 push 해서 Ctrl+Z 후에도 `virtualTimelineDeleted` 가 그대로 남아
+   * 파형 stitched cuts 가 유지 → 사용자 입장에서 "복구 안됨" 처럼 보였다.
+   */
+  type SubtitleHistoryEntry = {
+    subtitles: SubtitleLine[]
+    virtualTimelineDeleted: VirtualTimelineBlock[]
+    cutRanges: CutRange[]
+  }
+  const undoStackRef = useRef<SubtitleHistoryEntry[]>([])
+  const redoStackRef = useRef<SubtitleHistoryEntry[]>([])
+  /** virtualTimelineDeleted 의 최신 값 ref — applySubtitleChange/undo/redo 가 동기 캡처 */
+  const virtualTimelineDeletedRef = useRef<VirtualTimelineBlock[]>([])
+  useEffect(() => {
+    virtualTimelineDeletedRef.current = virtualTimelineDeleted
+  }, [virtualTimelineDeleted])
   /** 마지막으로 저장/연 `.autosub` 경로 — 「저장」 덮어쓰기용 */
   const projectFilePathRef = useRef<string | null>(null)
 
   const [isExtracting, setIsExtracting] = useState(false)
+  /** IPC 100% 이후 — 리스트·가상행 레이아웃이 끝날 때까지 오버레이 유지할 때 true */
+  const [extractAwaitListPaint, setExtractAwaitListPaint] = useState(false)
   const [progress, setProgress] = useState(0)
   const [transcribeMode, setTranscribeMode] = useState<TranscribeMode>('cpu')
   const [isExporting, setIsExporting] = useState(false)
@@ -1414,24 +1513,65 @@ export default function App(): ReactElement {
    * Phase 2 / 8 — READ 플래그 시 목록·파형 영역에서 파생 줄 수만 참조.
    * `SubtitleVirtualList` 인덱스는 여전히 `subtitles` SSOT 기준(플래그 true일 때 매핑 추가 전까지).
    */
-  const subtitlesForList = useMemo(() => {
+  const subtitlesForListRaw = useMemo(() => {
     if (!READ_SUBTITLES_FROM_VIRTUAL_TIMELINE) return subtitles
     return deriveVisibleSubtitleLinesForUi(subtitles, mergedCutRanges, virtualTimelineDeleted)
   }, [subtitles, mergedCutRanges, virtualTimelineDeleted])
+  /** element-wise 동일하면 이전 array reference 유지 → 자식 `SubtitleVirtualList` 의 prop 안정 */
+  const subtitlesForList = useStableArrayReference(subtitlesForListRaw) as SubtitleLine[]
 
   const peaksStitchCutSig = useMemo(() => cutRangesSignature(mergedCutRanges), [mergedCutRanges])
 
   /** 표시용 Peaks JSON 스티치만 — 하드 컷 + 단어 tombstone + 가상 삭제 블록 (재생 매핑은 mergedCutRanges 유지) */
-  const mergedWaveformPeaksStitchCuts = useMemo(
+  const mergedWaveformPeaksStitchCutsRaw = useMemo(
     () => mergeWaveformPeaksStitchCutRanges(mergedCutRanges, subtitles, virtualTimelineDeleted),
     [mergedCutRanges, subtitles, virtualTimelineDeleted]
   )
+  /**
+   * `mergeWaveformPeaksStitchCutRanges` 는 매번 새 `CutRange[]` 를 반환한다(`mergeCutRanges` 내부 sort/병합).
+   * 의미상 동일(시작·끝 모두 동일) 하면 이전 reference 를 유지해야 downstream useMemo 들 (`stitchedWaveformJsonComputed`,
+   * `timelineMediaEndHint`, `timelineMapping`, `playbackTimelineMapping`) 의 deps 가 stable 해진다.
+   */
+  const mergedWaveformPeaksStitchCuts = useStableArrayReference(
+    mergedWaveformPeaksStitchCutsRaw,
+    cutRangeShallowEqual
+  ) as CutRange[]
   const waveformPeaksStitchCutSig = useMemo(
     () => cutRangesSignature(mergedWaveformPeaksStitchCuts),
     [mergedWaveformPeaksStitchCuts]
   )
   /** 렌더마다 동기화해 RAF·이벤트 콜백이 최신 tombstone 까지 반영된 스킵 리스트를 즉시 본다 */
   mergedPlaybackSkipRangesRef.current = mergedWaveformPeaksStitchCuts
+
+  /**
+   * Peaks JSON 스티치(740k+ 픽셀 버퍼) 입력만 deferred — tombstone/가상삭제가 `subtitles` 에 즉시 반영되면
+   * `mergeWaveformPeaksStitchCutRanges` → `stitchWaveformJsonByCuts` → 캔버스/Peaks 초기화가 **첫 commit** 에 묶여
+   * waveform.log 의 ~800ms longtask 가 난다(스티치 자체 로그는 수 ms).
+   *
+   * `useDeferredValue` 로 1~2프레임 늦추면: 단어 카드·타임라인·재생(`mergedWaveformPeaksStitchCuts` 즉시) 은 그대로,
+   * 파형 비트맵만 짧게 따라온다. 이전에 시도했던 *stitched 출력* 자체를 defer 하는 것과 달리,
+   * 매핑은 즉시 컷 리스트를 쓰고 **픽셀 데이터 생성** 만 한 박자 늦다.
+   */
+  const subtitlesDeferredForPeaksJsonStitch = useDeferredValue(subtitles)
+  const virtualTimelineDeletedDeferredForPeaksJsonStitch = useDeferredValue(virtualTimelineDeleted)
+  const mergedWaveformPeaksStitchCutsForPeaksJsonOnlyRaw = useMemo(
+    () =>
+      mergeWaveformPeaksStitchCutRanges(
+        mergedCutRanges,
+        subtitlesDeferredForPeaksJsonStitch,
+        virtualTimelineDeletedDeferredForPeaksJsonStitch
+      ),
+    [
+      mergedCutRanges,
+      subtitlesDeferredForPeaksJsonStitch,
+      virtualTimelineDeletedDeferredForPeaksJsonStitch
+    ]
+  )
+  /** 동일 — `stitchedWaveformJsonComputed` deps stable 화. cut 시그니처 동일하면 LRU exact hit 와 함께 0ms. */
+  const mergedWaveformPeaksStitchCutsForPeaksJsonOnly = useStableArrayReference(
+    mergedWaveformPeaksStitchCutsForPeaksJsonOnlyRaw,
+    cutRangeShallowEqual
+  ) as CutRange[]
 
   /** 원본 피크 JSON 미디어 길이 — 스티치 상한·타임라인 힌트와 순환 참조 없음 */
   const rawWaveformTimelineDurationSec = useMemo((): number => {
@@ -1456,32 +1596,109 @@ export default function App(): ReactElement {
    *
    * 비용 — 스티치 자체는 동기 픽셀 복사이지만 컷 시그니처가 바뀔 때만 재계산되며, Peaks `precomputedWaveformSig`
    * 도 길이/데이터 길이 기반이라 같은 시그니처 결과면 `destroy/init` 루프는 발생하지 않는다.
+   *
+   * 입력 컷은 `mergedWaveformPeaksStitchCutsForPeaksJsonOnly`(deferred subtitles) — 삭제 직후 첫 paint 에
+   * 거대 버퍼 생성이 메인 스레드를 막지 않도록 한다.
    */
   const stitchedWaveformJsonComputed = useMemo((): JsonWaveformData | null => {
-    if (!videoPath || !waveformPeaksJsonData) return null
-    if (mergedWaveformPeaksStitchCuts.length === 0) return null
+    const cache = stitchedPeaksJsonCacheRef.current
+    if (!videoPath || !waveformPeaksJsonData) {
+      cache.clear()
+      return null
+    }
+    const wf = waveformPeaksJsonData
+    const newCuts = mergedWaveformPeaksStitchCutsForPeaksJsonOnly
     const stitchDur = rawWaveformTimelineDurationSec
     if (!(stitchDur > 0)) return null
+    if (newCuts.length === 0) return null
+
+    const srcKey = `${videoPath}|${wf.length ?? 0}|${stitchDur.toFixed(4)}`
+    const newSig = cutRangesSignature(newCuts)
+
+    /**
+     * 1) **Exact hit** — 같은 시그니처가 캐시에 있으면 이전 reference 그대로 반환.
+     *    Undo/Redo 가 직전 상태로 돌아갈 때 사실상 0ms 이고, 다운스트림 cascade 도 reference 동일성으로 스킵.
+     */
+    const exact = cache.get(srcKey, newSig)
+    if (exact) {
+      wfLog('perf', 'stitched peaks JSON 캐시 hit (LRU)', {
+        cutCount: newCuts.length,
+        outPixels: exact.out.length ?? 0,
+        cacheEntries: cache.size()
+      })
+      return exact.out
+    }
+
+    /**
+     * 2) **Miss + expansion-only** — MRU 항목의 컷이 새 컷의 부분집합이면 splice 만으로 확장.
+     *    1473 word 환경에서 단일 단어 삭제의 일반 경로.
+     */
+    const mru = cache.peekMru(srcKey, newSig)
+    if (mru && cutRemovedIntervalsExpandOnly(mru.mergedCuts, newCuts)) {
+      const tInc = performance.now()
+      const inc = stitchWaveformJsonExpandCutsIncremental(mru.out, mru.mergedCuts, wf, newCuts, stitchDur)
+      if (inc) {
+        const entry = cache.set(srcKey, newSig, { mergedCuts: mergeCutRanges([...newCuts]), out: inc })
+        wfLog('perf', 'stitchWaveformJsonExpandCutsIncremental', {
+          ms: Math.round(performance.now() - tInc),
+          cutCount: newCuts.length,
+          outPixels: inc.length ?? 0,
+          cacheEntries: cache.size(),
+          cacheBytes: cache.bytes()
+        })
+        return entry.out
+      }
+    }
+
+    /**
+     * 3) **Full fallback** — 전체 계산. 결과는 LRU 에 등록되어 다음 Undo/Redo 때 0ms hit.
+     */
     try {
-      return stitchWaveformJsonByCuts(waveformPeaksJsonData, mergedWaveformPeaksStitchCuts, stitchDur)
-    } catch {
+      const t0 = performance.now()
+      const out = stitchWaveformJsonByCuts(wf, newCuts, stitchDur)
+      wfLog('perf', 'stitchWaveformJsonByCuts 동기 계산', {
+        ms: Math.round(performance.now() - t0),
+        cutCount: newCuts.length,
+        srcPixels: wf.length ?? 0,
+        outPixels: out?.length ?? 0,
+        stitchDurSec: Math.round(stitchDur * 100) / 100
+      })
+      if (out) {
+        const entry = cache.set(srcKey, newSig, { mergedCuts: mergeCutRanges([...newCuts]), out })
+        return entry.out
+      }
+      return null
+    } catch (e) {
+      wfLog('perf', 'stitchWaveformJsonByCuts 예외', {
+        message: e instanceof Error ? e.message : String(e)
+      })
       return null
     }
   }, [
     videoPath,
     waveformPeaksJsonData,
-    mergedWaveformPeaksStitchCuts,
+    mergedWaveformPeaksStitchCutsForPeaksJsonOnly,
     rawWaveformTimelineDurationSec
   ])
 
-  /** 컷·tombstone 스티치 시그니처 변경 → 재생 매핑 리비전 증가. 단어 tombstone만 바뀌어도 즉시 committed 동기화. */
+  /**
+   * 과거 시도: stitched **출력** 전체를 `useDeferredValue` 하면 인라인 단어 레일과 픽셀 축이 어긋져 싱크가 깨졌다.
+   * 현재: 매핑·재생은 즉시 컷(`mergedWaveformPeaksStitchCuts`), Peaks JSON 생성 입력만 deferred.
+   */
+
+  /**
+   * 컷·tombstone 스티치 시그니처 변경 → pending revision 만 증가.
+   * committed 는 master audio effect (videoPath/baseUrl/sig/rev 묶음) 가 단일 소유 —
+   * 두 setter 를 같은 commit 안에서 함께 set 하면 `playbackSnapshot` useMemo 가 한 commit 안에 두 번 새 객체를 만들어
+   * 소비처 useCallback 들이 매번 새 ref 가 되고 nested-update / idle 폭주의 출발점이 된다.
+   * (하드 컷이 없을 때 mapperReady 고착은 `isPlaybackMapperReady` 가 직접 해소한다.)
+   */
   useEffect(() => {
     const sig = waveformPeaksStitchCutSig
     if (sig === cutSigRef.current) return
     cutSigRef.current = sig
     playbackPendingRevisionRef.current += 1
     setPlaybackPendingRevision(playbackPendingRevisionRef.current)
-    setPlaybackCommittedRevision(playbackPendingRevisionRef.current)
   }, [waveformPeaksStitchCutSig])
 
   /**
@@ -1492,6 +1709,24 @@ export default function App(): ReactElement {
   const timelineMediaEndHint = useMemo(() => {
     const subtitleEnd = subtitles.reduce((m, line) => Math.max(m, line.end ?? 0), 0)
     const durHint = durationSec > 0 ? durationSec : undefined
+    /**
+     * 편집축 길이는 **즉시** `mergedWaveformPeaksStitchCuts` 로 계산한다.
+     * `stitchedWaveformJsonComputed` 는 deferred 입력이라 삭제 직후 한두 프레임 옛 길이를 유지하면
+     * `createTimelineMapping` 의 클립·`mapMediaToEditSec` 과 실제 오디오·단어 하이라이트가 어긋난다.
+     */
+    if (
+      waveformPeaksJsonData &&
+      mergedWaveformPeaksStitchCuts.length > 0 &&
+      rawWaveformTimelineDurationSec > 0
+    ) {
+      const fromImmediateCuts = stitchedEditAxisDurationSecFromCuts(
+        waveformPeaksJsonData,
+        mergedWaveformPeaksStitchCuts,
+        rawWaveformTimelineDurationSec,
+        durHint
+      )
+      if (fromImmediateCuts != null && fromImmediateCuts > 0) return fromImmediateCuts
+    }
     if (stitchedWaveformJsonComputed) {
       const fromStitched = exactTimelineDurationSecFromWaveformJson(stitchedWaveformJsonComputed, durHint)
       if (fromStitched != null && fromStitched > 0) return fromStitched
@@ -1510,6 +1745,8 @@ export default function App(): ReactElement {
     waveformMediaSpanSec,
     waveformPeaksJsonData,
     waveformPeaksJsonLoading,
+    mergedWaveformPeaksStitchCuts,
+    rawWaveformTimelineDurationSec,
     stitchedWaveformJsonComputed
   ])
 
@@ -1544,8 +1781,23 @@ export default function App(): ReactElement {
     [playbackPendingRevision, playbackCommittedRevision, playbackTimelineMapping.masterMode]
   )
   const isPlaybackMapperReady = useCallback((): boolean => {
-    return playbackSnapshot.mapperReady && timelineMapping.masterMode === playbackSnapshot.masterMode
-  }, [playbackSnapshot.mapperReady, playbackSnapshot.masterMode, timelineMapping.masterMode])
+    /**
+     * 하드 타임라인 컷(`mergedCutRanges`)이 없을 때는 단어 tombstone 만으로
+     * `mergedWaveformPeaksStitchCuts` 가 생긴다. 이때 UI용 `timelineMapping` 은 stitched,
+     * `playbackTimelineMapping` 은 의도적으로 passthrough — `committed >= pending` 동기화는
+     * 마스터 오디오 URL 이 바뀌지 않아 master audio effect 가 layoutKey 같음으로 early-return 하면 영원히 안 따라잡는다.
+     * 이 조합에서는 `mapperReady` / `masterMode` 검사를 모두 건너뛰고 즉시 ready 로 본다.
+     * (그러지 않으면 `isPlaybackTransactionLocked` → `playRange` 가 큐에만 쌓이고 재생이 멈춘다.)
+     */
+    if (mergedCutRanges.length === 0) return true
+    if (!playbackSnapshot.mapperReady) return false
+    return timelineMapping.masterMode === playbackSnapshot.masterMode
+  }, [
+    playbackSnapshot.mapperReady,
+    playbackSnapshot.masterMode,
+    timelineMapping.masterMode,
+    mergedCutRanges.length
+  ])
   useEffect(() => {
     playbackCommandRouterRef.current.setMappingRevision(
       playbackSnapshot.pendingRevision,
@@ -1573,6 +1825,33 @@ export default function App(): ReactElement {
   const mapMediaToEditSec = useCallback(
     (sec: number): number => Math.max(0, timelineMapping.mediaToProgramSec(sec)),
     [timelineMapping]
+  )
+
+  const applySubtitleChangeRef = useRef<typeof applySubtitleChange | null>(null)
+  const wordEdgeSubtitleBridge = useMemo(
+    () =>
+      gapFillWhenBuildingVrew
+        ? undefined
+        : {
+            getSubtitleLines: () => subtitlesRef.current,
+            onSubtitleLinesCommit: (lines: SubtitleLine[]) => {
+              setGapFillWhenBuildingVrew(false)
+              const fn = applySubtitleChangeRef.current
+              if (fn) fn(() => lines)
+              else setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(lines))
+            },
+            onSubtitleLinesPreview: (lines: SubtitleLine[]) => {
+              const fn = applySubtitleChangeRef.current
+              if (fn) fn(() => lines, { recordHistory: false })
+            },
+            onSubtitleLinesRevert: (snapshot: SubtitleLine[]) => {
+              const fn = applySubtitleChangeRef.current
+              if (fn) fn(() => snapshot, { recordHistory: false })
+            },
+            editSecToMediaSec: mapEditToMediaSec,
+            mediaSecToEditSec: mapMediaToEditSec
+          },
+    [gapFillWhenBuildingVrew, mapEditToMediaSec, mapMediaToEditSec]
   )
 
   /**
@@ -1651,7 +1930,15 @@ export default function App(): ReactElement {
     (editSecRaw: number) => {
       const editSec = clampProgramEditSec(editSecRaw)
       playheadEditSecRef.current = editSec
-      const ai = pickActiveSubtitleIndex(subtitles, editSec)
+      /**
+       * **`subtitles` 는 deps 에서 빼고 ref 로 읽는다.**
+       * `subtitles` 가 `sentenceTokenTimeline` 파생 useMemo 라, 단어 분할/삭제 1회마다 새 array.
+       * 이 콜백 deps 에 들어가 있으면 매 삭제마다 콜백·이를 의존하는 모든 useEffect 가 재시작되어
+       * 재생 중 단어 하이라이트가 한 박자 늦게 따라옴(150~300ms 체감). ref 로 읽으면 콜백이 안정해
+       * 매 RAF tick 이 동일 클로저를 호출 → 하이라이트가 즉시 갱신된다.
+       */
+      const subsNow = subtitlesRef.current
+      const ai = pickActiveSubtitleIndex(subsNow, editSec)
       activeSubtitleIndexRef.current = ai
 
       const timeEl = previewCurrentTimeRef.current
@@ -1668,7 +1955,7 @@ export default function App(): ReactElement {
 
       const previewTextEl = previewSubtitleTextRef.current
       if (previewTextEl) {
-        previewTextEl.textContent = ai !== null && subtitles[ai] ? subtitles[ai].text : ''
+        previewTextEl.textContent = ai !== null && subsNow[ai] ? subsNow[ai].text : ''
       }
 
       const t = editSec
@@ -1723,7 +2010,7 @@ export default function App(): ReactElement {
 
       waveformPeaksRef.current?.syncPlayheadFromEditSec(editSec)
     },
-    [clampProgramEditSec, uiTimelineEndEditSec, subtitles]
+    [clampProgramEditSec, uiTimelineEndEditSec]
   )
 
   useLayoutEffect(() => {
@@ -1839,29 +2126,61 @@ export default function App(): ReactElement {
         onMapperBlocked?: () => void
       }
     ): boolean => {
-      if (!playbackSnapshot.mapperReady) {
-        options?.onMapperBlocked?.()
-        timelineEditLog('playback', `${source} 차단(mapper rebuild)`, {
-          targetEditSec,
-          playbackPendingRevision: playbackSnapshot.pendingRevision,
-          playbackCommittedRevision: playbackSnapshot.committedRevision
-        })
-        return false
-      }
-      if (timelineMapping.masterMode !== playbackSnapshot.masterMode) {
-        options?.onMapperBlocked?.()
-        timelineEditLog('playback', `${source} 차단(mode mismatch)`, {
+      /**
+       * 하드 컷이 없을 때(`mergedCutRanges.length === 0`)는 tombstone·가상 삭제만으로 `timelineMapping` 은
+       * stitched, `playbackTimelineMapping` 은 의도적으로 passthrough 가 된다. 두 가드 전부를 건너뛰고
+       * 즉시 재생을 허용 — 그러지 않으면 단어 자르기·삭제 직후 모든 단어 재생 클릭이 `onMapperBlocked`
+       * → 큐 → mapper revision 영원히 안 따라잡힘 사이클에 영구히 막힌다. (`isPlaybackMapperReady` 와 동일 정책.)
+       */
+      if (mergedCutRanges.length === 0) {
+        wfLog('peaks', 'startSyncedPlayback mapper 가드 우회 [diag-5] tombstone-only', {
           targetEditSec,
           timelineMasterMode: timelineMapping.masterMode,
           playbackMasterMode: playbackSnapshot.masterMode,
-          playbackPendingRevision: playbackSnapshot.pendingRevision,
-          playbackCommittedRevision: playbackSnapshot.committedRevision
+          mapperReady: playbackSnapshot.mapperReady
         })
-        return false
+      } else {
+        if (!playbackSnapshot.mapperReady) {
+          options?.onMapperBlocked?.()
+          timelineEditLog('playback', `${source} 차단(mapper rebuild)`, {
+            targetEditSec,
+            playbackPendingRevision: playbackSnapshot.pendingRevision,
+            playbackCommittedRevision: playbackSnapshot.committedRevision
+          })
+          wfLog('peaks', 'startSyncedPlayback 차단 [diag-5] mapper rebuild', {
+            targetEditSec,
+            playbackPendingRevision: playbackSnapshot.pendingRevision,
+            playbackCommittedRevision: playbackSnapshot.committedRevision
+          })
+          return false
+        }
+        if (timelineMapping.masterMode !== playbackSnapshot.masterMode) {
+          options?.onMapperBlocked?.()
+          timelineEditLog('playback', `${source} 차단(mode mismatch)`, {
+            targetEditSec,
+            timelineMasterMode: timelineMapping.masterMode,
+            playbackMasterMode: playbackSnapshot.masterMode,
+            playbackPendingRevision: playbackSnapshot.pendingRevision,
+            playbackCommittedRevision: playbackSnapshot.committedRevision
+          })
+          wfLog('peaks', 'startSyncedPlayback 차단 [diag-5] mode mismatch', {
+            targetEditSec,
+            timelineMasterMode: timelineMapping.masterMode,
+            playbackMasterMode: playbackSnapshot.masterMode
+          })
+          return false
+        }
       }
       const el = videoRef.current
       const masterAudio = masterAudioRef.current
-      if (!el || !masterAudio) return false
+      if (!el || !masterAudio) {
+        wfLog('peaks', 'startSyncedPlayback 차단 [diag-6] refs 없음', {
+          targetEditSec,
+          hasVideoEl: el != null,
+          hasMasterAudio: masterAudio != null
+        })
+        return false
+      }
       const editStart = clampProgramEditSec(targetEditSec)
       const targetMediaSec = mapEditToMediaSec(editStart)
       commitEditSecToUi(editStart)
@@ -1871,6 +2190,21 @@ export default function App(): ReactElement {
       playbackStartupProbeRef.current = null
       waLastMediaSecRef.current = null
       const targetAudioSec = playbackTimelineMapping.programToMasterAudioSec(editStart)
+      wfLog('peaks', 'startSyncedPlayback 진행 [diag-6]', {
+        source,
+        targetEditSec: editStart,
+        targetMediaSec,
+        targetAudioSec,
+        videoCurrentTime: Number.isFinite(el.currentTime) ? el.currentTime : null,
+        masterAudioCurrentTime: Number.isFinite(masterAudio.currentTime) ? masterAudio.currentTime : null,
+        masterAudioPaused: masterAudio.paused,
+        masterAudioReadyState: masterAudio.readyState,
+        masterAudioSrc: masterAudio.src || null,
+        hasWaveformMediaUrl: waveformMediaUrl != null,
+        hasWebAudioEngine: webAudioMasterPlaybackRef.current != null,
+        scheduleKind: activePlaybackScheduleRef.current?.kind ?? null,
+        scheduleSegCount: activePlaybackScheduleRef.current?.segments.length ?? 0
+      })
       timelineEditLog('playback', `${source} startSyncedPlayback(web-audio)`, {
         targetEditSec: editStart,
         targetMediaSec,
@@ -1895,6 +2229,10 @@ export default function App(): ReactElement {
         const engine = webAudioMasterPlaybackRef.current
         try {
           if (!engine || !decodeUrl) {
+            wfLog('peaks', 'startSyncedPlayback [diag-6] HTML 폴백 — engine/decodeUrl 없음', {
+              hasEngine: engine != null,
+              hasDecodeUrl: decodeUrl != null
+            })
             playMasterVideoSynced(masterAudio, el, {
               targetVideoSec: targetMediaSec,
               targetAudioSec,
@@ -1905,6 +2243,10 @@ export default function App(): ReactElement {
           }
           if (!scheduleInfo || scheduleInfo.segments.length <= 0) {
             timelineEditLog('playback', `${source} WebAudio: EDL schedule 없음 — HTML 폴백`)
+            wfLog('peaks', 'startSyncedPlayback [diag-6] HTML 폴백 — EDL schedule 없음', {
+              hasScheduleInfo: scheduleInfo != null,
+              segCount: scheduleInfo?.segments.length ?? 0
+            })
             playMasterVideoSynced(masterAudio, el, {
               targetVideoSec: targetMediaSec,
               targetAudioSec,
@@ -1914,10 +2256,19 @@ export default function App(): ReactElement {
             return
           }
           if (!engine.isLoadedForUrl(decodeUrl)) {
+            wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio loadFromUrl 시작', {
+              decodeUrl
+            })
             await engine.loadFromUrl(decodeUrl)
+            wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio loadFromUrl 완료')
           }
           engine.stopPlayback()
           await seekVideoElementTo(el, targetMediaSec)
+          wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio scheduleFromEdl 호출', {
+            targetMediaSec,
+            segCount: scheduleInfo.segments.length,
+            scheduleKind: scheduleInfo.kind
+          })
           const endClamp =
             scheduleInfo.kind === 'oneshot'
               ? (previewEndMediaSecRef.current ?? scheduleInfo.segments[scheduleInfo.segments.length - 1]!.endMediaSec)
@@ -1929,6 +2280,10 @@ export default function App(): ReactElement {
               segmentCount: scheduleInfo.segments.length,
               scheduleKind: scheduleInfo.kind
             })
+            wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio 비활성 — HTML 폴백', {
+              targetMediaSec,
+              segCount: scheduleInfo.segments.length
+            })
             playMasterVideoSynced(masterAudio, el, {
               targetVideoSec: targetMediaSec,
               targetAudioSec,
@@ -1937,6 +2292,9 @@ export default function App(): ReactElement {
             })
             return
           }
+          wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio 재생 중', {
+            targetMediaSec
+          })
           const waProbeStart = engine.getCurrentMediaSec()
           playbackStartupProbeRef.current = { startedAt: performance.now(), waStart: waProbeStart }
           playbackStartupVerifyTimerRef.current = window.setTimeout(() => {
@@ -1982,6 +2340,9 @@ export default function App(): ReactElement {
           timelineEditLog('playback', `${source} WebAudio 스케줄 실패 — HTML 폴백`, {
             message: err instanceof Error ? err.message : String(err)
           })
+          wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio 예외 — HTML 폴백', {
+            message: err instanceof Error ? err.message : String(err)
+          })
           playMasterVideoSynced(masterAudio, el, {
             targetVideoSec: targetMediaSec,
             targetAudioSec,
@@ -1998,10 +2359,14 @@ export default function App(): ReactElement {
       commitEditSecToUi,
       mapEditToMediaSec,
       markPlaybackActiveIfAudioClockReady,
-      playbackSnapshot,
+      playbackSnapshot.pendingRevision,
+      playbackSnapshot.committedRevision,
+      playbackSnapshot.mapperReady,
+      playbackSnapshot.masterMode,
       playbackTimelineMapping,
       timelineMapping.masterMode,
-      waveformMediaUrl
+      waveformMediaUrl,
+      mergedCutRanges.length
     ]
   )
 
@@ -2091,7 +2456,13 @@ export default function App(): ReactElement {
       playbackCommittedRevision: playbackSnapshot.committedRevision
     })
     return true
-  }, [isPlaybackMapperReady, bumpPendingQueue, playbackSnapshot, isEdlSessionActive])
+  }, [
+    isPlaybackMapperReady,
+    bumpPendingQueue,
+    playbackSnapshot.pendingRevision,
+    playbackSnapshot.committedRevision,
+    isEdlSessionActive
+  ])
 
   const seekToSubtitleStart = useCallback(
     (
@@ -2282,7 +2653,10 @@ export default function App(): ReactElement {
       isPlaying,
       queuePlaybackIntent,
       isPlaybackMapperReady,
-      playbackSnapshot,
+      playbackSnapshot.pendingRevision,
+      playbackSnapshot.committedRevision,
+      playbackSnapshot.mapperReady,
+      playbackSnapshot.masterMode,
       clearPlaybackSession,
       isOneShotSessionLocked,
       clearOneShotSession,
@@ -2451,7 +2825,10 @@ export default function App(): ReactElement {
       clampProgramEditSec,
       isDeleteGuardActive,
       queuePlaybackIntent,
-      playbackSnapshot,
+      playbackSnapshot.pendingRevision,
+      playbackSnapshot.committedRevision,
+      playbackSnapshot.mapperReady,
+      playbackSnapshot.masterMode,
       startSyncedPlayback,
       beginPlaybackSession,
       isOneShotSessionLocked,
@@ -2484,6 +2861,10 @@ export default function App(): ReactElement {
             requestedStartEditSec: startSec,
             requestedEndEditSec: endSec,
             subtitleLineCount: subtitles.length
+          })
+          wfLog('peaks', 'playEditRange 차단 [diag-5] 재생 가능 단어 없음', {
+            startSec,
+            endSec
           })
           return
         }
@@ -2546,6 +2927,12 @@ export default function App(): ReactElement {
             prevKind: prevSeek.kind,
             elapsedMs: now - prevSeek.at
           })
+          wfLog('peaks', 'playEditRange 차단 [diag-5] 하드 디듑', {
+            startSec: startInput,
+            endSec: endInput,
+            prevKind: prevSeek.kind,
+            elapsedMs: Math.round(now - prevSeek.at)
+          })
           return
         }
         const prevRange = lastPlayRangeIssuedRef.current
@@ -2562,6 +2949,11 @@ export default function App(): ReactElement {
             resolvedEndMediaSec: mediaEnd,
             elapsedMs: now - prevRange.at
           })
+          wfLog('peaks', 'playEditRange 차단 [diag-5] 구간 디듑', {
+            startSec: startInput,
+            endSec: endInput,
+            elapsedMs: Math.round(now - prevRange.at)
+          })
           return
         }
         const activeSession = oneShotSessionRef.current
@@ -2577,6 +2969,11 @@ export default function App(): ReactElement {
             resolvedEndMediaSec: mediaEnd,
             oneShotSession: activeSession
           })
+          wfLog('peaks', 'playEditRange 차단 [diag-5] 세션 디듑(active one-shot)', {
+            startSec: startInput,
+            endSec: endInput,
+            oneShotSession: activeSession
+          })
           return
         }
         const allow = playbackCommandRouterRef.current.beginPlayRange(mediaStart, mediaEnd)
@@ -2587,6 +2984,11 @@ export default function App(): ReactElement {
             requestedEndEditSec: endInput,
             resolvedStartMediaSec: mediaStart,
             resolvedEndMediaSec: mediaEnd
+          })
+          wfLog('peaks', 'playEditRange 차단 [diag-5] router', {
+            reason: allow.reason,
+            startSec: startInput,
+            endSec: endInput
           })
           return
         }
@@ -2600,6 +3002,11 @@ export default function App(): ReactElement {
             requestedEndEditSec: endInput,
             resolvedStartMediaSec: mediaStart,
             resolvedEndMediaSec: mediaEnd,
+            cutCount: mergedWaveformPeaksStitchCuts.length
+          })
+          wfLog('peaks', 'playEditRange 차단 [diag-5] EDL 세그먼트 없음', {
+            startSec: startInput,
+            endSec: endInput,
             cutCount: mergedWaveformPeaksStitchCuts.length
           })
           return
@@ -2661,11 +3068,21 @@ export default function App(): ReactElement {
         setIsBuffering(true)
         const editPlay = mapMediaToEditSec(mediaStart)
         commitEditSecToUi(editPlay)
+        wfLog('peaks', 'playEditRange → startSyncedPlayback [diag-5]', {
+          startSec: startInput,
+          endSec: endInput,
+          mediaStart,
+          mediaEnd,
+          editPlay,
+          masterMode: playbackTimelineMapping.masterMode
+        })
         startSyncedPlayback('playEditRange', editPlay, {
           onMapperBlocked: () => {
+            wfLog('peaks', 'playEditRange onMapperBlocked [diag-5]', { startSec, endSec })
             queuePlaybackIntent({ kind: 'playRange', startSec, endSec })
           },
           onAudioPlayRejected: () => {
+            wfLog('peaks', 'playEditRange onAudioPlayRejected [diag-5]', { startSec, endSec })
             clearOneShotSession('playEditRange rejected')
             clearPlaybackSession()
           }
@@ -2679,6 +3096,11 @@ export default function App(): ReactElement {
           requestedEndEditSec: endSec,
           queued: true
         })
+        wfLog('peaks', 'playEditRange 차단 [diag-5] delete guard', {
+          startSec,
+          endSec,
+          deleteOpId: lastDeleteOpIdRef.current
+        })
         return
       }
       run()
@@ -2689,7 +3111,10 @@ export default function App(): ReactElement {
       toMediaSeekSec,
       isDeleteGuardActive,
       queuePlaybackIntent,
-      playbackSnapshot,
+      playbackSnapshot.pendingRevision,
+      playbackSnapshot.committedRevision,
+      playbackSnapshot.mapperReady,
+      playbackSnapshot.masterMode,
       startSyncedPlayback,
       beginPlaybackSession,
       clearPlaybackSession,
@@ -2730,7 +3155,16 @@ export default function App(): ReactElement {
         if (next === prev) return prevTl
         const changed = subtitleLinesMeaningfullyChanged(next, prev)
         if (!changed) return prevTl
-        undoStackRef.current.push(prev)
+        /**
+         * `virtualTimelineDeleted`/`cutRanges` 도 함께 캡처해야 Ctrl+Z 가 stitched cut 까지 되돌릴 수 있다.
+         * 단어 삭제는 `setVirtualTimelineDeleted` 를 `setTimeout(0)` 으로 분리하지만, 이 push 시점의 ref 는
+         * **before-this-op** 의 값이므로 entry 정합성은 유지된다.
+         */
+        undoStackRef.current.push({
+          subtitles: prev,
+          virtualTimelineDeleted: virtualTimelineDeletedRef.current,
+          cutRanges: cutRangesRef.current
+        })
         if (undoStackRef.current.length > 100) undoStackRef.current.shift()
         redoStackRef.current = []
         return nextTl
@@ -2738,6 +3172,10 @@ export default function App(): ReactElement {
     },
     []
   )
+  /** WordEdgeDrag bridge 가 TDZ 회피용으로 참조하는 ref — applySubtitleChange 선언 이후 동기화 */
+  useEffect(() => {
+    applySubtitleChangeRef.current = applySubtitleChange
+  }, [applySubtitleChange])
 
   useEffect(() => {
     const revokePrev = () => {
@@ -2759,7 +3197,8 @@ export default function App(): ReactElement {
 
     const baseUrl = waveformMediaUrl
     const rev = playbackPendingRevisionRef.current
-    const layoutKey = `${videoPath}|${baseUrl}|${peaksStitchCutSig}|${rev}`
+    /** tombstone 변경(컷 없음)도 commit 으로 잡기 위해 stitch sig 포함 — committed 단일 소유자 */
+    const layoutKey = `${videoPath}|${baseUrl}|${peaksStitchCutSig}|${waveformPeaksStitchCutSig}|${rev}`
     if (masterAudioLayoutKeyRef.current === layoutKey) {
       return
     }
@@ -2782,7 +3221,7 @@ export default function App(): ReactElement {
     return () => {
       // no-op
     }
-  }, [videoPath, waveformMediaUrl, mergedCutRanges, peaksStitchCutSig])
+  }, [videoPath, waveformMediaUrl, mergedCutRanges, peaksStitchCutSig, waveformPeaksStitchCutSig])
 
   /** Web Audio EDL 디코드는 항상 원본 미디어 — stitched Blob 과 축 분리 */
   useEffect(() => {
@@ -2967,14 +3406,43 @@ export default function App(): ReactElement {
       return
     }
     const store = useEditorStore.getState()
-    if (store.tryPatchTombstonesFromTimeline(sentenceTokenTimeline)) return
-    if (store.patchFromTimelineIfStructureMatches(sentenceTokenTimeline)) return
+    const tStart = performance.now()
+    const tokenCount = sentenceTokenTimeline.reduce(
+      (acc, s) => acc + (s.tokens?.length ?? 0),
+      0
+    )
+    if (store.tryPatchTombstonesFromTimeline(sentenceTokenTimeline)) {
+      wfLog('perf', 'editor store hydrate — fast tombstone patch', {
+        ms: Math.round(performance.now() - tStart),
+        sentenceCount: sentenceTokenTimeline.length,
+        tokenCount
+      })
+      return
+    }
+    if (store.patchFromTimelineIfStructureMatches(sentenceTokenTimeline)) {
+      wfLog('perf', 'editor store hydrate — structure-match patch', {
+        ms: Math.round(performance.now() - tStart),
+        sentenceCount: sentenceTokenTimeline.length,
+        tokenCount
+      })
+      return
+    }
     const snap = buildEditorSnapshotFromSentenceTokenTimeline(
       sentenceTokenTimeline,
       waveformPeaksJsonData ?? null,
       rawWaveformTimelineDurationSec > 0 ? rawWaveformTimelineDurationSec : undefined
     )
+    const tBuilt = performance.now()
     store.hydrate(snap)
+    wfLog('perf', 'editor store hydrate — full snapshot (slow path)', {
+      buildMs: Math.round(tBuilt - tStart),
+      hydrateMs: Math.round(performance.now() - tBuilt),
+      totalMs: Math.round(performance.now() - tStart),
+      sentenceCount: sentenceTokenTimeline.length,
+      tokenCount,
+      hasPeaksJson: !!waveformPeaksJsonData,
+      peakPixels: waveformPeaksJsonData?.length ?? 0
+    })
   }, [sentenceTokenTimeline, waveformPeaksJsonData, rawWaveformTimelineDurationSec])
 
   /** 디바운스 없이 동기 useMemo 로 만든 stitched 결과의 로그/진단만 별도 effect 에서 처리 */
@@ -3043,7 +3511,10 @@ export default function App(): ReactElement {
     worker.onmessage = (event: MessageEvent<SilenceWorkerResponse>) => {
       if (cancelled) return
       const next = normalizeWorkerLines(event.data.lines ?? [])
-      setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(next))
+      /** 1,473 word 통째 재commit 도 transition 으로 격하 — silence-split 직후 UI freeze 차단 */
+      startTransition(() => {
+        setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(next))
+      })
       setGapFillWhenBuildingVrew(false)
       setSilenceSplitPending(false)
       silenceSplitRunKeyRef.current = runKey
@@ -3093,6 +3564,13 @@ export default function App(): ReactElement {
   const [waveformLineIndex, setWaveformLineIndex] = useState<number | null>(null)
   const [waveformWordId, setWaveformWordId] = useState<string | null>(null)
   const [peaksZoomViewRange, setPeaksZoomViewRange] = useState<PeaksZoomViewRange | null>(null)
+  /**
+   * 자르기 성공 직후 한 번 — `vrewRows` 가 새 `subtitles` 로 커밋된 뒤
+   *  `focusWaveformWord(line, wordIndexInVrew)` 로 **분할된 왼쪽 조각**(가시 인덱스 동일)을 선택한다.
+   *  같은 틱에 `setWaveformWordId` 만 호출하면 id/행 배열 타이밍이 어긋져 파형 뷰가 튀는 문제가 있다.
+   */
+  const postSplitWaveformFocusRef = useRef<{ lineIndex: number; wordIndexInVrew: number } | null>(null)
+  const [postSplitWaveformFocusCommit, setPostSplitWaveformFocusCommit] = useState(0)
 
   useEffect(() => {
     if (!videoPath || subtitles.length === 0) return
@@ -3159,14 +3637,46 @@ export default function App(): ReactElement {
    */
   const splitWordAtEditSecFromWaveform = useCallback(
     (lineIndex: number, wordIndexInVrew: number, splitEditSec: number) => {
-      if (!Number.isFinite(splitEditSec)) return
-      const splitMediaSec = mapEditToMediaSec(splitEditSec)
+      /** [진단 3] 자르기 진입 — 인자/매핑 결과를 그대로 기록 */
+      const splitMediaSec = Number.isFinite(splitEditSec) ? mapEditToMediaSec(splitEditSec) : NaN
+      wfLog('peaks', 'splitWordAtEditSecFromWaveform 진입 [diag-3]', {
+        lineIndex,
+        wordIndexInVrew,
+        splitEditSec,
+        splitMediaSec
+      })
+      if (!Number.isFinite(splitEditSec)) {
+        wfLog('peaks', 'splitWordAtEditSecFromWaveform reject [diag-3] splitEditSec 비정상', {
+          splitEditSec
+        })
+        return
+      }
+      postSplitWaveformFocusRef.current = null
       setGapFillWhenBuildingVrew(false)
+      /**
+       * 분할 직후 좌측 조각의 새 id 를 같은 React batch 에서 `setWaveformWordId` 로 박는다.
+       *  - 이렇게 하지 않으면 subtitles 만 먼저 갱신되고 activeWordId 는 한 프레임 뒤에 따라잡혀,
+       *    그 사이 자식 `SubtitleWaveformCanvas` 가 `wi === -1` 상태로 한 번 렌더 → 파형이 “휙” 튀는 현상이 발생.
+       *  - reducer 에서 id 를 계산해 외부 변수에 담아두고, applySubtitleChange 호출 직후 setState 로 적용.
+       */
+      let newLeftWordId: string | null = null
       applySubtitleChange((prev) => {
-        if (lineIndex < 0 || lineIndex >= prev.length) return prev
+        if (lineIndex < 0 || lineIndex >= prev.length) {
+          wfLog('peaks', 'splitWord reject [diag-3] lineIndex 범위 벗어남', {
+            lineIndex,
+            totalLines: prev.length
+          })
+          return prev
+        }
         const line = prev[lineIndex]
         const words = line.words ?? []
-        if (words.length === 0 || wordIndexInVrew < 0) return prev
+        if (words.length === 0 || wordIndexInVrew < 0) {
+          wfLog('peaks', 'splitWord reject [diag-3] words 비었거나 vrew idx 음수', {
+            wordsLen: words.length,
+            wordIndexInVrew
+          })
+          return prev
+        }
 
         let visibleSeen = -1
         let storageIdx = -1
@@ -3179,27 +3689,130 @@ export default function App(): ReactElement {
             }
           }
         }
-        if (storageIdx < 0) return prev
+        if (storageIdx < 0) {
+          wfLog('peaks', 'splitWord reject [diag-3] storageIdx 미발견', {
+            lineIndex,
+            wordIndexInVrew,
+            visibleSeen,
+            wordsLen: words.length
+          })
+          return prev
+        }
 
         const w = words[storageIdx]
         const a = Math.min(w.start, w.end)
         const b = Math.max(w.start, w.end)
         const minSpan = 0.01
-        if (!(b > a + minSpan * 2)) return prev
+        if (!(b > a + minSpan * 2)) {
+          wfLog('peaks', 'splitWord reject [diag-3] 단어 길이 < 2*minSpan', {
+            lineIndex,
+            storageIdx,
+            word: w.word,
+            a,
+            b,
+            span: b - a,
+            minSpan
+          })
+          return prev
+        }
         const t = Math.max(a + minSpan, Math.min(b - minSpan, splitMediaSec))
-        if (!(t > a + 1e-6 && t < b - 1e-6)) return prev
+        if (!(t > a + 1e-6 && t < b - 1e-6)) {
+          wfLog('peaks', 'splitWord reject [diag-3] t 가 단어 내부 아님', {
+            lineIndex,
+            storageIdx,
+            word: w.word,
+            a,
+            b,
+            splitMediaSec,
+            t,
+            tFromA: t - a,
+            tToB: b - t
+          })
+          return prev
+        }
+        wfLog('peaks', 'splitWord 실행 [diag-3]', {
+          lineIndex,
+          storageIdx,
+          word: w.word,
+          a,
+          b,
+          splitMediaSec,
+          t
+        })
 
-        const left: SubtitleWord = { ...w, start: a, end: t }
-        const right: SubtitleWord = { ...w, start: t, end: b }
+        /**
+         * 시각 t 비율에 맞춰 글자도 두 조각으로 — 사용자가 “이 시점 이후 글자” 와 “이전 글자” 를
+         * 각각 가지는 두 단어가 되도록 한다 (한 글자뿐이면 같은 글자를 양쪽에 유지).
+         */
+        const { left: leftText, right: rightText } = splitWordTextAtMediaCut(w.word, a, b, t)
+        const leftFinal = leftText.length > 0 ? leftText : w.word
+        const rightFinal = rightText.length > 0 ? rightText : w.word
+        /**
+         * 분할 체인 — 좌측은 `${parent}1`, 우측은 `${parent}2` 가 누적된다.
+         * 어댑터(`vrewSubtitleAdapter`)가 이 chain 을 `block_{g}_{slot}_{chain}` 형태 ID 로 변환해,
+         * 자르기 후에도 활성 단어 ID 가 의미 있게 새로워져 트림/뷰가 정상 갱신되도록 한다.
+         */
+        const parentChain = w.splitChain ?? ''
+        const leftChain = `${parentChain}1`
+        const rightChain = `${parentChain}2`
+        const left: SubtitleWord = {
+          ...w,
+          start: a,
+          end: t,
+          word: leftFinal,
+          splitChain: leftChain
+        }
+        const right: SubtitleWord = {
+          ...w,
+          start: t,
+          end: b,
+          word: rightFinal,
+          splitChain: rightChain
+        }
+        /** 분할 직후 포커스: 가시 인덱스는 그대로 — 왼쪽 조각이 여전히 `wordIndexInVrew` 자리에 있다. */
+        postSplitWaveformFocusRef.current = { lineIndex, wordIndexInVrew }
+        /**
+         * 좌측 조각이 어댑터에서 받게 될 안정 ID 를 reducer 안에서 미리 계산한다.
+         *  포맷은 `vrewSubtitleAdapter` 의 `gapFill:false` 경로와 동일해야 한다.
+         *    baseId = block_{lineIndex+1}_{storageIdx+1}, suffix = '_${leftChain}'
+         */
+        newLeftWordId = `${makeRowWordBlockId(lineIndex + 1, storageIdx + 1)}_${leftChain}`
         const nextWords = [
           ...words.slice(0, storageIdx),
           left,
           right,
           ...words.slice(storageIdx + 1)
         ]
-        const updated: SubtitleLine = { ...line, words: nextWords }
+        const updated: SubtitleLine = {
+          ...line,
+          words: nextWords,
+          /** 글자 분할로 라인 text 도 재계산 — sentenceTokenTimeline 동기화 시 일관성 유지. */
+          text: nextWords
+            .filter((x) => x.isDeleted !== true)
+            .map((x) => x.word)
+            .join(' ')
+            .trim()
+        }
         return [...prev.slice(0, lineIndex), updated, ...prev.slice(lineIndex + 1)]
       })
+      /**
+       * 분할 성공 시 — subtitles 업데이트와 같은 batch 에서 활성 단어 ID 를 좌측 새 ID 로 강제.
+       *  이렇게 해야 자식 캔버스가 처음부터 새 vrewRows 와 일치하는 activeWordId 로 렌더되어
+       *  `wi === -1` 폴백을 거치지 않고 viewWin 도 튀지 않는다.
+       */
+      if (newLeftWordId != null) {
+        wfLog('peaks', 'splitWord 분할 직후 좌측 포커스 강제 [diag-3]', {
+          lineIndex,
+          wordIndexInVrew,
+          newLeftWordId
+        })
+        setWaveformLineIndex(lineIndex)
+        setWaveformWordId(newLeftWordId)
+        postSplitWaveformFocusRef.current = null
+      } else if (postSplitWaveformFocusRef.current != null) {
+        // 폴백(드물게 reducer 가 다른 경로로 진입한 경우): 기존 effect 기반 포커스로
+        setPostSplitWaveformFocusCommit((c) => c + 1)
+      }
     },
     [applySubtitleChange, mapEditToMediaSec]
   )
@@ -3214,15 +3827,126 @@ export default function App(): ReactElement {
    * 파형(Peaks)은 gap-fill 무음 더미 단어마다 세그먼트가 생기는데, 자막 카드 칩은 원본 단어만 있어 개수·경계가 어긋남.
    * tombstone 이 있거나 사용자가 끈 경우 gap-fill 을 끄고 vrew 단어 배열을 자막과 1:1로 맞춘다.
    */
-  const vrewRows = useMemo(
-    () =>
-      subtitleLinesToVrewRows(subtitles, {
-        gapFill: shouldFillGapsWhenBuildingVrewRows(gapFillWhenBuildingVrew, subtitlesContainDeletedWords),
-        // 자막 단어는 미디어 축이라 Peaks 줌·세그먼트와 맞추려면 프로그램(편집) 축으로 매핑
-        mapWordMediaToProgram: (ms, me) => ({ start: mapMediaToEditSec(ms), end: mapMediaToEditSec(me) })
-      }),
-    [subtitles, gapFillWhenBuildingVrew, subtitlesContainDeletedWords, mapMediaToEditSec]
+  /**
+   * **`mapWordMediaToProgram` 을 useCallback 으로 안정화 — vrewRowCache(Incremental) 의 cache key 가 매번 변하면 효과 0.**
+   * 매 vrewRows useMemo 호출에서 새 화살표 함수를 넘기면 `vrewRowCache` 가 모든 line 에서 miss 되어
+   * 1473 word 전체가 재빌드. mapMediaToEditSec 가 변할 때만 새 reference 가 되도록 useCallback.
+   */
+  const mapWordMediaToProgramForVrew = useCallback(
+    (ms: number, me: number) => ({
+      start: mapMediaToEditSec(ms),
+      end: mapMediaToEditSec(me)
+    }),
+    [mapMediaToEditSec]
   )
+
+  const vrewRowsRaw = useMemo(
+    () => {
+      const t0 = performance.now()
+      const out = subtitleLinesToVrewRows(subtitles, {
+        gapFill: shouldFillGapsWhenBuildingVrewRows(
+          gapFillWhenBuildingVrew,
+          subtitlesContainDeletedWords
+        ),
+        mapWordMediaToProgram: mapWordMediaToProgramForVrew
+      })
+      const ms = performance.now() - t0
+      if (ms > 5) {
+        const wordCount = subtitles.reduce(
+          (acc, l) => acc + (l.words?.length ?? 0),
+          0
+        )
+        wfLog('perf', 'vrewRows 빌드', {
+          ms: Math.round(ms),
+          lineCount: subtitles.length,
+          wordCount,
+          gapFill: shouldFillGapsWhenBuildingVrewRows(
+            gapFillWhenBuildingVrew,
+            subtitlesContainDeletedWords
+          )
+        })
+      }
+      return out
+    },
+    [subtitles, gapFillWhenBuildingVrew, subtitlesContainDeletedWords, mapWordMediaToProgramForVrew]
+  )
+  /**
+   * `subtitleLinesToVrewRows` 내부는 WeakMap 으로 `SubtitleRow` 를 캐시하므로 element reference 는 안정.
+   * 하지만 `lines.map(...)` 이 항상 새 array 를 만들어 `SubtitleVirtualList` 가 받는 prop reference 가 매 렌더 변한다.
+   * element-wise 동일하면 prev array 그대로 유지 → `SubtitleVirtualList` `rowProps` useMemo 와 자식 row reconcile 모두 skip.
+   */
+  const vrewRows = useStableArrayReference(vrewRowsRaw) as SubtitleRow[]
+
+  /**
+   * SubtitleVirtualList 로 들어가는 1,473 word x 303 line 의 prop 을 background priority 로 격하 — 추출 직후 첫 commit 의 main thread 점유 시간을 줄여
+   * 컨트롤이 즉시 반응하게 한다. 다른 소비처(재생 동기화, peaks 계산 등) 는 즉시값 그대로.
+   */
+  const deferredSubtitlesForUi = useDeferredValue(subtitles)
+  const deferredVrewRowsForUi = useDeferredValue(vrewRows)
+
+  /**
+   * `SubtitleDataProvider` 가 **즉시** `subtitles` 를 들고 있으므로(`SubtitleVirtualRow` 가 wordRail 을 그리는 소스),
+   * 같은 컴포넌트로 흘러가는 `vrewRows` 도 즉시여야 한다. 둘이 한 commit 안에서 박자가 어긋나면 칩의 `chipWordId`
+   * (deferred)와 `wordRail` 의 단어 시간(즉시)이 매칭되지 않아 더블클릭이 wrong storage index 를 잡고
+   * `focusWaveformWord` 가 early-return — 파형이 안 열리고 hover caret 표시도 다른 단어로 이동한다.
+   *
+   * deferred 는 추출 직후 1,473단어 첫 commit 페인트 비용을 낮추는 용도였는데, tombstone/split 가 매우 빈번한
+   * 본 워크플로우에선 deferred 가 더 큰 비일관 비용을 만든다 → 항상 즉시값을 사용한다.
+   */
+  void deferredSubtitlesForUi
+  void deferredVrewRowsForUi
+  const subtitlesForSubtitleVirtualList = subtitles
+  const vrewRowsForSubtitleVirtualList = vrewRows
+
+  /**
+   * 자막 추출 완료 후에도 오버레이를 유지하고, deferred 리스트 prop 이 실제 값과 동기화된 뒤
+   * (paint 한 단계 이후) 닫는다 → 진행률 100% 직후 곧바로 정렬된 카드가 보이게 함.
+   */
+  useEffect(() => {
+    if (!isExtracting || !extractAwaitListPaint) return
+    if (subtitles.length === 0) return
+    if (deferredSubtitlesForUi !== subtitles) return
+    if (deferredVrewRowsForUi !== vrewRows) return
+    let cancelled = false
+    let raf2 = 0
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        if (cancelled) return
+        queueMicrotask(() => {
+          if (cancelled) return
+          setIsExtracting(false)
+          setProgress(0)
+          setExtractAwaitListPaint(false)
+        })
+      })
+    })
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(raf1)
+      cancelAnimationFrame(raf2)
+    }
+  }, [
+    isExtracting,
+    extractAwaitListPaint,
+    subtitles,
+    deferredSubtitlesForUi,
+    vrewRows,
+    deferredVrewRowsForUi
+  ])
+
+  /** deferred 동기화가 막히는 비정상 시 오버레이 무한 대기 방지 */
+  useEffect(() => {
+    if (!isExtracting || !extractAwaitListPaint) return
+    const t = window.setTimeout(() => {
+      wfLog('perf', 'extract overlay reveal fallback (15s timeout)', {
+        ts: new Date().toISOString()
+      })
+      setIsExtracting(false)
+      setProgress(0)
+      setExtractAwaitListPaint(false)
+    }, 15000)
+    return () => window.clearTimeout(t)
+  }, [isExtracting, extractAwaitListPaint])
 
   /** Peaks 줌 — 편집 타임라인 경계(splice 파형·세그먼트와 동일 축) */
   const waveformLineZoomBounds = useMemo(() => {
@@ -3279,6 +4003,13 @@ export default function App(): ReactElement {
     },
     [vrewRows, waveformLineIndex, waveformWordId, isWaveformFocusSuppressed]
   )
+
+  useEffect(() => {
+    const p = postSplitWaveformFocusRef.current
+    if (p == null) return
+    postSplitWaveformFocusRef.current = null
+    focusWaveformWord(p.lineIndex, p.wordIndexInVrew, 'double-click')
+  }, [subtitles, postSplitWaveformFocusCommit, focusWaveformWord])
 
   const onWaveformWordDoubleClick = useCallback(
     (lineIndex: number, wordIndex: number) => {
@@ -3540,6 +4271,15 @@ export default function App(): ReactElement {
       if (pendingMediaCuts.length > 0) {
         const cuts = pendingMediaCuts
         const hint = pendingHint
+        /**
+         * 가상 타임라인 갱신은 **같은 핸들러 안에서** 호출 → React 18 자동 batching 으로 `setSentenceTokenTimeline`
+         * 과 한 commit 에 묶인다. 이전엔 `setTimeout(0)` 로 분리했지만, 그 사이에 발생한 Ctrl+Z 가
+         * `virtualTimelineDeletedRef.current` 의 옛 값을 읽고 → 그 후 setTimeout 이 늦게 fire 해서
+         * 가상 삭제가 다시 복원되지 않는 race 가 있었다.
+         *
+         * 파형 픽셀 데이터(`stitchedWaveformJsonComputed`) 는 이미 `useDeferredValue` 로 한 단계 늦춰지므로
+         * 같은 commit 에 묶여도 740k 픽셀 재페인트가 첫 페인트를 막지 않는다.
+         */
         setVirtualTimelineDeleted((vp) => {
           let acc = vp
           for (const r of cuts) acc = mergeDeletedMediaIntoTimeline(acc, r, hint)
@@ -3601,6 +4341,7 @@ export default function App(): ReactElement {
       if (pendingMediaCuts.length > 0) {
         const cuts = pendingMediaCuts
         const hint = pendingHint
+        /** 동일 — undo 정합성을 위해 같은 핸들러에 묶고, stitched 픽셀 redraw 는 useDeferredValue 가 처리 */
         setVirtualTimelineDeleted((vp) => {
           let acc = vp
           for (const r of cuts) acc = mergeDeletedMediaIntoTimeline(acc, r, hint)
@@ -3628,6 +4369,11 @@ export default function App(): ReactElement {
     applySubtitleChange((prev) => mergeEmptySubtitleWithPrevious(prev, index) ?? prev)
   }, [applySubtitleChange])
 
+  /**
+   * videoPath 가 null 일 때 idle 리셋 — `setX([])` 가 매번 새 array 참조라 React eager bail-out 실패,
+   * 그게 1.2kHz 렌더 폭주의 진짜 원인이었음. functional setter 로 prev 가 이미 빈 array 면 prev 자체를 반환해 bail 보장.
+   * → chain 끊김: sentenceTokenTimeline ref 안정 → subtitles useMemo ref 안정 → commitEditSecToUi ref 안정 → 본 effect 재발화 0.
+   */
   useEffect(() => {
     if (!videoPath) {
       playbackEnginePhaseRef.current = 'idle'
@@ -3642,9 +4388,9 @@ export default function App(): ReactElement {
       commitEditSecToUi(0)
       setDurationSec(0)
       setIsPlaying(false)
-      setSentenceTokenTimeline([])
-      setCutRanges([])
-      setVirtualTimelineDeleted([])
+      setSentenceTokenTimeline((prev) => (prev.length === 0 ? prev : []))
+      setCutRanges((prev) => (prev.length === 0 ? prev : []))
+      setVirtualTimelineDeleted((prev) => (prev.length === 0 ? prev : []))
     }
   }, [videoPath, commitEditSecToUi])
 
@@ -3836,7 +4582,10 @@ export default function App(): ReactElement {
     masterAudioToMediaSec,
     mediaToMasterAudioSec,
     isDeleteGuardActive,
-    playbackSnapshot,
+    playbackSnapshot.pendingRevision,
+    playbackSnapshot.committedRevision,
+    playbackSnapshot.mapperReady,
+    playbackSnapshot.masterMode,
     queuePlaybackIntent,
     startSyncedPlayback,
     beginPlaybackSession,
@@ -3938,6 +4687,36 @@ export default function App(): ReactElement {
         wordText: meta?.wordText ?? null,
         lineIndex: meta?.lineIndex ?? null
       })
+      /** [진단 4] waveform.log 에도 동일 정보를 흘려, edge-drag commit 직후 흐름을 한 파일에서 추적. */
+      const guards = {
+        isBuffering,
+        isEdlSessionActive: isEdlSessionActive(),
+        phase: playbackEnginePhaseRef.current
+      }
+      wfLog('peaks', 'dispatchPlayRangeIntentFromWaveform 진입 [diag-4]', {
+        startSec,
+        endSec,
+        wordId: meta?.wordId ?? null,
+        wordText: meta?.wordText ?? null,
+        lineIndex: meta?.lineIndex ?? null,
+        ...guards,
+        oneShotSession: oneShotSessionRef.current
+      })
+      /**
+       * 모든 가드가 idle 인데 oneShotSession 만 남아있으면 stale — 이전 세션이 정상 종료되지 않아
+       * `playEditRange` 의 세션 디듑 가드에 영원히 걸려 같은 단어 재생이 차단된다. 명시적으로 정리.
+       */
+      if (
+        !isBuffering &&
+        !isEdlSessionActive() &&
+        playbackEnginePhaseRef.current === 'idle' &&
+        oneShotSessionRef.current != null
+      ) {
+        wfLog('peaks', 'dispatchPlayRangeIntentFromWaveform stale one-shot 정리 [diag-4]', {
+          oneShotSession: oneShotSessionRef.current
+        })
+        clearOneShotSession('dispatch idle stale clear')
+      }
       if (isBuffering || isEdlSessionActive() || playbackEnginePhaseRef.current !== 'idle') {
         queuePlaybackIntent({ kind: 'playRange', startSec, endSec })
         timelineEditLog('playback', 'waveform playRange queued(non-idle or buffering)', {
@@ -3947,11 +4726,21 @@ export default function App(): ReactElement {
           enginePlaybackDesired: isEdlSessionActive(),
           phase: playbackEnginePhaseRef.current
         })
+        wfLog('peaks', 'dispatchPlayRangeIntentFromWaveform → queued [diag-4]', {
+          startSec,
+          endSec,
+          ...guards
+        })
         return
       }
+      wfLog('peaks', 'dispatchPlayRangeIntentFromWaveform → dispatch [diag-4]', {
+        startSec,
+        endSec,
+        ...guards
+      })
       dispatchPlayRangeIntent(startSec, endSec)
     },
-    [dispatchPlayRangeIntent, isBuffering, isEdlSessionActive, queuePlaybackIntent]
+    [dispatchPlayRangeIntent, isBuffering, isEdlSessionActive, queuePlaybackIntent, clearOneShotSession]
   )
 
   const dispatchTogglePlayIntent = useCallback(() => {
@@ -4180,7 +4969,14 @@ export default function App(): ReactElement {
         el.pause()
       }
       if (softStop) {
-        oneShotSoftStopUntilRef.current = performance.now() + 450
+        /**
+         * **소프트 가드 길이 단축 — 450ms → 120ms.**
+         * 길게 두면 `seekToSubtitleStart` user-trusted 시크와 `idle drift guard` 모두
+         * 자연 종료 직후 한참 동안 막혀 "재생이 조금 느린" 체감을 만든다. idle drift 가
+         * 즉시 강제 seek 하면 video seeking → 다른 effect 재진입으로 무한 업데이트 가드가
+         * 뜨는 경합이 있어 짧게라도 유지하는 게 안전하다.
+         */
+        oneShotSoftStopUntilRef.current = performance.now() + 120
         timelineEditLog('playback', `soft-stop guard armed(${reason})`, {
           untilMs: oneShotSoftStopUntilRef.current,
           targetEditSec: editResolved,
@@ -4232,6 +5028,13 @@ export default function App(): ReactElement {
       finalizePlaybackStopRef.current = null
     }
   }, [finalizePlaybackStop])
+
+  useEffect(() => {
+    clearOneShotSessionRef.current = clearOneShotSession
+    return () => {
+      clearOneShotSessionRef.current = null
+    }
+  }, [clearOneShotSession])
 
   useEffect(() => {
     const v = videoRef.current
@@ -4437,6 +5240,29 @@ export default function App(): ReactElement {
       }
 
       if (masterAudio.paused) {
+        /**
+         * **WebAudio 자연 종료 후 oneShotSession 정리.**
+         * `WebAudioMasterPlayback.scheduleFromEdl` 의 BufferSource 가 onended 로 종료되면
+         * `playingFlag=false` 가 되지만 외부에 통지가 없다. 그러면 RAF 의 첫 `waEngine.isPlaying()`
+         * 블록을 건너뛰고 이 분기로 떨어지는데, 이때 정리가 없으면 `oneShotSessionRef` 가
+         * `state:"playing"` 인 채 남아 이후 모든 단어 클릭이 "세션 디듑(active one-shot)" 으로
+         * 큐잉되어 재생/포커스 둘 다 막힌다. RAF 종료 직전에 한 번 마무리한다.
+         */
+        const lingering = oneShotSessionRef.current
+        if (lingering && lingering.state === 'playing') {
+          oneShotSessionRef.current = { ...lingering, state: 'done' }
+          playbackCommandRouterRef.current.finishRange(playbackSessionIdRef.current)
+          playbackSessionIdRef.current = 0
+          finalizePlaybackStop('raf one-shot natural end', {
+            mediaSec: previewEndMediaSecRef.current ?? lingering.end,
+            soft: true
+          })
+          clearOneShotSession('raf natural-end (engine stopped, master paused)')
+          wfLog('peaks', 'startSyncedPlayback [diag-6] one-shot 자연 종료 정리', {
+            sessionId: lingering.id,
+            sessionEndMediaSec: lingering.end
+          })
+        }
         rafPlayheadRef.current = null
         return
       }
@@ -4728,18 +5554,32 @@ export default function App(): ReactElement {
     const prev = undoStackRef.current.pop()
     if (!prev) return
     setSentenceTokenTimeline((curTl) => {
-      redoStackRef.current.push(sentenceTokenTimelineToSubtitleLines(curTl))
-      return subtitleLinesToSentenceTokenTimeline(prev)
+      const curSubs = sentenceTokenTimelineToSubtitleLines(curTl)
+      redoStackRef.current.push({
+        subtitles: curSubs,
+        virtualTimelineDeleted: virtualTimelineDeletedRef.current,
+        cutRanges: cutRangesRef.current
+      })
+      return subtitleLinesToSentenceTokenTimeline(prev.subtitles)
     })
+    setVirtualTimelineDeleted(prev.virtualTimelineDeleted)
+    setCutRanges(prev.cutRanges)
   }, [])
 
   const redoSubtitleChange = useCallback(() => {
     const next = redoStackRef.current.pop()
     if (!next) return
     setSentenceTokenTimeline((curTl) => {
-      undoStackRef.current.push(sentenceTokenTimelineToSubtitleLines(curTl))
-      return subtitleLinesToSentenceTokenTimeline(next)
+      const curSubs = sentenceTokenTimelineToSubtitleLines(curTl)
+      undoStackRef.current.push({
+        subtitles: curSubs,
+        virtualTimelineDeleted: virtualTimelineDeletedRef.current,
+        cutRanges: cutRangesRef.current
+      })
+      return subtitleLinesToSentenceTokenTimeline(next.subtitles)
     })
+    setVirtualTimelineDeleted(next.virtualTimelineDeleted)
+    setCutRanges(next.cutRanges)
   }, [])
 
   useEffect(() => {
@@ -4767,6 +5607,7 @@ export default function App(): ReactElement {
         return
       }
       setVideoPath(absPath)
+      setExtractAwaitListPaint(false)
       setSentenceTokenTimeline([])
       setCutRanges([])
       setVirtualTimelineDeleted([])
@@ -4790,9 +5631,48 @@ export default function App(): ReactElement {
     const p = pendingAutoTranscribeRef.current
     if (!p || !isVideoFilePath(p)) return
     pendingAutoTranscribeRef.current = null
+    setExtractAwaitListPaint(false)
     setIsExtracting(true)
     window.api.sendVideoDropPath(p)
   }, [modelReady, busy, isExtracting])
+
+  /**
+   * 단어 추출 직후 카드가 잠시 붙어 보이는 현상 진단용 —
+   * 메인 스레드 50ms 초과 작업을 자동으로 `waveform.log`(scope: perf) 에 기록.
+   * PerformanceObserver(longtask) 는 크롬/Electron 에서 표준 지원 — 비용은 거의 0.
+   */
+  useEffect(() => {
+    if (typeof PerformanceObserver === 'undefined') return
+    let installed = false
+    try {
+      const obs = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          const dur = Math.round(entry.duration)
+          if (dur < 50) continue
+          wfLog('perf', 'longtask', {
+            ms: dur,
+            startTimeMs: Math.round(entry.startTime),
+            name: entry.name,
+            entryType: entry.entryType,
+            ts: new Date().toISOString()
+          })
+        }
+      })
+      obs.observe({ entryTypes: ['longtask'] })
+      installed = true
+      return () => {
+        try {
+          obs.disconnect()
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* longtask 미지원 환경 — 무시 */
+    }
+    if (!installed) return
+    return
+  }, [])
 
   useEffect(() => {
     const offExport = window.api.onExportProgress((payload) => {
@@ -4816,11 +5696,60 @@ export default function App(): ReactElement {
       setProgress((prev) => Math.max(prev, Math.min(100, pct)))
     })
     const offC = window.api.onTranscribeComplete((raw) => {
-      setIsExtracting(false)
-      setProgress(0)
       setTranscribeMode('cpu')
-      const lines = parseSubtitleLines((raw as { subtitles?: unknown })?.subtitles)
-      setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(lines))
+      const rawLines = parseSubtitleLines((raw as { subtitles?: unknown })?.subtitles)
+      /**
+       * `end > start` 가 깨진 단어는 카드 레이아웃·캐럿 측정에서 NaN/음수 폭을 만들어
+       * `useLayoutEffect` ↔ `ResizeObserver` 가 매 렌더 다른 값을 set 하는 형태의
+       * Maximum update depth 루프의 잠재 트리거가 된다. 추출 직후 한 번만 정리한다.
+       */
+      let droppedWords = 0
+      const lines = rawLines.map((l) => {
+        if (!l.words || l.words.length === 0) return l
+        const cleaned = l.words.filter((w) => {
+          const ok =
+            Number.isFinite(w.start) &&
+            Number.isFinite(w.end) &&
+            w.end > w.start
+          if (!ok) droppedWords += 1
+          return ok
+        })
+        return cleaned.length === l.words.length ? l : { ...l, words: cleaned }
+      })
+      const wordCount = lines.reduce((acc, l) => acc + (l.words?.length ?? 0), 0)
+      if (lines.length === 0 || wordCount === 0) {
+        setExtractAwaitListPaint(false)
+        setIsExtracting(false)
+        setProgress(0)
+        wfLog('perf', '단어 추출 완료 — 빈 결과', {
+          lineCount: lines.length,
+          wordCount,
+          ts: new Date().toISOString()
+        })
+        return
+      }
+      const t0 = performance.now()
+      wfLog('perf', '단어 추출 완료 — setSentenceTokenTimeline 시작', {
+        lineCount: lines.length,
+        wordCount,
+        droppedInvalidWords: droppedWords,
+        ts: new Date().toISOString()
+      })
+      /**
+       * 1,473 word × 303 line 의 첫 commit 은 main thread longtask 를 유발.
+       * `startTransition` + `useDeferredValue`(리스트 prop) 와 함께, 오버레이는
+       * `extractAwaitListPaint` + effect 가 deferred 가 따라잡힌 뒤에만 닫는다 (100% 직후 곧바로 정렬된 화면).
+       */
+      setProgress(100)
+      setExtractAwaitListPaint(true)
+      startTransition(() => {
+        setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(lines))
+      })
+      wfLog('perf', '단어 추출 완료 — setSentenceTokenTimeline 호출 끝', {
+        callMs: Math.round(performance.now() - t0),
+        lineCount: lines.length,
+        wordCount
+      })
       setSilenceSplitPending(true)
       silenceSplitRunKeyRef.current = null
       const wp = (raw as { waveform_peaks?: { ok?: boolean; path?: string | null } }).waveform_peaks
@@ -4836,6 +5765,7 @@ export default function App(): ReactElement {
       redoStackRef.current = []
     })
     const offE = window.api.onTranscribeError(() => {
+      setExtractAwaitListPaint(false)
       setIsExtracting(false)
       setProgress(0)
       setTranscribeMode('cpu')
@@ -5969,7 +6899,7 @@ export default function App(): ReactElement {
                     <div ref={subtitleListRootRef} className="subtitle-list-stack">
                       <SubtitleDataProvider subtitles={subtitles}>
                         <SubtitleVirtualList
-                          subtitles={subtitles}
+                          subtitles={subtitlesForSubtitleVirtualList}
                           activeSubtitleIndexRef={activeSubtitleIndexRef}
                           playheadSecRef={playheadEditSecRef}
                           isPlaying={isPlaying}
@@ -5997,7 +6927,7 @@ export default function App(): ReactElement {
                           waveformActiveWordId={waveformWordId}
                           onWaveformWordDoubleClick={onWaveformWordDoubleClick}
                           onWaveformExpandedLineWordClick={onWaveformExpandedLineWordClick}
-                          vrewRows={vrewRows}
+                          vrewRows={vrewRowsForSubtitleVirtualList}
                           onWaveformMountLayout={onWaveformMountLayout}
                           mediaDurationSec={waveformMediaDurationCapSec ?? waveformUiDurationSec}
                           peaksZoomViewRange={peaksZoomViewRange}
@@ -6035,6 +6965,7 @@ export default function App(): ReactElement {
                         autoFocusSeekBlockToken={waveformAutoSeekBlockToken}
                         mediaDurationSec={waveformMediaDurationCapSec ?? waveformUiDurationSec}
                         onPeaksDurationComparedToMedia={onPeaksDurationComparedToMedia}
+                        wordEdgeSubtitleBridge={wordEdgeSubtitleBridge}
                       />
                     ) : null}
                     {modelReady && subtitlesForList.length > 0 ? (
@@ -6081,9 +7012,11 @@ export default function App(): ReactElement {
             aria-labelledby="extract-modal-title"
           >
             <h2 id="extract-modal-title" className="extract-modal-title">
-              {transcribeMode === 'gpu'
-                ? 'GPU모드로 자막을 추출하고 있습니다...'
-                : 'CPU모드로 자막을 추출하고 있습니다...'}
+              {extractAwaitListPaint
+                ? '자막 화면을 불러오는 중…'
+                : transcribeMode === 'gpu'
+                  ? 'GPU모드로 자막을 추출하고 있습니다...'
+                  : 'CPU모드로 자막을 추출하고 있습니다...'}
             </h2>
             <div
               className="extract-progress-track"

@@ -6,6 +6,7 @@ import { createPortal } from 'react-dom'
 import type { MutableRefObject, PointerEvent as ReactPointerEvent } from 'react'
 import {
   forwardRef,
+  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -15,6 +16,9 @@ import {
   useState
 } from 'react'
 import type { JsonWaveformData } from '../../shared/waveformJson'
+import type { SubtitleLine } from '../../shared/subtitles'
+import { storageWordIndexFromVisibleNonDeletedIndex } from '../../shared/subtitles'
+import type { EdgeDragResult } from '../../shared/subtitleWordEdgeDrag'
 import type { SubtitleRow, Word } from './components/vrewPeaksEditor/types'
 import { wfLog } from './components/vrewPeaksEditor/waveformDebugLog'
 import {
@@ -33,6 +37,7 @@ import {
   type WaveformFillBand
 } from './waveform/waveformCanvasDrawing'
 import { useWaveformViewWindow } from './waveform/useWaveformViewWindow'
+import { useWordEdgeDrag } from './useWordEdgeDrag'
 
 export type SubtitleWaveformPeaksHandle = {
   onWaveMountDirty: () => void
@@ -43,6 +48,18 @@ export type PeaksZoomViewRange = {
   lineIndex: number
   windowStart: number
   windowEnd: number
+}
+
+/** 파형 트림 핸들 → `SentenceTokenTimeline` 경유 단어 시각 SSOT 갱신 (`useWordEdgeDrag`) */
+export type WordEdgeSubtitleBridge = {
+  getSubtitleLines: () => readonly SubtitleLine[]
+  onSubtitleLinesCommit: (lines: SubtitleLine[]) => void
+  /** 드래그 중 미리보기 — undo 스택 없이 SSOT 만 갱신 */
+  onSubtitleLinesPreview?: (lines: SubtitleLine[]) => void
+  /** 캔슬 시 드래그 시작 스냅샷으로 복원 */
+  onSubtitleLinesRevert?: (snapshot: SubtitleLine[]) => void
+  editSecToMediaSec: (editSec: number) => number
+  mediaSecToEditSec: (mediaSec: number) => number
 }
 
 export type SubtitleWaveformPeaksProps = {
@@ -93,6 +110,11 @@ export type SubtitleWaveformPeaksProps = {
   onUndo?: () => void
   /** 핸들 위 시간 라벨 */
   formatEditSec?: (sec: number) => string
+  /**
+   * 단어 좌·우 트림 핸들을 `applyWordEdgeDrag` 에 연결할 때만 지정.
+   * `gapFill` Vrew 행과는 저장소 인덱스가 어긋날 수 있어 비활성화하는 편이 안전하다.
+   */
+  wordEdgeSubtitleBridge?: WordEdgeSubtitleBridge | null
 }
 
 function clampPx(n: number, lo: number, hi: number): number {
@@ -101,10 +123,19 @@ function clampPx(n: number, lo: number, hi: number): number {
 
 const MIN_TRIM_SPAN_SEC = 0.038
 
+const EMPTY_SUBTITLE_LINES: readonly SubtitleLine[] = []
+
 /** 커넥터용 — Peaks 세그먼트 없음 */
 const peaksStubRef: { current: PeaksConnectorLike | null } = { current: null }
 
-export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, SubtitleWaveformPeaksProps>(
+/**
+ * `React.memo` 로 래핑 — Undo/Redo 처럼 `precomputedWaveformJson` 이 **이전 reference** 와 같으면
+ * (LRU exact hit) 전체 컴포넌트 트리 re-render 와 내부 16개 effect 재발화를 건너뛴다.
+ *
+ * 새 삭제로 `stitchedWaveformJsonComputed` reference 가 매번 변하는 경우엔 memo 가 skip 못해도,
+ * 다른 자식(`SubtitleVirtualList` 등) 변경으로 인한 부모 re-render 에서 stitched 가 그대로면 skip 한다.
+ */
+const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, SubtitleWaveformPeaksProps>(
   function SubtitleWaveformCanvas(
     {
       rows,
@@ -129,7 +160,8 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       mediaDurationSec: mediaDurationSecProp,
       onPeaksDurationComparedToMedia,
       onUndo,
-      formatEditSec
+      formatEditSec,
+      wordEdgeSubtitleBridge
     },
     ref
   ) {
@@ -198,22 +230,13 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
     activeWordIdRef.current = activeWordId
     const isPlayingWaveRef = useRef(false)
     isPlayingWaveRef.current = Boolean(isPlaying)
-
     const mediaHint = mediaDurationSecProp != null && mediaDurationSecProp > 0 ? mediaDurationSecProp : undefined
     const metrics = useMemo(
       () => resolvePeaksTimelineMetrics(precomputedWaveformJson, mediaHint),
       [precomputedWaveformJson, mediaHint]
     )
 
-    const {
-      viewWin,
-      setViewWin,
-      viewWinRef,
-      onZoomPointerDown,
-      onZoomPointerMove,
-      onZoomPointerUp,
-      onZoomWheel
-    } = useWaveformViewWindow(metrics, zoomOuterRef)
+    const { viewWin, setViewWin, viewWinRef } = useWaveformViewWindow(metrics, zoomOuterRef)
 
     const durExact = useMemo(
       () => exactTimelineDurationSecFromWaveformJson(precomputedWaveformJson, mediaHint),
@@ -257,20 +280,41 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       cb({ lineIndex: li, windowStart: vw.start, windowEnd: vw.end })
     }, [onZoomViewRange])
 
+    /**
+     * 마지막으로 viewWin 을 *재계산* 한 키 — `activeLineIndex|가시단어슬롯|expandL|expandR`.
+     * 자르기 직후 `activeWordId` 만 바뀌고(좌측 조각의 새 id) **같은 슬롯**이면 키가 동일해
+     *  `computeWordContextWindow` 를 다시 돌리지 않아 파형 뷰가 튀지 않는다.
+     */
+    const lastViewKeyRef = useRef<string | null>(null)
+
     /** 활성 단어 ±이웃 중심 줌(확장 시 한 단어씩) — 선택 없을 때만 전체 줄 폴백 */
     useLayoutEffect(() => {
       if (activeLineIndex === null || !metrics) {
         setViewWin(null)
+        lastViewKeyRef.current = null
         return
       }
       const row = rowsRef.current[activeLineIndex]
       const words = row?.words ?? []
       const wid = activeWordIdRef.current
       const wi = wid ? words.findIndex((x) => x.id === wid) : -1
+      const key = `${activeLineIndex}|${wi}|${expandL}|${expandR}`
+      if (key === lastViewKeyRef.current && viewWinRef.current) return
+      /**
+       * **stale id 보호** — split 직후처럼 부모가 activeWordId 를 새 조각으로 옮기기 전 한 프레임,
+       *  자식 effect 가 `wi === -1` 상태에서 먼저 돌아 전체 라인 폴백 뷰로 빠지면서 파형이 “휙” 튀어 보인다.
+       *  그 짧은 transient 동안 기존 viewWin 을 그대로 유지하고 lastViewKey 도 업데이트하지 않는다.
+       *  다음 렌더에서 새 id 가 도착하면 정상적으로 재계산.
+       */
+      if (wid && wi < 0 && viewWinRef.current) return
+      lastViewKeyRef.current = key
+
       const mediaCap = metrics.durationSec
 
       if (wi >= 0 && words.length > 0 && wid) {
-        const ctx = computeWordContextWindow(words, wi, expandL, expandR, { mediaDurationSec: mediaCap })
+        const ctx = computeWordContextWindow(words, wi, expandL, expandR, {
+          mediaDurationSec: mediaCap
+        })
         if (ctx) {
           const ns = ctx.windowStart
           const ne = ctx.windowEnd
@@ -409,6 +453,12 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       return activeWords.findIndex((w) => w.id === activeWordId)
     }, [activeWords, activeWordId])
 
+    const centerWordIndexRef = useRef(centerWordIndex)
+    centerWordIndexRef.current = centerWordIndex
+
+    const wordEdgeBridgeRef = useRef(wordEdgeSubtitleBridge)
+    wordEdgeBridgeRef.current = wordEdgeSubtitleBridge
+
     const contextClampLimits = useMemo(() => {
       if (centerWordIndex < 0 || activeWords.length === 0) return null
       const li = Math.max(0, centerWordIndex - 1 - expandL)
@@ -455,27 +505,42 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       return bands
     }, [centerWordIndex, viewWin, editRange, activeWords])
 
-    /** 다른 줄·단어 선택 시 트림·확장 초기화 */
+    /**
+     * 다른 줄·단어 선택 시, **그리고 자르기로 활성 단어의 시간이 바뀐 직후** 트림 범위를 새 단어로 재설정.
+     *
+     * 자르기(`splitWordAtEditSecFromWaveform`)는 동일 `wordId` 를 좌·우 두 단어가 공유하게 만들어
+     * `activeWordId` / `centerWordIndex` 가 그대로 유지된다. 그러면 옛 의존성 배열
+     * `[activeLineIndex, activeWordId, centerWordIndex]` 만으로는 effect 가 실행되지 않아
+     * `editRange` 가 분할 전 폭에 남아 “파형은 갱신 안 된 것처럼” 보인다.
+     *
+     * `activeWordSpan` 의 start/end 가 바뀔 때(분할로 좌측 반쪽이 됨)도 다시 잡아 준다.
+     */
+    const activeWordSpanSig =
+      activeWordSpan != null ? `${activeWordSpan.start}:${activeWordSpan.end}` : null
     useEffect(() => {
-      if (centerWordIndex < 0 || activeLineIndex == null || !activeWordId) {
+      /**
+       * **stale id 보호** — split 직후처럼 activeWordId 가 새 행 배열에 아직 없는 transient 동안에는
+       *  editRange/expand 를 비우지 않고 그대로 둔다. 다음 렌더에 부모가 새 id 로 갱신하면
+       *  centerWordIndex 가 다시 유효해져 이 effect 가 정상 경로로 들어간다.
+       */
+      if (activeLineIndex == null || !activeWordId) {
         setEditRange(null)
         setExpandL(0)
         setExpandR(0)
+        return
+      }
+      if (centerWordIndex < 0) {
+        // stale: 다음 렌더 기다림 — 기존 editRange/expand 유지
         return
       }
       const w = rowsRef.current[activeLineIndex]?.words?.[centerWordIndex]
-      if (!w) {
-        setEditRange(null)
-        setExpandL(0)
-        setExpandR(0)
-        return
-      }
+      if (!w) return
       const lo = Math.min(w.start, w.end)
       const hi = Math.max(w.start, w.end)
       setEditRange({ start: lo, end: hi })
       setExpandL(0)
       setExpandR(0)
-    }, [activeLineIndex, activeWordId, centerWordIndex])
+    }, [activeLineIndex, activeWordId, centerWordIndex, activeWordSpanSig])
 
     /** 타임코드·외부 편집으로 단어 경계가 바뀌면 트림만 클램프 */
     useEffect(() => {
@@ -513,6 +578,119 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
       return a + fr * (b - a)
     }, [])
 
+    const getSubtitleLinesStable = useCallback(
+      () => wordEdgeBridgeRef.current?.getSubtitleLines() ?? EMPTY_SUBTITLE_LINES,
+      []
+    )
+
+    const mediaSecAtPointerX = useCallback(
+      (clientX: number) => {
+        const b = wordEdgeBridgeRef.current
+        if (!b) return 0
+        return b.editSecToMediaSec(pointerToTimeOnStrip(clientX))
+      },
+      [pointerToTimeOnStrip]
+    )
+
+    const onWordEdgePreview = useCallback((result: EdgeDragResult) => {
+      const b = wordEdgeBridgeRef.current
+      if (!b) return
+      /**
+       * **SSOT 미리보기는 의도적으로 호출하지 않는다** — 드래그 중에는 단어블록이 움직이지 않고,
+       *  포인터를 떼는 순간(`onCommit`)에 한 번에 합치기/분해가 적용된다.
+       *  매 프레임 SSOT 를 갱신하면 같은 부분 흡수/분해 알고리즘이 누적 입력으로 돌아가
+       *  cross-line round-trip 이 깨지고 시각이 “뚝뚝” 점프하므로 비활성.
+       *  트림 핸들 시각 위치(`setEditRange`)만 부드럽게 미리 보여 사용자 피드백을 유지.
+       */
+      const li = activeLineIndexRef.current
+      const cwi = centerWordIndexRef.current
+      if (li == null || cwi < 0) return
+      const line = result.subtitles[li]
+      const si = storageWordIndexFromVisibleNonDeletedIndex(line, cwi)
+      const w = si >= 0 ? line?.words?.[si] : undefined
+      if (!w || w.isDeleted) return
+      const lo = Math.min(w.start, w.end)
+      const hi = Math.max(w.start, w.end)
+      setEditRange({ start: b.mediaSecToEditSec(lo), end: b.mediaSecToEditSec(hi) })
+    }, [])
+
+    const onWordEdgeCommit = useCallback((result: EdgeDragResult) => {
+      /**
+       * [진단 1] commit 직후 변경된 단어들의 lineIndex/wordIndex/start/end 와
+       *          tombstone 된 단어들의 위치를 상세히 기록한다.
+       *          - 단어 수와 좌표가 의도대로 바뀌었는지, cross-line 으로 새어 나가지 않았는지 확인.
+       */
+      const mutatedDetail = result.mutated.map((r) => {
+        const w = result.subtitles[r.lineIndex]?.words?.[r.wordIndex]
+        return {
+          li: r.lineIndex,
+          wi: r.wordIndex,
+          word: w?.word ?? null,
+          start: w?.start ?? null,
+          end: w?.end ?? null,
+          isDeleted: w?.isDeleted ?? null
+        }
+      })
+      const tombstoneDetail = result.tombstoned.map((r) => {
+        const w = result.subtitles[r.lineIndex]?.words?.[r.wordIndex]
+        return {
+          li: r.lineIndex,
+          wi: r.wordIndex,
+          word: w?.word ?? null,
+          start: w?.start ?? null,
+          end: w?.end ?? null
+        }
+      })
+      wfLog('peaks', 'trim-handle commit (useWordEdgeDrag) [diag-1]', {
+        mutated: result.mutated.length,
+        tombstoned: result.tombstoned.length,
+        mutatedDetail,
+        tombstoneDetail
+      })
+      wordEdgeBridgeRef.current?.onSubtitleLinesCommit(result.subtitles)
+
+      /**
+       * [진단 2] commit 직후 — activeWordId / centerWordIndex / editRange / cutSec
+       *          이 어떻게 남았는지 캡처. setEditRange · setCutSec 가 비동기라 ref 로 본다.
+       *          ref 는 다음 paint 에서 최신화되므로 microtask + 짧은 timeout 두 단계로 기록.
+       */
+      const captureAfterCommit = (tag: string) => {
+        wfLog('peaks', `commit 직후 상태 캡처 [diag-2 ${tag}]`, {
+          activeLineIndex: activeLineIndexRef.current,
+          activeWordId: activeWordIdRef.current,
+          centerWordIndex: centerWordIndexRef.current,
+          editRange: editRangeRef.current,
+          cutSec: cutSecRef.current
+        })
+      }
+      queueMicrotask(() => captureAfterCommit('microtask'))
+      window.setTimeout(() => captureAfterCommit('t+16ms'), 16)
+    }, [])
+
+    const onWordEdgeDragFinish = useCallback(({ cancelled }: { cancelled: boolean }) => {
+      setDraggingHandle(null)
+      if (!cancelled) return
+      const li = activeLineIndexRef.current
+      const cwi = centerWordIndexRef.current
+      if (li == null || cwi < 0) return
+      const w = rowsRef.current[li]?.words?.[cwi]
+      if (!w) return
+      const lo = Math.min(w.start, w.end)
+      const hi = Math.max(w.start, w.end)
+      setEditRange({ start: lo, end: hi })
+    }, [])
+
+    const { startDrag: startWordEdgeDrag } = useWordEdgeDrag({
+      getSubtitles: getSubtitleLinesStable,
+      secAtClientX: mediaSecAtPointerX,
+      onPreview: onWordEdgePreview,
+      onCommit: onWordEdgeCommit,
+      onDragFinish: onWordEdgeDragFinish,
+      onDragRevert: (snapshot) => {
+        wordEdgeBridgeRef.current?.onSubtitleLinesRevert?.(snapshot)
+      }
+    })
+
     /**
      * 트림 핸들 드래그 — 끝 단어 경계(=현재 뷰 좌·우 끝)에 닿으면 잠시 브레이크를 걸어
      * 핸들이 그 자리에서 멈추도록 한다. 커서가 경계 밖으로 일정 픽셀(`BRAKE_PX_OVERSHOOT`)
@@ -521,6 +699,36 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
      */
     const onTrimHandlePointerDown = useCallback(
       (which: 'start' | 'end') => (e: ReactPointerEvent<HTMLDivElement>) => {
+        const bridge = wordEdgeBridgeRef.current
+        const li = activeLineIndexRef.current
+        const cwi = centerWordIndexRef.current
+        if (bridge && li != null && cwi >= 0) {
+          const lines = bridge.getSubtitleLines()
+          const storageWi = storageWordIndexFromVisibleNonDeletedIndex(lines[li], cwi)
+          if (storageWi >= 0) {
+            wfLog('peaks', 'trim-handle → useWordEdgeDrag', {
+              which,
+              lineIndex: li,
+              centerWordIndex: cwi,
+              storageWi
+            })
+            setDraggingHandle(which === 'start' ? 'trimStart' : 'trimEnd')
+            startWordEdgeDrag(
+              e,
+              { lineIndex: li, wordIndex: storageWi },
+              which === 'start' ? 'start' : 'end'
+            )
+            return
+          }
+        }
+
+        wfLog('peaks', 'trim-handle → local-only fallback', {
+          which,
+          hasBridge: !!bridge,
+          activeLineIndex: li,
+          centerWordIndex: cwi,
+          activeWordId
+        })
         e.stopPropagation()
         e.preventDefault()
         expandLeftTokensRef.current = 4
@@ -605,7 +813,7 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
         window.addEventListener('pointerup', up)
         window.addEventListener('pointercancel', up)
       },
-      [pointerToTimeOnStrip]
+      [pointerToTimeOnStrip, startWordEdgeDrag]
     )
 
     const trimHandlePct = useMemo(() => {
@@ -1073,14 +1281,14 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
                 <div
                   ref={zoomOuterRef}
                   className="relative isolate h-28 w-full min-w-0 overflow-hidden rounded-xl border-2 border-white/85 bg-[#0c1018]"
-                  onWheel={onZoomWheel}
                 >
+                  {/**
+                   * 파형 본체 드래그(패닝) **비활성** — 사용자가 파형을 잡아 좌우로 끌면
+                   *  뷰가 미디어 길이만큼 흘러내려 단어 트림/자르기에 방해가 되므로
+                   *  포인터 이벤트를 받지 않게 둔다. 휠 줌은 외곽(`zoomOuterRef`)에서 그대로 유효.
+                   */}
                   <div
-                    className="absolute inset-0 z-0 cursor-grab touch-none active:cursor-grabbing"
-                    onPointerDown={onZoomPointerDown}
-                    onPointerMove={onZoomPointerMove}
-                    onPointerUp={onZoomPointerUp}
-                    onPointerCancel={onZoomPointerUp}
+                    className="pointer-events-none absolute inset-0 z-0"
                     aria-hidden
                   />
                   <canvas
@@ -1304,3 +1512,5 @@ export const SubtitleWaveformPeaks = forwardRef<SubtitleWaveformPeaksHandle, Sub
     )
   }
 )
+
+export const SubtitleWaveformPeaks = memo(SubtitleWaveformPeaksImpl)

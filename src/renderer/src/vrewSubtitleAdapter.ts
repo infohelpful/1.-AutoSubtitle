@@ -32,6 +32,24 @@ export type SubtitleLinesToVrewOptions = {
   mapWordMediaToProgram?: MediaToProgramMapper
 }
 
+/**
+ * Incremental row 캐시 — 변경되지 않은 line 은 이전 SubtitleRow reference 를 그대로 반환한다.
+ *
+ * **이유**: 1473 word × 매 편집마다 `lines.map(...)` 전체가 새 row 객체를 만들면
+ *  SubtitleVirtualRow 가 받는 `vrewRows[index]` 가 항상 새 reference → 모든 행이 reconciliation.
+ *  변경된 카드 1개만 새 row 가 되도록 line·gapFill·mapMP 묶음을 key 로 캐시한다.
+ *
+ *  WeakMap key 는 line 자체. value 는 그 line 으로 만든 row + 사용된 (gapFill, mapMP) 묶음.
+ *  mapMP 가 다른 closure (예: 컷 변경 후) 면 cache miss 로 처리해 재빌드.
+ */
+type VrewRowCacheEntry = {
+  gapFill: boolean
+  mapMP: MediaToProgramMapper | undefined
+  row: SubtitleRow
+  idx: number
+}
+const vrewRowCache: WeakMap<SubtitleLine, VrewRowCacheEntry> = new WeakMap()
+
 /** 한 줄 자막 ↔ Peaks 한 행 (단어 타임코드가 없으면 줄 전체를 한 단어로) */
 export function subtitleLinesToVrewRows(lines: SubtitleLine[], options?: SubtitleLinesToVrewOptions): SubtitleRow[] {
   const gapFill = options?.gapFill !== false
@@ -42,104 +60,142 @@ export function subtitleLinesToVrewRows(lines: SubtitleLine[], options?: Subtitl
     mapMP ? mapMP(start, end) : { start, end }
 
   return lines.map((line, idx) => {
-    const rowId = `sub-${idx}`
-
-    const warnIfInvalid = (payload: { start: number; end: number; words: SubtitleWord[] }) => {
-      if (!import.meta.env.DEV) return
-      const v = validateSubtitleLineWords(payload)
-      if (!v.ok) console.warn('[wordContract]', rowId, v.errors)
+    /**
+     * Incremental cache hit — line reference 동일 + 같은 gapFill/mapMP/idx 면 row reference 재사용.
+     * (idx 가 변하면 rowId/wordId 가 달라지므로 cache miss 처리)
+     */
+    const cached = vrewRowCache.get(line)
+    if (
+      cached !== undefined &&
+      cached.gapFill === gapFill &&
+      cached.mapMP === mapMP &&
+      cached.idx === idx
+    ) {
+      return cached.row
     }
+    const row = buildVrewRowFromLine(line, idx, gapFill, toProg)
+    vrewRowCache.set(line, { gapFill, mapMP, row, idx })
+    return row
+  })
+}
 
-    if (line.words && line.words.length > 0) {
-      const visibleOnly = line.words.filter((w) => !w.isDeleted)
-      if (!gapFill) {
-        const words = visibleOnly.map((w, wi) => {
-          const p = toProg(w.start, w.end)
-          return {
-            id: makeRowWordBlockId(idx + 1, wi + 1),
-            text: w.word,
-            start: p.start,
-            end: p.end,
-            ...(w.isSilence ? ({ isSilence: true } as const) : {})
-          }
-        })
-        const lineProg = toProg(line.start, line.end)
-        warnIfInvalid({
-          start: lineProg.start,
-          end: lineProg.end,
-          words: words.map((x) => ({
-            start: x.start,
-            end: x.end,
-            word: x.text,
-            ...(x.isSilence ? { isSilence: true as const } : {})
-          }))
-        })
-        return { id: rowId, words, lineText: line.text }
-      }
+function buildVrewRowFromLine(
+  line: SubtitleLine,
+  idx: number,
+  gapFill: boolean,
+  toProg: (start: number, end: number) => { start: number; end: number }
+): SubtitleRow {
+  const rowId = `sub-${idx}`
 
-      const nonSilent = visibleOnly.filter((w) => !w.isSilence)
-      let subtitleWords: SubtitleWord[]
+  const warnIfInvalid = (payload: { start: number; end: number; words: SubtitleWord[] }): void => {
+    if (!import.meta.env.DEV) return
+    const v = validateSubtitleLineWords(payload)
+    if (!v.ok) console.warn('[wordContract]', rowId, v.errors)
+  }
 
-      if (nonSilent.length === 0) {
-        subtitleWords = [
-          {
-            start: line.start,
-            end: line.end,
-            word: line.text.trim() || ' ',
-            isSilence: false
-          }
-        ]
-      } else {
-        // gap-fill 은 미디어 축에서 수행 — 단어 사이 무음 더미도 미디어 축 기준 계산
-        subtitleWords = fillGapsInSubtitleWords(
-          { start: line.start, end: line.end, words: visibleOnly },
-          {
-            gapThresholdSec: DEFAULT_GAP_THRESHOLD_SEC,
-            includeLineBoundaries: true,
-            stripPreviousSilences: true
-          }
-        )
-      }
-
-      warnIfInvalid({ start: line.start, end: line.end, words: subtitleWords })
-
-      const words = subtitleWords.map((w, wi) => {
+  if (line.words && line.words.length > 0) {
+    const visibleOnly = line.words.filter((w) => !w.isDeleted)
+    if (!gapFill) {
+      /**
+       * `gapFill: false` 경로의 Vrew 행 ID는 *원본 저장 인덱스 + 1* 을 슬롯으로 쓴다.
+       * — 단어가 tombstone 되어도 살아남은 단어들의 id 가 바뀌지 않아 `activeWordId` 가 유지되고,
+       *   `useWordEdgeDrag` 같은 후속 편집이 끊김 없이 이어진다.
+       */
+      const indexed = line.words
+        .map((w, storageIdx) => ({ w, storageIdx }))
+        .filter(({ w }) => !w.isDeleted)
+      const words = indexed.map(({ w, storageIdx }) => {
         const p = toProg(w.start, w.end)
+        /**
+         * 자르기로 분할된 단어는 `splitChain` 이 있다 — 동일 storage 슬롯이라도
+         *  좌·우가 서로 다른 안정 ID 를 갖도록 `block_{g}_{slot}_{chain}` 형태로 접미사 부착.
+         */
+        const baseId = makeRowWordBlockId(idx + 1, storageIdx + 1)
+        const id = w.splitChain ? `${baseId}_${w.splitChain}` : baseId
         return {
-          id: makeRowWordBlockId(idx + 1, wi + 1),
+          id,
           text: w.word,
           start: p.start,
           end: p.end,
           ...(w.isSilence ? ({ isSilence: true } as const) : {})
         }
       })
+      const lineProg = toProg(line.start, line.end)
+      warnIfInvalid({
+        start: lineProg.start,
+        end: lineProg.end,
+        words: words.map((x) => ({
+          start: x.start,
+          end: x.end,
+          word: x.text,
+          ...(x.isSilence ? { isSilence: true as const } : {})
+        }))
+      })
       return { id: rowId, words, lineText: line.text }
     }
 
-    const lineProg = toProg(line.start, line.end)
-    const fallback = {
-      id: makeRowWordBlockId(idx + 1, 1),
-      text: line.text.trim() || ' ',
-      start: lineProg.start,
-      end: lineProg.end
-    }
-    warnIfInvalid({
-      start: lineProg.start,
-      end: lineProg.end,
-      words: [
+    const nonSilent = visibleOnly.filter((w) => !w.isSilence)
+    let subtitleWords: SubtitleWord[]
+
+    if (nonSilent.length === 0) {
+      subtitleWords = [
         {
-          start: fallback.start,
-          end: fallback.end,
-          word: fallback.text
+          start: line.start,
+          end: line.end,
+          word: line.text.trim() || ' ',
+          isSilence: false
         }
       ]
-    })
-    return {
-      id: rowId,
-      words: [fallback],
-      lineText: line.text
+    } else {
+      // gap-fill 은 미디어 축에서 수행 — 단어 사이 무음 더미도 미디어 축 기준 계산
+      subtitleWords = fillGapsInSubtitleWords(
+        { start: line.start, end: line.end, words: visibleOnly },
+        {
+          gapThresholdSec: DEFAULT_GAP_THRESHOLD_SEC,
+          includeLineBoundaries: true,
+          stripPreviousSilences: true
+        }
+      )
     }
+
+    warnIfInvalid({ start: line.start, end: line.end, words: subtitleWords })
+
+    const words = subtitleWords.map((w, wi) => {
+      const p = toProg(w.start, w.end)
+      return {
+        id: makeRowWordBlockId(idx + 1, wi + 1),
+        text: w.word,
+        start: p.start,
+        end: p.end,
+        ...(w.isSilence ? ({ isSilence: true } as const) : {})
+      }
+    })
+    return { id: rowId, words, lineText: line.text }
+  }
+
+  const lineProg = toProg(line.start, line.end)
+  const fallback = {
+    id: makeRowWordBlockId(idx + 1, 1),
+    text: line.text.trim() || ' ',
+    start: lineProg.start,
+    end: lineProg.end
+  }
+  warnIfInvalid({
+    start: lineProg.start,
+    end: lineProg.end,
+    words: [
+      {
+        start: fallback.start,
+        end: fallback.end,
+        word: fallback.text
+      }
+    ]
   })
+  return {
+    id: rowId,
+    words: [fallback],
+    lineText: line.text
+  }
 }
 
 export type MergeVrewRowsIntoSubtitleLinesOptions = {

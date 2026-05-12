@@ -30,7 +30,7 @@ export function toWaveformLogDetail(u: unknown): unknown {
  * 외 scope(`seek`/`diag`/`view`/`segments`/`lifecycle`/`playback`/`connector`/`ui` 등)는 호출은 유지하되
  * IPC 송신을 막아 파일 폭증을 차단한다.
  */
-const WF_LOG_FILE_SCOPES = new Set<string>(['peaks', 'audio'])
+const WF_LOG_FILE_SCOPES = new Set<string>(['peaks', 'audio', 'perf'])
 
 /**
  * Renderer → (조건부) main process → `%AppData%/AutoSubtitle/logs/waveform.log`.

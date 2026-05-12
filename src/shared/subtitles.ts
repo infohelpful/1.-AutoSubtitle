@@ -14,6 +14,13 @@ export type SubtitleWord = {
   isSilence?: boolean
   /** true: 비파괴 삭제(tombstone). 배열·타임스탬프는 유지하되 표시·재생·내보내기에서 제외 */
   isDeleted?: boolean
+  /**
+   * 자르기(`splitWordAtEditSecFromWaveform`) 분할 흔적 — 분할된 조각마다 부모 chain 에
+   *  '1'(좌), '2'(우) 를 누적해 붙여 동일 storage 슬롯에서도 좌·우가 서로 다른 안정 ID 를
+   *  갖도록 만든다(`vrewSubtitleAdapter` 가 어댑트할 때 `block_{g}_{slot}_{splitChain}` 형태).
+   *  값이 없으면 분할되지 않은 원본 단어 — 기존 ID 그대로 부여.
+   */
+  splitChain?: string
 }
 
 export type SubtitleLine = {
@@ -21,6 +28,11 @@ export type SubtitleLine = {
   end: number
   text: string
   words?: SubtitleWord[]
+  /**
+   * true: 줄 자체가 tombstone — 줄 안의 모든 단어가 `isDeleted` 가 되었을 때 함께 표시.
+   * UI 에서 카드 자체를 숨기지만 배열에서는 제거하지 않아 추후 복구가 가능하다.
+   */
+  isDeleted?: boolean
 }
 
 /** 화면 표시·내보내기용 — `isDeleted` tombstone 과 무음 더미를 제외한 단어들 */
@@ -29,6 +41,28 @@ export function visibleSubtitleWords(
 ): SubtitleWord[] {
   if (!words || words.length === 0) return []
   return words.filter((w) => !w.isDeleted && !w.isSilence)
+}
+
+/**
+ * `subtitleLinesToVrewRows(..., { gapFill: false })` 한 줄의 단어 순서는
+ * `line.words` 에서 `isDeleted` 가 아닌 항목만 원래 순서대로 고른 것과 같다.
+ * 그 **보이는** 순서 인덱스 → `SubtitleLine.words` 저장소 인덱스.
+ *
+ * gap-fill 로 무음 더미가 삽입된 행과는 대응하지 않는다.
+ */
+export function storageWordIndexFromVisibleNonDeletedIndex(
+  line: SubtitleLine | undefined,
+  visibleIndex: number
+): number {
+  if (!line?.words?.length || visibleIndex < 0) return -1
+  const words = line.words
+  let v = 0
+  for (let wi = 0; wi < words.length; wi++) {
+    if (words[wi]!.isDeleted) continue
+    if (v === visibleIndex) return wi
+    v++
+  }
+  return -1
 }
 
 /** 목록·내보내기용 — 삭제·무음 플레이스홀더는 제외한 표시 문자열 */

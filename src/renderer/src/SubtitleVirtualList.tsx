@@ -17,6 +17,11 @@ import type { RowComponentProps } from 'react-window'
 import type { MouseEvent } from 'react'
 
 import type { SubtitleLine } from '../../shared/subtitles'
+import {
+  DISPLAY_CROSS_CARD_GAP_ABSORB_MS,
+  DISPLAY_GAP_ABSORB_MS,
+  resolveDisplayEndSec
+} from '../../shared/subtitleDisplayTime'
 import type { JsonWaveformData } from '../../shared/waveformJson'
 import {
   nearestValidStorageCaret,
@@ -159,7 +164,7 @@ export type SubtitleListRowProps = {
 const shouldDeleteAudioForWords = (words: Array<{ isSilence?: boolean }> | undefined): boolean =>
   Boolean(words && words.length > 0 && words.every((w) => Boolean(w.isSilence)))
 
-function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
+function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) {
   const {
     index,
     style,
@@ -205,6 +210,19 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
   const requestFocusCaret = requestFocusWord
   const row = subtitles[index]
   if (!row) return null
+  /**
+   * 모든 단어가 tombstone(`isDeleted`) 된 카드 — UI 에서는 빈 카드로 남지 않도록 0 높이 숨김 행을 렌더.
+   * 배열에서 줄을 실제로 제거하지는 않아 인덱스 기반 콜백 / 캐럿 매핑이 그대로 유지된다.
+   * `useDynamicRowHeight` 의 ResizeObserver 가 0px 을 측정 → 가상 목록에서 자리가 회수된다.
+   */
+  if (row.isDeleted === true) {
+    return (
+      <div
+        style={{ ...style, height: 0, padding: 0, margin: 0, overflow: 'hidden', pointerEvents: 'none' }}
+        aria-hidden="true"
+      />
+    )
+  }
   const [caretIndex, setCaretIndex] = useState(0)
   const [caretVisible, setCaretVisible] = useState(false)
   const [caretBlink, setCaretBlink] = useState(false)
@@ -262,14 +280,49 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     return out
   }, [row.words])
 
-  /** row.words 가 줄어들거나 tombstone 이 늘면 캐럿/선택 앵커를 유효 경계로 스냅 */
+  /**
+   * 카드 헤더와 마지막 단어 툴팁이 **동일한 끝 시각** 을 쓰도록 한 곳에서 계산.
+   *
+   * - 카드↔카드 사이 짧은 갭(≤ `DISPLAY_CROSS_CARD_GAP_ABSORB_MS`) 은 다음 카드 시작으로 흡수.
+   * - 단어↔단어 / 마지막 단어↔카드 끝 사이 짧은 갭(≤ `DISPLAY_GAP_ABSORB_MS`) 은 칩 툴팁에서 흡수.
+   * - 데이터(`row.end`, `rw.end`) 자체는 불변 — 본 값은 **표시 전용**.
+   */
+  const effectiveCardEndSec = resolveDisplayEndSec(
+    row.end,
+    subtitles[index + 1]?.start ?? null,
+    DISPLAY_CROSS_CARD_GAP_ABSORB_MS
+  )
+
+  /**
+   * row.words 변경 시 캐럿/선택 앵커의 **단일 소유자는 명시적 액션(`requestFocusCaret`)** 이다.
+   *  - Backspace/Delete/Split 핸들러가 setTimeout(0) 으로 `requestFocusCaret(index, target)` 을 호출해
+   *    의도한 자리에 캐럿을 둔다 — 본 effect 는 그 결과를 덮어쓰면 안 된다.
+   *  - 과거에 visible 축 환산(`storageCaret ↔ renderableCaret`) 으로 자동 정렬을 시도하면, 명시 액션과
+   *    race 가 나서 캐럿이 끝(또는 엉뚱한 자리) 으로 점프하는 “위치가 병신” 현상이 생겼다.
+   *  - 본 effect 는 (a) react-window 가상 리스트가 같은 인스턴스를 다른 `index` 행에 **재활용** 한 경우에만
+   *    캐럿을 재계산하고, (b) 그 외에는 단어 수가 줄어 storage 캐럿이 length 를 초과한 경우만 **boundary clamp**
+   *    한다. 그 외 valid 범위 내 캐럿은 그대로 유지한다.
+   */
+  const prevIndexRef = useRef<number>(index)
   useEffect(() => {
     const sw = row.words ?? []
-    setCaretIndex((prev) => nearestValidStorageCaret(sw, Math.max(0, Math.min(prev, sw.length))))
-    setSelectionAnchor((prev) =>
-      prev === null ? prev : nearestValidStorageCaret(sw, Math.max(0, Math.min(prev, sw.length)))
-    )
-  }, [row.words])
+    const prevIndex = prevIndexRef.current
+    prevIndexRef.current = index
+    if (prevIndex !== index) {
+      setCaretIndex((prev) => nearestValidStorageCaret(sw, Math.max(0, Math.min(prev, sw.length))))
+      setSelectionAnchor((prev) =>
+        prev === null ? prev : nearestValidStorageCaret(sw, Math.max(0, Math.min(prev, sw.length)))
+      )
+      return
+    }
+    // boundary clamp 만 — 명시 액션이 valid 위치를 설정했다면 그대로 유지된다.
+    setCaretIndex((prev) => (prev > sw.length ? nearestValidStorageCaret(sw, sw.length) : prev))
+    setSelectionAnchor((prev) => {
+      if (prev === null) return prev
+      if (prev > sw.length) return nearestValidStorageCaret(sw, sw.length)
+      return prev
+    })
+  }, [row.words, index])
 
   /**
    * 파형이 열린 줄: Peaks 실제 zoomview 구간과 줄 구간을 맞춘다.
@@ -393,7 +446,16 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
       return
     }
     const timeToPx = (t: number) => ((t - tw.windowStart) / tw.span) * innerRect.width
-    const chipEl = (wi: number) => document.getElementById(`subtitle-word-${index}-${wi}`)
+    /**
+     * `wi` 는 visible(wordRail) 인덱스. 칩 DOM id 는 `storageIndex` 로 만들어지므로(tombstone 이 있는 카드는
+     * `wi !== storageIndex`), visible 인덱스로 `getElementById` 하면 null 또는 **다른 칩**을 잡아 caret 좌표가
+     * tombstone 영역(다음 칩 안쪽)으로 잘못 계산된다. 반드시 `wordRail[wi].storageIndex` 로 룩업한다.
+     */
+    const chipEl = (wi: number) => {
+      const si = words[wi]?.storageIndex
+      if (si == null) return null
+      return document.getElementById(`subtitle-word-${index}-${si}`)
+    }
     /** 칩 경계 사이 공백의 가로 중앙(px, inner 기준) — 캐럿은 translateX(-50%)로 이 점에 맞춤 */
     const centers: number[] = new Array(n + 1)
     const innerW = innerRect.width
@@ -1035,7 +1097,18 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
    * 상태로 저장하는 caret 은 storage 축이며, 이동은 visible 단어 경계를 따른다.
    */
   const onCaretKeyDown = (e: KeyboardEvent<HTMLButtonElement>, renderableCi: number) => {
-    e.stopPropagation()
+    /**
+     * **Ctrl+Z / Ctrl+Y (또는 Ctrl+Shift+Z) 는 stopPropagation 하지 않는다.**
+     * caret 에 포커스가 있는 상태에서 단어 삭제 후 Ctrl+Z 를 누르면, 이전 코드는 무조건 stopPropagation 으로
+     * App-level window keydown 핸들러가 받지 못해 undo 가 묻혀 있었다. caret 핸들러는 'z'/'y' 를 처리하지 않으므로
+     * 이벤트가 window 까지 buble 하도록 그대로 둔다.
+     */
+    const isCtrlModifier = e.ctrlKey || e.metaKey
+    const lowerKey = e.key.toLowerCase()
+    const isUndoRedoHotkey = isCtrlModifier && (lowerKey === 'z' || lowerKey === 'y')
+    if (!isUndoRedoHotkey) {
+      e.stopPropagation()
+    }
     const subs = row.words ?? []
     const ci = renderableCaretToStorageCaret(subs, renderableCi)
     if (e.key === ' ' || e.code === 'Space') {
@@ -1449,9 +1522,14 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
         }}
         onBlurCapture={(e) => {
           // 클릭 전환 타이밍에서는 relatedTarget이 null일 수 있어 한 틱 뒤 실제 포커스 위치를 확인한다.
+          // setTimeout 으로 미루면 React SyntheticEvent 의 currentTarget 이 비워질 수 있으므로
+          // 클로저로 캡처해 두고 unmount 등 분리된 경우엔 articleRef 폴백을 본다.
+          const targetEl: HTMLElement | null = (e.currentTarget as HTMLElement) ?? null
           window.setTimeout(() => {
             const active = document.activeElement as Node | null
-            if (!active || !e.currentTarget.contains(active)) {
+            const rootEl = targetEl ?? articleRef.current
+            const stillInside = !!active && !!rootEl && rootEl.contains(active)
+            if (!stillInside) {
               clearRowCaretState(hoveredCaretIndex !== null)
               spaceSeekIntentRef.current = 'none'
             }
@@ -1462,7 +1540,7 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
           <div className="subtitle-card-times" aria-label="자막 구간">
             <span className="subtitle-time">{formatTimecode(row.start)}</span>
             <span className="subtitle-time-sep">→</span>
-            <span className="subtitle-time">{formatTimecode(row.end)}</span>
+            <span className="subtitle-time">{formatTimecode(effectiveCardEndSec)}</span>
           </div>
         </div>
         {wordRail.length > 0 ? (
@@ -1570,14 +1648,19 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                             activeChipCloseTimerRef.current = null
                           }
 
+                          /**
+                           * **`wi` (visible 인덱스) 를 넘겨야** 한다 — `focusWaveformWord` 는 `vrewRows[].words`
+                           * (visible 필터링) 를 인덱싱한다. 과거에 `storageWi` 를 넘기면 tombstone 이 생긴 직후
+                           * `storageWi !== wi` 라서 `w` 가 undefined → early return → 파형이 안 열렸다.
+                           */
                           /** detail>=2 는 더블클릭의 두 번째 click — 접기 타이머를 걸면 안 됨 */
                           if (isWaveActiveChip && e.detail === 1) {
                             activeChipCloseTimerRef.current = setTimeout(() => {
-                              onWaveformExpandedLineWordClick(index, storageWi)
+                              onWaveformExpandedLineWordClick(index, wi)
                               activeChipCloseTimerRef.current = null
                             }, 280)
                           } else if (!isWaveActiveChip) {
-                            onWaveformExpandedLineWordClick(index, storageWi)
+                            onWaveformExpandedLineWordClick(index, wi)
                           }
 
                           if (isPlaying) {
@@ -1609,9 +1692,25 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
                         if (!waveformEnabled || !onWaveformWordDoubleClick) return
                         e.preventDefault()
                         e.stopPropagation()
-                        onWaveformWordDoubleClick(index, storageWi)
+                        /** visible 인덱스(`wi`) — focusWaveformWord 가 vrewRows.words(visible-filtered) 인덱싱 */
+                        onWaveformWordDoubleClick(index, wi)
                       }}
-                      title={`${formatTimecode(rw.start)} ~ ${formatTimecode(rw.end)}`}
+                      title={(() => {
+                        const isLastChip = wi === wordRail.length - 1
+                        const nextStart = wordRail[wi + 1]?.start ?? null
+                        /**
+                         * 마지막 칩은 **카드 헤더 끝 시각과 항상 동치**가 되어야 한다 — 헤더가 120ms 까지 흡수하므로
+                         * 마지막 칩도 같은 임계로 `effectiveCardEndSec` 까지 흡수해서 표시값을 맞춘다.
+                         * 중간 칩은 단어↔단어 자연 침묵을 보존해야 하므로 50ms 그대로.
+                         */
+                        const nextBoundary = isLastChip ? effectiveCardEndSec : nextStart
+                        const absorbMs = isLastChip
+                          ? DISPLAY_CROSS_CARD_GAP_ABSORB_MS
+                          : DISPLAY_GAP_ABSORB_MS
+                        return `${formatTimecode(rw.start)} ~ ${formatTimecode(
+                          resolveDisplayEndSec(rw.end, nextBoundary, absorbMs)
+                        )}`
+                      })()}
                     >
                       <span
                         className={
@@ -1723,6 +1822,57 @@ function SubtitleVirtualRow(props: RowComponentProps<SubtitleListRowProps>) {
     </div>
   )
 }
+
+/**
+ * Incremental adapter 가 line/row reference 를 안정시켜도, react-window 의 `rowComponent` 는 매번
+ * `RowComponentProps` 새 객체를 받기 때문에 React.memo 없이는 모든 visible row 가 reconciliation 된다.
+ * 한 카드만 변경되어도 1473 word 의 약 30 행이 다 재렌더 → 약 850ms longtask.
+ *
+ * 다음 규칙으로 row 별 skip 한다:
+ *  1. **자기 row data 가 같으면 skip** — `subtitles[index]` / `vrewRows[index]` 가 reference 동일.
+ *  2. **펼침 상태가 안 바뀌면 skip** — 다른 줄의 펼침/접힘은 무관.
+ *  3. **펼친 줄에서만 `waveformActiveWordId` 비교** — 접힌 줄은 그 prop 무시.
+ *  4. **나머지 prop 은 reference 비교** — callbacks 는 useCallback 으로 안정되어 있으면 OK.
+ *
+ *  callbacks/플래그가 변경되는 드문 케이스(재생 토글, 무음 일괄 삭제 등) 에서는 모든 row 가 다시 그려지므로
+ *  정확성은 보장되며, 단순 단어 삭제 같은 hot path 에서만 큰 효과를 본다.
+ */
+const subtitleVirtualRowAreEqual = (
+  prev: RowComponentProps<SubtitleListRowProps>,
+  next: RowComponentProps<SubtitleListRowProps>
+): boolean => {
+  if (prev.index !== next.index) return false
+  if (prev.style !== next.style) return false
+  // 자기 row 의 핵심 데이터 비교
+  if (prev.subtitles[prev.index] !== next.subtitles[next.index]) return false
+  const prevVrew = prev.vrewRows?.[prev.index]
+  const nextVrew = next.vrewRows?.[next.index]
+  if (prevVrew !== nextVrew) return false
+  // 펼침 상태(자기 row 한정)
+  const wasExpanded = prev.waveformExpandedLineIndex === prev.index
+  const isExpanded = next.waveformExpandedLineIndex === next.index
+  if (wasExpanded !== isExpanded) return false
+  if (isExpanded && prev.waveformActiveWordId !== next.waveformActiveWordId) return false
+  // 나머지 prop 은 reference 비교 (subtitles/vrewRows/펼침 관련은 위에서 처리)
+  for (const key of Object.keys(next) as Array<keyof typeof next>) {
+    if (
+      key === 'subtitles' ||
+      key === 'vrewRows' ||
+      key === 'index' ||
+      key === 'style' ||
+      key === 'waveformExpandedLineIndex' ||
+      key === 'waveformActiveWordId'
+    )
+      continue
+    if ((prev as unknown as Record<string, unknown>)[key as string] !==
+        (next as unknown as Record<string, unknown>)[key as string]) {
+      return false
+    }
+  }
+  return true
+}
+
+const SubtitleVirtualRow = memo(SubtitleVirtualRowImpl, subtitleVirtualRowAreEqual)
 
 export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
   const { subtitles: subtitlesFromContext } = useSubtitleData()
@@ -1988,9 +2138,20 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
   )
 
   /** 고정 행 높이 대신 실제 카드 DOM 높이 측정 — 파형 펼침/접힘에 따라 행마다 빈 슬롯이 생기던 문제 완화 */
+  const tombstoneSig = useMemo(() => {
+    let s = ''
+    for (let i = 0; i < subtitles.length; i++) {
+      if (subtitles[i]?.isDeleted) s += `${i},`
+    }
+    return s
+  }, [subtitles])
   const dynamicRowHeightKey = useMemo(
-    () => `${subtitles.length}-${props.waveformExpandedLineIndex ?? 'x'}`,
-    [subtitles.length, props.waveformExpandedLineIndex]
+    /**
+     * tombstoneSig 를 key 에 합쳐 isDeleted 변화 시 `useDynamicRowHeight` 캐시가 무효화되도록 한다.
+     * — isDeleted 행이 0-height 로 변했는데 캐시된 152px 이 살아 있어 빈 공간이 남던 문제 차단.
+     */
+    () => `${subtitles.length}-${props.waveformExpandedLineIndex ?? 'x'}-${tombstoneSig}`,
+    [subtitles.length, props.waveformExpandedLineIndex, tombstoneSig]
   )
   const dynamicRowHeight = useDynamicRowHeight({
     defaultRowHeight: SUBTITLE_LIST_ROW_HEIGHT,

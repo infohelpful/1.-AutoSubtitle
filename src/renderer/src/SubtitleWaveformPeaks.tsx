@@ -13,5 +13,6 @@ export {
   SubtitleWaveformPeaks,
   type SubtitleWaveformPeaksHandle,
   type SubtitleWaveformPeaksProps,
-  type PeaksZoomViewRange
+  type PeaksZoomViewRange,
+  type WordEdgeSubtitleBridge
 } from './SubtitleWaveformCanvas'

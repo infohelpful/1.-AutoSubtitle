@@ -15,6 +15,13 @@ export type SubtitleWord = {
   /** true: 비파괴 삭제(tombstone). 배열·타임스탬프는 유지하되 표시·재생·내보내기에서 제외 */
   isDeleted?: boolean
   /**
+   * true: 단어 트림(엣지 드래그)으로 인접 단어에 흡수되어 tombstone 처리된 경우.
+   *  - 텍스트는 흡수한 단어로 옮겨갔고, 미디어 오디오는 그대로 유지된다(잘리지 않음).
+   *  - 따라서 stitched 파형 cut 으로 반영하지 *않는다*. `isDeleted` 일반 삭제(스킵 재생/내보내기)
+   *    과 구분하기 위한 비파괴 메타 플래그.
+   */
+  mergedByEdgeTrim?: boolean
+  /**
    * 자르기(`splitWordAtEditSecFromWaveform`) 분할 흔적 — 분할된 조각마다 부모 chain 에
    *  '1'(좌), '2'(우) 를 누적해 붙여 동일 storage 슬롯에서도 좌·우가 서로 다른 안정 ID 를
    *  갖도록 만든다(`vrewSubtitleAdapter` 가 어댑트할 때 `block_{g}_{slot}_{splitChain}` 형태).

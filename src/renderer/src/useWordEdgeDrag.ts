@@ -40,6 +40,8 @@ import {
 
 } from '../../shared/subtitleWordEdgeDrag'
 
+import { wfLog } from './components/vrewPeaksEditor/waveformDebugLog'
+
 
 
 function cloneSubtitleLines(lines: readonly SubtitleLine[]): SubtitleLine[] {
@@ -122,11 +124,69 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
 
     el: Element | null
 
+    /** pointerdown 시점의 클릭 sec — anchor + delta 계산용 */
+
+    clickSec: number
+
+    /** pointerdown 시점의 target edge sec (target.start 또는 target.end) — delta 적용 baseline */
+
+    anchorEdgeSec: number
+
+    /** 첫 pointermove 가 임계치(`MOVE_DEAD_ZONE_PX`)를 넘은 이후 true — 그 전까진 edge 를 절대 안 움직임 */
+
+    moveStarted: boolean
+
+    /** clientX dead zone 비교용 */
+
+    clickClientX: number
+
+    /** 가장 멀리 떨어진 픽셀 거리 — commit 시 의도가 아닌 클릭이면 commit 자체를 차단 */
+
+    maxClientXDelta: number
+
+    /** target.start / target.end (pointerdown 시점) */
+
+    snapStartSec: number
+
+    snapEndSec: number
+
+    /** 마지막 onMove 에서 계산한 newSec — finish 시 commitMode=true 로 한 번 더 호출 */
+
+    lastSec: number | null
+
   } | null>(null)
 
   const dragSnapshotRef = useRef<SubtitleLine[] | null>(null)
 
   const lastResultRef = useRef<EdgeDragResult | null>(null)
+
+
+
+  /**
+
+   * 클릭 박스(트림 핸들 ~32px) 안에서의 미세 드리프트가 newSec 로 새지 않게 픽셀 dead zone.
+
+   *  - 4 px 면 사용자가 클릭만 하고 마우스를 미세하게 떨어도 핸들이 절대 안 움직임.
+
+   *  - 의도적인 드래그(8~12 px 이상)는 그대로 통과.
+
+   */
+
+  const MOVE_DEAD_ZONE_PX = 4
+
+
+
+  /**
+
+   * commit 임계치 — pointerdown 부터 pointerup 까지 한 번도 이 픽셀 거리를 넘은 적이 없으면
+
+   * 의도가 없는 클릭으로 보고 commit 자체를 차단한다. trim 핸들이 “찰칵” 한 번 눌렸다고
+
+   * 단어 폭이 자동으로 변경되어 오른쪽 끝으로 쓸려가는 사고를 막는 1차 안전망.
+
+   */
+
+  const COMMIT_MIN_PX = 6
 
 
 
@@ -140,7 +200,40 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
 
       if (!drag || drag.pointerId !== e.pointerId || !snap) return
 
-      const sec = opts.secAtClientX(e.clientX)
+      const dx = e.clientX - drag.clickClientX
+
+      if (Math.abs(dx) > drag.maxClientXDelta) drag.maxClientXDelta = Math.abs(dx)
+
+      // 클릭 직후 dead zone 안의 sub-pixel 떨림은 무시 — 클릭 박스 가장자리를 찍어도 핸들이 즉시 점프하지 않음.
+
+      if (!drag.moveStarted) {
+
+        if (Math.abs(dx) < MOVE_DEAD_ZONE_PX) return
+
+        drag.moveStarted = true
+
+      }
+
+      const curSec = opts.secAtClientX(e.clientX)
+
+      const delta = curSec - drag.clickSec
+
+      // anchor + delta — 클릭 박스 내부 어디를 찍었든 첫 commit 위치는 target edge 그대로,
+
+      // 사용자가 이동한 거리만큼만 정확히 반영. 이전엔 절대 newSec 을 그대로 썼기 때문에
+
+      // 핸들 클릭 박스 안 살짝 오른쪽을 찍으면 곧바로 Shrink 분기로 들어가 `ownEnd - minWidth`
+
+      // 까지 단어가 쓸려 오른쪽 끝으로 점프하는 버그가 있었다.
+
+      const sec = drag.anchorEdgeSec + delta
+
+      drag.lastSec = sec
+
+      /**
+       * preview — commitMode=false : 이웃 텍스트는 절대 안 바뀜. target 의 edge 만 움직이고
+       * 침범된 이웃은 시간만 줄어듦. 흡수는 finish 의 commit 호출에서만 발생.
+       */
 
       const result = applyWordEdgeDrag({
 
@@ -152,7 +245,9 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
 
         newSec: sec,
 
-        minWordWidthSec: opts.minWordWidthSec ?? MIN_WORD_DURATION_SEC
+        minWordWidthSec: opts.minWordWidthSec ?? MIN_WORD_DURATION_SEC,
+
+        commitMode: false
 
       })
 
@@ -210,15 +305,91 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
 
       }
 
-      if (!cancelled && lastResultRef.current) {
+      /**
 
-        opts.onCommit(lastResultRef.current)
+       * commit 차단 1차: 사용자가 한 번도 `COMMIT_MIN_PX` 이상 이동한 적이 없으면 의도가 없는 클릭으로
+
+       * 보고 commit 자체를 막는다. 핸들이 “찰칵” 클릭됐을 뿐인데 word 가 오른쪽 끝으로 쓸려가는 사고를
+
+       * 막는 안전망 — 단어 폭이 좁아 1~2 px 만 흘려도 ownEnd-minWidth 까지 갈 수 있기 때문.
+
+       */
+
+      const shouldCommit =
+
+        !cancelled && drag != null && drag.maxClientXDelta >= COMMIT_MIN_PX && lastResultRef.current != null
+
+      wfLog('peaks', 'useWordEdgeDrag finish', {
+
+        cancelled,
+
+        moveStarted: drag?.moveStarted ?? false,
+
+        maxClientXDelta: drag?.maxClientXDelta ?? 0,
+
+        deadZonePx: MOVE_DEAD_ZONE_PX,
+
+        commitMinPx: COMMIT_MIN_PX,
+
+        clickClientX: drag?.clickClientX ?? null,
+
+        clickSec: drag?.clickSec ?? null,
+
+        anchorEdgeSec: drag?.anchorEdgeSec ?? null,
+
+        snapStartSec: drag?.snapStartSec ?? null,
+
+        snapEndSec: drag?.snapEndSec ?? null,
+
+        edge: drag?.edge ?? null,
+
+        target: drag?.target ?? null,
+
+        committed: shouldCommit,
+
+        hadLastResult: lastResultRef.current != null
+
+      })
+
+      if (shouldCommit && drag != null && drag.lastSec != null && snap) {
+
+        /**
+         * commit 단계 — 마지막 newSec 로 commitMode=true 호출. 이때만 끝점 흡수가 일어난다.
+         * preview 결과를 그대로 commit 하지 않는 이유: preview 는 isDeleted 변경을 하지 않으므로
+         * 핸들이 prev.start 까지 끌려가 있어도 tombstone 이 안 들어가 있다.
+         */
+
+        const commitResult = applyWordEdgeDrag({
+
+          subtitles: snap,
+
+          target: drag.target,
+
+          edge: drag.edge,
+
+          newSec: drag.lastSec,
+
+          minWordWidthSec: opts.minWordWidthSec ?? MIN_WORD_DURATION_SEC,
+
+          commitMode: true
+
+        })
+
+        opts.onCommit(commitResult)
+
+      } else if (!cancelled && !shouldCommit && snap && opts.onDragRevert) {
+
+        // commit 차단 시 미리보기로 흘린 SSOT/editRange 를 깔끔히 되돌린다 (preview 가 SSOT 를 안 건드린 현재 구현에선
+
+        // editRange 만 영향) — onDragFinish 가 cancelled=true 일 때 처리하는 흐름과 동일하게 맞춰 둔다.
+
+        opts.onDragRevert(cloneSubtitleLines(snap))
 
       }
 
       lastResultRef.current = null
 
-      opts.onDragFinish?.({ cancelled })
+      opts.onDragFinish?.({ cancelled: cancelled || !shouldCommit })
 
     },
 
@@ -260,7 +431,19 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
 
       const el = e.currentTarget
 
-      dragSnapshotRef.current = cloneSubtitleLines(opts.getSubtitles())
+      const snap = cloneSubtitleLines(opts.getSubtitles())
+
+      dragSnapshotRef.current = snap
+
+      const wRef = snap[target.lineIndex]?.words?.[target.wordIndex]
+
+      const snapStartSec = wRef ? Math.min(wRef.start, wRef.end) : 0
+
+      const snapEndSec = wRef ? Math.max(wRef.start, wRef.end) : 0
+
+      const anchorEdgeSec = edge === 'start' ? snapStartSec : snapEndSec
+
+      const clickSec = opts.secAtClientX(e.clientX)
 
       draggingRef.current = {
 
@@ -270,9 +453,49 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
 
         pointerId: e.pointerId,
 
-        el
+        el,
+
+        clickSec,
+
+        anchorEdgeSec,
+
+        moveStarted: false,
+
+        clickClientX: e.clientX,
+
+        maxClientXDelta: 0,
+
+        snapStartSec,
+
+        snapEndSec,
+
+        lastSec: null
 
       }
+
+      wfLog('peaks', 'useWordEdgeDrag startDrag', {
+
+        edge,
+
+        target,
+
+        clickClientX: e.clientX,
+
+        clickSec,
+
+        anchorEdgeSec,
+
+        snapStartSec,
+
+        snapEndSec,
+
+        anchorMinusClick: anchorEdgeSec - clickSec,
+
+        hasWordRef: wRef != null,
+
+        wordText: wRef?.word ?? null
+
+      })
 
       try {
 

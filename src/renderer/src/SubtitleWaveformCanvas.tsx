@@ -218,6 +218,14 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     const [draggingHandle, setDraggingHandle] = useState<
       'trimStart' | 'trimEnd' | 'cut' | null
     >(null)
+    /**
+     * 트림 핸들이 이웃 단어의 끝점에 닿아 *흡수 commit 직전* 상태일 때만 'start'/'end' 로 셋팅.
+     *  - 'start' : 왼쪽 핸들이 prev.start 에 도달 — 마우스를 떼면 prev 가 흡수됨.
+     *  - 'end' : 오른쪽 핸들이 next.end 에 도달 — 마우스를 떼면 next 가 흡수됨.
+     *  - null : 한계 도달 아님.
+     * UI 가 핸들 색을 빨갛게 바꿔 사용자에게 "여기서 떼면 통째 합쳐진다" 를 알려준다.
+     */
+    const [handleAtLimit, setHandleAtLimit] = useState<'start' | 'end' | null>(null)
     /** 한 번의 드래그에서 좌·우로 단어 경계 넘김 확장 시도 횟수(대부분 1회면 충분) */
     const expandLeftTokensRef = useRef(4)
     const expandRightTokensRef = useRef(4)
@@ -289,6 +297,14 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
 
     /** 활성 단어 ±이웃 중심 줌(확장 시 한 단어씩) — 선택 없을 때만 전체 줄 폴백 */
     useLayoutEffect(() => {
+      /**
+       * **트림 드래그 중에는 viewWin 을 고정** — 미리보기에서 `setViewWin` 을 호출하지 않지만,
+       *  `editRange`/rows 가 바뀌며 이 effect 가 매 프레임 돌면 `computeWordContextWindow` 가
+       *  줌을 다시 잡아 파형이 “존나 확대” 되는 현상이 난다. 트림 중에는 기존 viewWin 유지,
+       *  손을 떼면 `draggingHandle` 해제 후 여기서 통상 정책으로 한 번 복구한다.
+       */
+      if (draggingHandle === 'trimStart' || draggingHandle === 'trimEnd') return
+
       if (activeLineIndex === null || !metrics) {
         setViewWin(null)
         lastViewKeyRef.current = null
@@ -367,7 +383,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       activeRowTimesSig,
       expandL,
       expandR,
-      activeWordId
+      activeWordId,
+      draggingHandle
     ])
 
     useEffect(() => {
@@ -597,10 +614,10 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       if (!b) return
       /**
        * **SSOT 미리보기는 의도적으로 호출하지 않는다** — 드래그 중에는 단어블록이 움직이지 않고,
-       *  포인터를 떼는 순간(`onCommit`)에 한 번에 합치기/분해가 적용된다.
-       *  매 프레임 SSOT 를 갱신하면 같은 부분 흡수/분해 알고리즘이 누적 입력으로 돌아가
-       *  cross-line round-trip 이 깨지고 시각이 “뚝뚝” 점프하므로 비활성.
-       *  트림 핸들 시각 위치(`setEditRange`)만 부드럽게 미리 보여 사용자 피드백을 유지.
+       *  포인터를 떼는 순간(`onCommit`)에 한 번에 합치기가 적용된다.
+       *  트림 핸들 시각만 `setEditRange` 로 갱신한다. **`viewWin` 은 건드리지 않는다** — 단어 구간이
+       *  짧아질수록 `viewWin = [start,end]` 맞춤 줌이 극단적으로 커지는(로그의 ~0.04s 구간 등) 문제가 있어서,
+       *  트림 중 파형 줌·스크롤은 고정이고 핸들만 움직인다.
        */
       const li = activeLineIndexRef.current
       const cwi = centerWordIndexRef.current
@@ -611,7 +628,41 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       if (!w || w.isDeleted) return
       const lo = Math.min(w.start, w.end)
       const hi = Math.max(w.start, w.end)
-      setEditRange({ start: b.mediaSecToEditSec(lo), end: b.mediaSecToEditSec(hi) })
+      const editLo = b.mediaSecToEditSec(lo)
+      const editHi = b.mediaSecToEditSec(hi)
+      setEditRange({ start: editLo, end: editHi })
+      /**
+       * **한계 시각 피드백** — 핸들이 이웃의 끝점에 도달하면 빨강.
+       *  - 'start' 한계: 왼쪽 핸들이 same-line storage prev active 단어의 start 와 일치 → prev 흡수 임박.
+       *  - 'end' 한계: 오른쪽 핸들이 same-line storage next active 단어의 end 와 일치 → next 흡수 임박.
+       */
+      if (line?.words) {
+        const words = line.words
+        let prevActive: typeof w | undefined
+        for (let i = si - 1; i >= 0; i -= 1) {
+          const ww = words[i]
+          if (ww && !ww.isDeleted) {
+            prevActive = ww
+            break
+          }
+        }
+        let nextActive: typeof w | undefined
+        for (let i = si + 1; i < words.length; i += 1) {
+          const ww = words[i]
+          if (ww && !ww.isDeleted) {
+            nextActive = ww
+            break
+          }
+        }
+        const limitEps = 1e-5
+        let nextLimit: 'start' | 'end' | null = null
+        if (prevActive && Math.abs(w.start - prevActive.start) < limitEps) {
+          nextLimit = 'start'
+        } else if (nextActive && Math.abs(w.end - nextActive.end) < limitEps) {
+          nextLimit = 'end'
+        }
+        setHandleAtLimit((prev) => (prev === nextLimit ? prev : nextLimit))
+      }
     }, [])
 
     const onWordEdgeCommit = useCallback((result: EdgeDragResult) => {
@@ -669,6 +720,12 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
 
     const onWordEdgeDragFinish = useCallback(({ cancelled }: { cancelled: boolean }) => {
       setDraggingHandle(null)
+      setHandleAtLimit(null)
+      /**
+       * 종료 후 통상 viewWin 정책으로 복귀하도록 lastViewKey 를 무효화한다.
+       * 다음 useLayoutEffect 실행에서 새 viewWin 이 계산된다.
+       */
+      lastViewKeyRef.current = null
       if (!cancelled) return
       const li = activeLineIndexRef.current
       const cwi = centerWordIndexRef.current
@@ -833,19 +890,31 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
 
     /**
      * 자르기 라인 — 트림 구간 내부에서만 자유롭게 이동.
-     * - 새 단어 선택/트림 변경 시 트림 구간 안으로 클램프(없으면 가운데로 초기화).
+     * - **새 단어 활성화(activeWordId 변경) 시 → 무조건 트림 시작점으로 초기화** (사용자 요구).
+     * - 같은 단어에서 트림 구간만 바뀌면(트림 핸들 드래그 등) → 기존 cut 위치를 트림 안으로 클램프.
      * - 트림 구간 자체가 사라지면 자르기 라인도 null.
+     *
+     * **주의: deps 는 `editRange` 만 둔다.** `activeWordId` 를 deps 에 넣으면 단어 변경 시
+     * `editRange` 가 아직 이전 단어의 범위인 상태에서 한 번 effect 가 더 돌아 cut 이 잘못된 곳으로 가는
+     * 1-tick flicker 가 생긴다. word 변경은 `activeWordId` 자체를 closure 에서 읽어 트래커 ref 로 감지한다.
      */
+    const cutSecLastActiveWordIdRef = useRef<string | null>(null)
     useEffect(() => {
       if (!editRange) {
         setCutSec(null)
+        cutSecLastActiveWordIdRef.current = null
         return
       }
       const s = Math.min(editRange.start, editRange.end)
       const e = Math.max(editRange.start, editRange.end)
       const eps = 1e-4
+      const startCut = Math.min(e - eps, s + eps)
+      const wid = activeWordIdRef.current ?? null
+      const wordChanged = cutSecLastActiveWordIdRef.current !== wid
+      cutSecLastActiveWordIdRef.current = wid
       setCutSec((prev) => {
-        if (prev == null || !Number.isFinite(prev)) return (s + e) / 2
+        if (wordChanged) return startCut
+        if (prev == null || !Number.isFinite(prev)) return startCut
         if (prev <= s + eps) return s + eps
         if (prev >= e - eps) return e - eps
         return prev
@@ -904,6 +973,22 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         sec: cutSec
       }
     }, [viewWin, cutSec])
+
+    /**
+     * 자르기·재생 라인 부드러운 움직임 — `cutSec` 은 이미 0.01s 단위로 quantize 된 값을 받지만
+     * 60Hz 화면에선 매 프레임 다른 위치로 React 가 강제 점프 그리므로 띄엄띄엄 보인다.
+     * 재생 중일 때만 `left` 에 12ms 선형 transition 을 걸어 프레임 사이 빈 구간을 CSS 가 채워
+     * 사용자 시야에서 0.01s 단위 진행이 자연스럽게 흐르도록 한다.
+     *
+     * - 드래그 중: transition 해제(드래그 추적이 지연되면 안 됨).
+     * - 정지/일시정지/단어 전환: transition 해제(시작점으로 즉시 스냅).
+     */
+    const cutLineMotionStyle = useMemo<{ transition: string; willChange?: string }>(() => {
+      if (isPlaying && draggingHandle !== 'cut') {
+        return { transition: 'left 12ms linear', willChange: 'left' }
+      }
+      return { transition: 'none' }
+    }, [isPlaying, draggingHandle])
 
     /** 라벨이 박스 밖으로 옮겨졌으므로 상단 패딩은 최소만(중심선 여유) */
     const WAVE_TOP_LABEL_BAND_PX = 4
@@ -1180,9 +1265,10 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     }, [activeWords, onPausePlayback, onPlayEditRange])
 
     /**
-     * `isPlaying` 이 true → false 전환 시점에 자르기 라인이 트림 끝 근처(<=80ms) 라면
-     * 자연 종료로 간주하고 재생 시작 지점(`playStartSecRef`) 으로 자동 복귀시킨다.
-     * - 중간 일시정지는 그 자리에서 멈추도록 그대로 둔다(임의 pause 와 자연 종료 구분).
+     * `isPlaying` 이 true → false 전환되면 **무조건** 자르기 라인을 트림 시작점으로 복귀.
+     *  - 사용자 요구: "재생이 끝나면 자동으로 시작지점으로 가야하고 무조건이야".
+     *  - 자연 종료/임의 일시정지 구분 없이 동일하게 시작점으로 되돌린다.
+     *  - 다음 ▶/Space 가 곧바로 트림 시작점부터 재생을 시작.
      */
     const prevIsPlayingForRewindRef = useRef<boolean>(Boolean(isPlaying))
     useEffect(() => {
@@ -1190,18 +1276,13 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       const now = Boolean(isPlaying)
       prevIsPlayingForRewindRef.current = now
       if (!(was && !now)) return
-      const er = editRangeRef.current
-      const cur = cutSecRef.current
-      const start = playStartSecRef.current
       playStartSecRef.current = null
-      if (!er || cur == null || start == null) return
-      const e = Math.max(er.start, er.end)
-      const NEAR_END_SEC = 0.08
-      if (cur < e - NEAR_END_SEC) return
-      // 자연 종료 — 시작 지점으로 자르기 라인 자동 복귀
+      const er = editRangeRef.current
+      if (!er) return
       const s = Math.min(er.start, er.end)
+      const e = Math.max(er.start, er.end)
       const eps = 1e-4
-      const back = Math.min(e - eps, Math.max(s + eps, start))
+      const back = Math.min(e - eps, s + eps)
       setCutSec(back)
     }, [isPlaying])
 
@@ -1269,7 +1350,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                     {cutLinePct != null ? (
                       <span
                         className="absolute -translate-x-1/2 whitespace-nowrap rounded-md bg-sky-500 px-1.5 py-[2px] font-mono text-[10px] font-semibold leading-tight text-white shadow-[0_2px_6px_rgba(2,132,199,0.55)]"
-                        style={{ left: `${cutLinePct.pct}%`, top: 0 }}
+                        style={{ left: `${cutLinePct.pct}%`, top: 0, ...cutLineMotionStyle }}
                       >
                         {fmtSec(cutLinePct.sec)}
                       </span>
@@ -1307,6 +1388,11 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                         const isDraggingThis =
                           (which === 'start' && draggingHandle === 'trimStart') ||
                           (which === 'end' && draggingHandle === 'trimEnd')
+                        /**
+                         * 한계 도달 시각화 — 이 핸들이 이웃 단어의 끝점에 닿아 *흡수 commit 직전* 이면 빨강.
+                         * 사용자는 이 상태에서 마우스를 떼면 prev/next 가 통째 흡수됨을 시각으로 미리 안다.
+                         */
+                        const atLimit = handleAtLimit === which
                         return (
                           <div
                             key={which}
@@ -1317,14 +1403,33 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                             aria-label={which === 'start' ? '구간 시작' : '구간 끝'}
                           >
                             <div
-                              className="pointer-events-none absolute inset-y-0 left-1/2 w-[2px] -translate-x-1/2 bg-white/95 shadow-[0_0_6px_rgba(255,255,255,0.5)] transition-opacity duration-75"
-                              style={{ opacity: isDraggingThis ? 0.25 : 1 }}
+                              className="pointer-events-none absolute inset-y-0 left-1/2 w-[2px] -translate-x-1/2 transition-opacity duration-75"
+                              style={{
+                                opacity: isDraggingThis ? 0.25 : 1,
+                                background: atLimit ? 'rgb(248 113 113)' : 'rgba(255,255,255,0.95)',
+                                boxShadow: atLimit
+                                  ? '0 0 8px rgba(248,113,113,0.85)'
+                                  : '0 0 6px rgba(255,255,255,0.5)'
+                              }}
                             />
                             <div
-                              className="pointer-events-none absolute left-1/2 top-1/2 flex h-6 w-3.5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-[3px] border border-slate-900/80 bg-white shadow-md transition-opacity duration-75"
-                              style={{ opacity: isDraggingThis ? 0.3 : 1 }}
+                              className="pointer-events-none absolute left-1/2 top-1/2 flex h-6 w-3.5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-[3px] shadow-md transition-opacity duration-75"
+                              style={{
+                                opacity: isDraggingThis ? 0.3 : 1,
+                                border: atLimit
+                                  ? '1px solid rgb(127 29 29)'
+                                  : '1px solid rgba(15,23,42,0.8)',
+                                background: atLimit ? 'rgb(248 113 113)' : 'white'
+                              }}
                             >
-                              <span className="block h-3 w-[1px] bg-slate-500/80" />
+                              <span
+                                className="block h-3 w-[1px]"
+                                style={{
+                                  background: atLimit
+                                    ? 'rgba(127,29,29,0.85)'
+                                    : 'rgba(100,116,139,0.8)'
+                                }}
+                              />
                             </div>
                           </div>
                         )
@@ -1337,7 +1442,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                     <div className="pointer-events-none absolute inset-0 z-[60]">
                       <div
                         className="pointer-events-auto absolute inset-y-0 w-8 -translate-x-1/2 cursor-ew-resize touch-none"
-                        style={{ left: `${cutLinePct.pct}%` }}
+                        style={{ left: `${cutLinePct.pct}%`, ...cutLineMotionStyle }}
                         onPointerDown={onCutLinePointerDown}
                         role="slider"
                         aria-label="자르기·재생 시작 라인"

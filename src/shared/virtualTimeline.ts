@@ -350,6 +350,14 @@ export function tombstoneBlocksFromSoftDeletedSubtitleWords(
     for (let wi = 0; wi < words.length; wi += 1) {
       const w = words[wi]!
       if (w.isDeleted !== true) continue
+      /**
+       * **트림 드래그 흡수로 인한 tombstone 은 스킵.**
+       *  - 텍스트는 인접 단어에 이미 옮겨졌고, 미디어 오디오는 그대로 유지되므로 stitched 파형에
+       *    cut 으로 들어가면 안 된다. 이 cut 이 깔리면 commit 직후 파형이 좌측으로 “접혀” 보여
+       *    사용자가 “점프” 로 체감한다.
+       *  - 일반 단어 삭제(`isDeleted=true` 이면서 `mergedByEdgeTrim` 미설정) 는 그대로 cut 처리.
+       */
+      if (w.mergedByEdgeTrim === true) continue
       const clamped = clampTombstoneMediaRangeToAliveNeighbors(words, wi, null)
       let ms: number
       let me: number

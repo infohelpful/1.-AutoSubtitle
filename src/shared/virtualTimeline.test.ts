@@ -204,6 +204,30 @@ import {
     expect(blocks[0]!.mediaEndSec).toBeCloseTo(2, 4)
   })
 
+  it('tombstoneBlocksFromSoftDeletedSubtitleWords skips trim-merge tombstones (mergedByEdgeTrim)', () => {
+    /**
+     *  단어 트림(엣지 드래그) 흡수로 인한 tombstone 은 텍스트가 이미 인접 단어로 옮겨졌고
+     *  미디어 오디오는 그대로 유지된다. stitched 파형 cut 으로 들어가면 commit 직후 파형이
+     *  좌측으로 “접혀” 보여 사용자가 점프로 체감하므로 cut 후보에서 제외해야 한다.
+     */
+    const blocks = tombstoneBlocksFromSoftDeletedSubtitleWords(
+      [
+        {
+          start: 0,
+          end: 3,
+          text: 'x',
+          words: [
+            { start: 0, end: 1, word: 'a' },
+            { start: 1, end: 2, word: 'gone-trim', isDeleted: true, mergedByEdgeTrim: true },
+            { start: 2, end: 3, word: 'b' }
+          ]
+        }
+      ],
+      []
+    )
+    expect(blocks.length).toBe(0)
+  })
+
   it('deriveVisibleSubtitleLinesForUi strips soft-deleted words (empty deletedMediaBlocks)', () => {
     const derived = deriveVisibleSubtitleLinesForUi(
       [

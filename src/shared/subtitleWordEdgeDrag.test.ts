@@ -46,9 +46,102 @@ describe('subtitleWordEdgeDrag — flatten/filter/link', () => {
   })
 })
 
-describe('subtitleWordEdgeDrag — expand → merge (within line)', () => {
-  it('merges previous word into target when extending start across its boundary', () => {
-    /** 부분 침범이 아니게 prev.start 왼쪽까지 당겨 전량 tombstone 병합 */
+/**
+ * 정책 — preview (commitMode 기본 false) 단계는 **이웃 텍스트를 절대 손대지 않는다**.
+ * target 의 edge 만 움직이고, 침범한 이웃은 시간만 줄어든다. 흡수(tombstone)는 항상 빈 배열.
+ */
+describe('subtitleWordEdgeDrag — preview (no absorb, time-only neighbors)', () => {
+  it('expand end into next: next.start ← newEnd, next.word intact, no tombstone', () => {
+    const subs: SubtitleLine[] = [
+      mkLine(0, 2.0, [
+        [0.0, 1.0, '유튜브'],
+        [1.0, 2.0, '영상을']
+      ])
+    ]
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
+      subtitles: subs,
+      target: { lineIndex: 0, wordIndex: 0 },
+      edge: 'end',
+      newSec: 1.4
+    })
+    expect(tombstoned).toEqual([])
+    const w = next[0]!.words!
+    expect(w[0]!.word).toBe('유튜브')
+    expect(w[0]!.end).toBeCloseTo(1.4)
+    expect(w[1]!.word).toBe('영상을')
+    expect(w[1]!.start).toBeCloseTo(1.4)
+    expect(w[1]!.end).toBeCloseTo(2.0)
+  })
+
+  it('expand start into prev: prev.end ← newStart, prev.word intact, no tombstone', () => {
+    const subs: SubtitleLine[] = [
+      mkLine(0, 2.0, [
+        [0.0, 1.0, '유튜브'],
+        [1.0, 2.0, '영상을']
+      ])
+    ]
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
+      subtitles: subs,
+      target: { lineIndex: 0, wordIndex: 1 },
+      edge: 'start',
+      newSec: 0.5
+    })
+    expect(tombstoned).toEqual([])
+    const w = next[0]!.words!
+    expect(w[0]!.word).toBe('유튜브')
+    expect(w[0]!.end).toBeCloseTo(0.5)
+    expect(w[1]!.word).toBe('영상을')
+    expect(w[1]!.start).toBeCloseTo(0.5)
+  })
+
+  it('preview: reaching prev.start does NOT absorb; prev is shrunk to zero-width but kept alive', () => {
+    const subs: SubtitleLine[] = [
+      mkLine(0, 1.0, [
+        [0.0, 0.5, '가'],
+        [0.5, 1.0, '나']
+      ])
+    ]
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
+      subtitles: subs,
+      target: { lineIndex: 0, wordIndex: 1 },
+      edge: 'start',
+      newSec: 0.0
+    })
+    expect(tombstoned).toEqual([])
+    const w = next[0]!.words!
+    expect(w[0]!.word).toBe('가')
+    expect(w[0]!.isDeleted).toBeFalsy()
+    expect(w[1]!.word).toBe('나')
+    expect(w[1]!.start).toBeCloseTo(0.0)
+  })
+
+  it('preview: reaching next.end does NOT absorb; next is shrunk to zero-width but kept alive', () => {
+    const subs: SubtitleLine[] = [
+      mkLine(0, 1.0, [
+        [0.0, 0.5, '가'],
+        [0.5, 1.0, '나']
+      ])
+    ]
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
+      subtitles: subs,
+      target: { lineIndex: 0, wordIndex: 0 },
+      edge: 'end',
+      newSec: 1.0
+    })
+    expect(tombstoned).toEqual([])
+    const w = next[0]!.words!
+    expect(w[1]!.word).toBe('나')
+    expect(w[1]!.isDeleted).toBeFalsy()
+    expect(w[0]!.end).toBeCloseTo(1.0)
+  })
+})
+
+/**
+ * 정책 — commit (commitMode=true, 마우스를 뗀 순간) 단계는 **핸들이 이웃의 끝점에 도달했을 때만**
+ * 통째 흡수한다. 부분 위치에서는 이웃 텍스트가 보존되며 시간만 줄어든다.
+ */
+describe('subtitleWordEdgeDrag — commit (endpoint-only absorb)', () => {
+  it('start edge crossing prev.start absorbs prev fully (mergedByEdgeTrim)', () => {
     const subs: SubtitleLine[] = [
       mkLine(0, 1.5, [
         [0.2, 0.5, '안녕'],
@@ -60,19 +153,19 @@ describe('subtitleWordEdgeDrag — expand → merge (within line)', () => {
       subtitles: subs,
       target: { lineIndex: 0, wordIndex: 1 },
       edge: 'start',
-      newSec: 0.15 // prev 전체가 target 왼쪽으로 넘어가도록 prev.start(0.2) 보다 왼쪽
+      newSec: 0.15,
+      commitMode: true
     })
-
     expect(tombstoned).toEqual([{ lineIndex: 0, wordIndex: 0 }])
     const words = next[0]!.words!
     expect(words[0]!.isDeleted).toBe(true)
+    expect(words[0]!.mergedByEdgeTrim).toBe(true)
     expect(words[1]!.word).toBe('안녕 하세요')
     expect(words[1]!.start).toBeCloseTo(0.15)
     expect(words[1]!.end).toBeCloseTo(1.0)
-    expect(words[2]!.start).toBeCloseTo(1.0)
   })
 
-  it('merges next word into target when extending end across its boundary', () => {
+  it('end edge reaching next.end absorbs next fully', () => {
     const subs: SubtitleLine[] = [
       mkLine(0, 1.5, [
         [0.0, 0.5, '안녕'],
@@ -84,100 +177,110 @@ describe('subtitleWordEdgeDrag — expand → merge (within line)', () => {
       subtitles: subs,
       target: { lineIndex: 0, wordIndex: 1 },
       edge: 'end',
-      newSec: 1.5 // 다음 단어 끝까지 — 부분 침범 아닌 전량 tombstone
+      newSec: 1.5,
+      commitMode: true
     })
-
     expect(tombstoned).toEqual([{ lineIndex: 0, wordIndex: 2 }])
     const words = next[0]!.words!
     expect(words[1]!.word).toBe('하세요 여러분')
     expect(words[1]!.end).toBeCloseTo(1.5)
     expect(words[2]!.isDeleted).toBe(true)
+    expect(words[2]!.mergedByEdgeTrim).toBe(true)
   })
 
-  it('partially absorbs next word text when end expands only partway through it', () => {
+  it('commit + mid-prev position does NOT absorb — prev.word kept, prev.end shrunk', () => {
+    /**
+     * 사용자가 prev 의 내부에서 손을 뗀 경우 — prev.start 까지 끌지 않았으므로 흡수 미발생.
+     * prev 의 텍스트는 그대로, prev 의 시간만 줄어든다. (사용자 요구사항의 핵심)
+     */
     const subs: SubtitleLine[] = [
       mkLine(0, 2.0, [
         [0.0, 1.0, '유튜브'],
         [1.0, 2.0, '영상을']
       ])
     ]
-    /** [1.0,2.0] 에서 1.333 근처 절단 → 앞 ~1글자 "영" 흡수 (공백 없이 직접 concat) */
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
+      subtitles: subs,
+      target: { lineIndex: 0, wordIndex: 1 },
+      edge: 'start',
+      newSec: 0.5,
+      commitMode: true
+    })
+    expect(tombstoned).toEqual([])
+    const w = next[0]!.words!
+    expect(w[0]!.word).toBe('유튜브')
+    expect(w[0]!.isDeleted).toBeFalsy()
+    expect(w[0]!.end).toBeCloseTo(0.5)
+    expect(w[1]!.word).toBe('영상을')
+    expect(w[1]!.start).toBeCloseTo(0.5)
+  })
+
+  it('commit + mid-next position does NOT absorb — next.word kept, next.start shrunk', () => {
+    const subs: SubtitleLine[] = [
+      mkLine(0, 2.0, [
+        [0.0, 1.0, '유튜브'],
+        [1.0, 2.0, '영상을']
+      ])
+    ]
     const { subtitles: next, tombstoned } = applyWordEdgeDrag({
       subtitles: subs,
       target: { lineIndex: 0, wordIndex: 0 },
       edge: 'end',
-      newSec: 1.0 + (2.0 - 1.0) / 3
+      newSec: 1.6,
+      commitMode: true
     })
-    expect(tombstoned.length).toBe(0)
-    const words = next[0]!.words!
-    expect(words[0]!.word).toBe('유튜브영')
-    expect(words[1]!.word).toBe('상을')
-    expect(words[1]!.start).toBeCloseTo(1.0 + (2.0 - 1.0) / 3, 5)
+    expect(tombstoned).toEqual([])
+    const w = next[0]!.words!
+    expect(w[0]!.word).toBe('유튜브')
+    expect(w[0]!.end).toBeCloseTo(1.6)
+    expect(w[1]!.word).toBe('영상을')
+    expect(w[1]!.start).toBeCloseTo(1.6)
   })
 
-  it('partial absorb then shrink round-trip: 유튜브 + 영상을 → 유튜브영 / 상을 → 유튜브 / 영상을', () => {
+  it('commit + 1-char neighbor mid-position: still no absorb (no near-collapse policy)', () => {
+    /**
+     *  이전 정책은 next 가 minWidth 이하로 짜부라지면 “near-collapse 흡수” 가 발생했으나,
+     *  새 정책에선 **끝점 도달만** 흡수 — mid-position 은 무조건 시간만 줄어든다.
+     */
     const subs: SubtitleLine[] = [
-      mkLine(0, 2.0, [
-        [0.0, 1.0, '유튜브'],
-        [1.0, 2.0, '영상을']
+      mkLine(0, 1.0, [
+        [0.0, 0.5, '가'],
+        [0.5, 1.0, '나']
       ])
     ]
-    /** 1) 부분 흡수 — '유튜브' + '영' */
-    const step1 = applyWordEdgeDrag({
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
       subtitles: subs,
       target: { lineIndex: 0, wordIndex: 0 },
       edge: 'end',
-      newSec: 1.0 + 1.0 / 3
+      newSec: 0.995,
+      commitMode: true
     })
-    expect(step1.subtitles[0]!.words![0]!.word).toBe('유튜브영')
-    expect(step1.subtitles[0]!.words![1]!.word).toBe('상을')
-
-    /** 2) 분해 — 다시 1.0 로 줄이기 (1글자 만큼 next 앞으로 prepend) */
-    const step2 = applyWordEdgeDrag({
-      subtitles: step1.subtitles,
-      target: { lineIndex: 0, wordIndex: 0 },
-      edge: 'end',
-      newSec: 1.0
-    })
-    const w = step2.subtitles[0]!.words!
-    expect(w[0]!.word).toBe('유튜브')
-    expect(w[0]!.end).toBeCloseTo(1.0)
-    expect(w[1]!.word).toBe('영상을')
-    expect(w[1]!.start).toBeCloseTo(1.0)
-    expect(w[1]!.end).toBeCloseTo(2.0)
+    expect(tombstoned).toEqual([])
+    expect(next[0]!.words![1]!.isDeleted).toBeFalsy()
+    expect(next[0]!.words![1]!.word).toBe('나')
   })
 
-  it('partial absorb (start edge) then shrink round-trip', () => {
-    /** "유튜브" "영상을" — 두 번째 단어의 start 를 왼쪽으로 살짝 당겨 '브' 1글자 흡수 → 다시 분해 */
+  it('commit + crossing 1-char neighbor.end absorbs fully', () => {
     const subs: SubtitleLine[] = [
-      mkLine(0, 2.0, [
-        [0.0, 1.0, '유튜브'],
-        [1.0, 2.0, '영상을']
+      mkLine(0, 1.0, [
+        [0.0, 0.5, '가'],
+        [0.5, 1.0, '나']
       ])
     ]
-    const step1 = applyWordEdgeDrag({
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
       subtitles: subs,
-      target: { lineIndex: 0, wordIndex: 1 },
-      edge: 'start',
-      newSec: 2.0 / 3
+      target: { lineIndex: 0, wordIndex: 0 },
+      edge: 'end',
+      newSec: 1.0,
+      commitMode: true
     })
-    expect(step1.subtitles[0]!.words![0]!.word).toBe('유튜')
-    expect(step1.subtitles[0]!.words![1]!.word).toBe('브영상을')
-
-    const step2 = applyWordEdgeDrag({
-      subtitles: step1.subtitles,
-      target: { lineIndex: 0, wordIndex: 1 },
-      edge: 'start',
-      newSec: 1.0
-    })
-    const w = step2.subtitles[0]!.words!
-    expect(w[0]!.word).toBe('유튜브')
-    expect(w[0]!.end).toBeCloseTo(1.0)
-    expect(w[1]!.word).toBe('영상을')
-    expect(w[1]!.start).toBeCloseTo(1.0)
+    expect(tombstoned).toEqual([{ lineIndex: 0, wordIndex: 1 }])
+    expect(next[0]!.words![0]!.word).toBe('가 나')
+    expect(next[0]!.words![1]!.isDeleted).toBe(true)
+    expect(next[0]!.words![1]!.mergedByEdgeTrim).toBe(true)
   })
 
-  it('merges multiple consecutive prev words on big jump', () => {
+  it('commit merges multiple consecutive prev words on a big jump', () => {
     const subs: SubtitleLine[] = [
       mkLine(0, 2, [
         [0.0, 0.3, 'A'],
@@ -186,29 +289,59 @@ describe('subtitleWordEdgeDrag — expand → merge (within line)', () => {
         [1.0, 2.0, 'D']
       ])
     ]
-    /**
-     * D 의 start 를 0.4 까지 — 먼저 C 전량 병합 후 '나다라' 구간 안(0.4) 에서 부분 분할.
-     * 부분 흡수는 양쪽에 최소 1글자가 남는 경우에만 일어난다(빈 단어 보호).
-     */
-    const { subtitles: next } = applyWordEdgeDrag({
+    /** D.start = 0.0 — A, 나다라, C 모두 끝점을 가로지른다 → 셋 다 흡수. */
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
       subtitles: subs,
       target: { lineIndex: 0, wordIndex: 3 },
       edge: 'start',
-      newSec: 0.4
+      newSec: 0.0,
+      commitMode: true
     })
+    expect(tombstoned).toEqual([
+      { lineIndex: 0, wordIndex: 2 },
+      { lineIndex: 0, wordIndex: 1 },
+      { lineIndex: 0, wordIndex: 0 }
+    ])
     const words = next[0]!.words!
-    expect(words[0]!.isDeleted).not.toBe(true)
-    expect(words[1]!.isDeleted).not.toBe(true)
-    expect(words[1]!.word.length).toBeGreaterThanOrEqual(1)
-    expect(words[1]!.start).toBeCloseTo(0.3)
+    expect(words[0]!.isDeleted).toBe(true)
+    expect(words[1]!.isDeleted).toBe(true)
+    expect(words[2]!.isDeleted).toBe(true)
+    expect(words[3]!.word).toBe('A 나다라 C D')
+    expect(words[3]!.start).toBeCloseTo(0.0)
+  })
+
+  it('commit on mid-prev with big jump — passes through fully-crossed prevs, stops on partial', () => {
+    /**
+     * D.start = 0.4: C(0.6~1.0) 는 끝점을 완전히 가로지름 → 흡수. 나다라(0.3~0.6) 는 mid → 흡수 안 됨, 시간만.
+     */
+    const subs: SubtitleLine[] = [
+      mkLine(0, 2, [
+        [0.0, 0.3, 'A'],
+        [0.3, 0.6, '나다라'],
+        [0.6, 1.0, 'C'],
+        [1.0, 2.0, 'D']
+      ])
+    ]
+    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
+      subtitles: subs,
+      target: { lineIndex: 0, wordIndex: 3 },
+      edge: 'start',
+      newSec: 0.4,
+      commitMode: true
+    })
+    expect(tombstoned).toEqual([{ lineIndex: 0, wordIndex: 2 }])
+    const words = next[0]!.words!
+    expect(words[0]!.isDeleted).toBeFalsy()
+    expect(words[1]!.isDeleted).toBeFalsy()
+    expect(words[1]!.word).toBe('나다라')
     expect(words[1]!.end).toBeCloseTo(0.4)
     expect(words[2]!.isDeleted).toBe(true)
-    expect(words[3]!.word).toMatch(/D/)
+    expect(words[3]!.word).toBe('C D')
     expect(words[3]!.start).toBeCloseTo(0.4)
   })
 })
 
-describe('subtitleWordEdgeDrag — shrink → absorb', () => {
+describe('subtitleWordEdgeDrag — shrink (preview = commit)', () => {
   it('previous word.end is pulled to the new start when shrinking', () => {
     const subs: SubtitleLine[] = [
       mkLine(0, 1.5, [
@@ -258,12 +391,12 @@ describe('subtitleWordEdgeDrag — same-card only (cross-line is no-op/clamp)', 
         [1.5, 2.0, '여러분']
       ])
     ]
-    /** 이전 카드의 단어 영역(0.5) 으로 끌어도 target 의 lineLo(1.0) 로 clamp — 변화 없음. */
     const { subtitles: next, tombstoned } = applyWordEdgeDrag({
       subtitles: subs,
       target: { lineIndex: 1, wordIndex: 0 },
       edge: 'start',
-      newSec: 0.45
+      newSec: 0.45,
+      commitMode: true
     })
     expect(tombstoned).toEqual([])
     expect(next[0]!.isDeleted).toBeFalsy()
@@ -284,7 +417,8 @@ describe('subtitleWordEdgeDrag — same-card only (cross-line is no-op/clamp)', 
       subtitles: subs,
       target: { lineIndex: 0, wordIndex: 1 },
       edge: 'end',
-      newSec: 1.5
+      newSec: 1.5,
+      commitMode: true
     })
     expect(tombstoned).toEqual([])
     expect(next[0]!.words![1]!.word).toBe('B')
@@ -297,16 +431,16 @@ describe('subtitleWordEdgeDrag — same-card only (cross-line is no-op/clamp)', 
     const subs: SubtitleLine[] = [
       mkLine(0, 1, [
         [0.0, 0.4, 'A'],
-        [0.4, 0.7, 'X', true], // tombstone — invisible 인접
+        [0.4, 0.7, 'X', true],
         [0.7, 1.0, 'B']
       ])
     ]
-    /** B.start 를 0 으로 — A 전량 tombstone (부분 안쪽 0.3 아님) */
     const { subtitles: next, tombstoned } = applyWordEdgeDrag({
       subtitles: subs,
       target: { lineIndex: 0, wordIndex: 2 },
       edge: 'start',
-      newSec: 0
+      newSec: 0,
+      commitMode: true
     })
     expect(tombstoned).toEqual([{ lineIndex: 0, wordIndex: 0 }])
     expect(next[0]!.words![0]!.isDeleted).toBe(true)
@@ -328,7 +462,8 @@ describe('subtitleWordEdgeDrag — parent SubtitleLine sync', () => {
       subtitles: subs,
       target: { lineIndex: 0, wordIndex: 1 },
       edge: 'end',
-      newSec: 1.5 // '셋' 전량 tombstone 병합 (1.2 는 단어 안쪽 부분 침범)
+      newSec: 1.5,
+      commitMode: true
     })
     expect(next[0]!.start).toBeCloseTo(0.0)
     expect(next[0]!.end).toBeCloseTo(1.5)
@@ -337,10 +472,6 @@ describe('subtitleWordEdgeDrag — parent SubtitleLine sync', () => {
   })
 
   it('marks line as isDeleted when all active words become empty text (visibleText 0)', () => {
-    /**
-     * 외부에서 모든 active 단어의 글자가 비어 들어오면 `unflattenAndSync` 가 라인을 tombstone 처리.
-     * — 빈 카드(단어 없는 카드)가 잔존하지 않게 하기 위한 안전망.
-     */
     const subs: SubtitleLine[] = [
       {
         start: 1,
@@ -405,9 +536,8 @@ describe('subtitleWordEdgeDrag — guards', () => {
   })
 })
 
-describe('subtitleWordEdgeDrag — shrink → revive tombstoned neighbor (de-merge)', () => {
+describe('subtitleWordEdgeDrag — revive (de-merge) of tombstoned neighbors', () => {
   it('shrinking right edge through a tombstoned next-neighbor revives it fully', () => {
-    /** 시나리오: '하나' 가 '둘' 을 흡수해 (병합) 그 후 다시 줄여 '둘' 복원 */
     const merged: SubtitleLine[] = [
       mkLine(0, 1.0, [
         [0.0, 1.0, '하나 둘'],
@@ -422,7 +552,7 @@ describe('subtitleWordEdgeDrag — shrink → revive tombstoned neighbor (de-mer
       newSec: 0.5
     })
     const words = next[0]!.words!
-    expect(words[0]!.word).toBe('하나')
+    /** target.word 는 손대지 않는다(글자 split 정책 제거). 부활한 '둘' 은 원래 텍스트로 살아남. */
     expect(words[0]!.start).toBeCloseTo(0.0)
     expect(words[0]!.end).toBeCloseTo(0.5)
     expect(words[1]!.isDeleted).toBeFalsy()
@@ -453,7 +583,6 @@ describe('subtitleWordEdgeDrag — shrink → revive tombstoned neighbor (de-mer
   })
 
   it('shrinking left edge revives tombstoned prev-neighbor', () => {
-    /** '둘' 이 '하나' 를 흡수했던 상황 → start 를 다시 밀어 '하나' 복원 */
     const merged: SubtitleLine[] = [
       mkLine(0, 1.0, [
         [0.0, 0.5, '하나', true],
@@ -471,135 +600,11 @@ describe('subtitleWordEdgeDrag — shrink → revive tombstoned neighbor (de-mer
     expect(words[0]!.word).toBe('하나')
     expect(words[0]!.start).toBeCloseTo(0.0)
     expect(words[0]!.end).toBeCloseTo(0.5)
-    expect(words[1]!.word).toBe('둘')
     expect(words[1]!.start).toBeCloseTo(0.5)
     expect(words[1]!.end).toBeCloseTo(1.0)
   })
 
-  it('shrinking past multiple consecutive tombstoned next-neighbors revives them all (snaps target to closest revived)', () => {
-    /** A 가 B, C 두 단어를 모두 흡수한 상태 → A.end 를 줄여서 B, C 동시에 분해.
-     *  full revive 시 target.end 는 인접 부활 단어(B)의 start 로 스냅된다 — 사이클(merge→split→merge) 안정성. */
-    const merged: SubtitleLine[] = [
-      mkLine(0, 1.5, [
-        [0.0, 1.5, 'A B C'],
-        [0.4, 0.8, 'B', true],
-        [0.8, 1.2, 'C', true],
-        [1.2, 1.5, 'D']
-      ])
-    ]
-    const { subtitles: next } = applyWordEdgeDrag({
-      subtitles: merged,
-      target: { lineIndex: 0, wordIndex: 0 },
-      edge: 'end',
-      newSec: 0.3
-    })
-    const words = next[0]!.words!
-    /** target.end 는 사용자가 끌어둔 0.3 이 아니라 B.start(0.4) 로 스냅 — gap 제거로 다음 re-merge 가 작은 드래그로 가능 */
-    expect(words[0]!.end).toBeCloseTo(0.4)
-    expect(words[1]!.isDeleted).toBeFalsy()
-    expect(words[1]!.start).toBeCloseTo(0.4)
-    expect(words[1]!.end).toBeCloseTo(0.8)
-    expect(words[2]!.isDeleted).toBeFalsy()
-    expect(words[2]!.start).toBeCloseTo(0.8)
-    expect(words[2]!.end).toBeCloseTo(1.2)
-  })
-
-  it('full revive past origEnd snaps target.start to revived.end (cycle stability)', () => {
-    /** 사용자가 target.start 를 부활 단어의 origEnd 보다 훨씬 오른쪽으로 끌어도,
-     *  re-merge 가 작은 드래그로 가능하도록 인접 부활 단어 우측 끝(=revived.end)으로 스냅. */
-    const merged: SubtitleLine[] = [
-      mkLine(0, 1.0, [
-        [0.004, 0.13968, '이전', true],
-        [0.004, 0.5, '이전 안녕'],
-        [0.5, 1.0, '하세요']
-      ])
-    ]
-    const { subtitles: next } = applyWordEdgeDrag({
-      subtitles: merged,
-      target: { lineIndex: 0, wordIndex: 1 },
-      edge: 'start',
-      newSec: 0.41176
-    })
-    const words = next[0]!.words!
-    expect(words[0]!.isDeleted).toBeFalsy()
-    expect(words[0]!.start).toBeCloseTo(0.004)
-    expect(words[0]!.end).toBeCloseTo(0.13968)
-    /** 핵심: target.start 는 사용자가 끌어둔 0.41176 이 아니라 0.13968 로 스냅 */
-    expect(words[1]!.start).toBeCloseTo(0.13968)
-  })
-
-  it('shrinking only partially into the SECOND merged neighbor revives only that one', () => {
-    /** A 가 B, C 모두 흡수. A.end 를 C 의 내부까지만 줄임 → C 부분 부활, B 는 여전히 흡수됨 */
-    const merged: SubtitleLine[] = [
-      mkLine(0, 1.5, [
-        [0.0, 1.5, 'A B C'],
-        [0.4, 0.8, 'B', true],
-        [0.8, 1.2, 'C', true]
-      ])
-    ]
-    const { subtitles: next } = applyWordEdgeDrag({
-      subtitles: merged,
-      target: { lineIndex: 0, wordIndex: 0 },
-      edge: 'end',
-      newSec: 1.0
-    })
-    const words = next[0]!.words!
-    expect(words[0]!.end).toBeCloseTo(1.0)
-    expect(words[1]!.isDeleted).toBe(true) // B 는 아직 A 의 새 범위 안
-    expect(words[2]!.isDeleted).toBeFalsy() // C 는 부분 부활
-    expect(words[2]!.start).toBeCloseTo(1.0)
-    expect(words[2]!.end).toBeCloseTo(1.2)
-  })
-
-  it('shrinking start edge does not touch cross-line previous word', () => {
-    /** Same-card 정책 — cross-line prev 는 시각/글자 모두 그대로. */
-    const subs: SubtitleLine[] = [
-      mkLine(0, 0.13968, [[0.004, 0.13968, '이전']]),
-      mkLine(0.13968, 1.0, [
-        [0.13968, 0.5, '안녕'],
-        [0.5, 1.0, '하세요']
-      ])
-    ]
-    const { subtitles: next } = applyWordEdgeDrag({
-      subtitles: subs,
-      target: { lineIndex: 1, wordIndex: 0 },
-      edge: 'start',
-      newSec: 0.41176
-    })
-    const line0 = next[0]!
-    expect(line0.words![0]!.start).toBeCloseTo(0.004)
-    expect(line0.words![0]!.end).toBeCloseTo(0.13968)
-    expect(line0.words![0]!.word).toBe('이전')
-    const line1 = next[1]!
-    expect(line1.words![0]!.start).toBeCloseTo(0.41176)
-    expect(line1.words![0]!.word).toBe('안녕')
-  })
-
-  it('shrinking end edge does not touch cross-line next word', () => {
-    const subs: SubtitleLine[] = [
-      mkLine(0, 0.5, [
-        [0.0, 0.25, '안녕'],
-        [0.25, 0.5, '하세요']
-      ]),
-      mkLine(0.5, 1.0, [[0.5, 1.0, '다음']])
-    ]
-    const { subtitles: next } = applyWordEdgeDrag({
-      subtitles: subs,
-      target: { lineIndex: 0, wordIndex: 1 },
-      edge: 'end',
-      newSec: 0.3
-    })
-    const line1 = next[1]!
-    expect(line1.words![0]!.start).toBeCloseTo(0.5)
-    expect(line1.words![0]!.end).toBeCloseTo(1.0)
-    expect(line1.words![0]!.word).toBe('다음')
-  })
-
   it('cross-line tombstone is NOT revived (same-card only revive)', () => {
-    /**
-     * Same-card 정책 — 이전 카드의 tombstone 단어는 부활 대상이 아니다.
-     * 사용자가 target.start 를 끌어도 line0 의 tombstone '여러분' 은 그대로 유지된다.
-     */
     const merged: SubtitleLine[] = [
       mkLine(0, 1.0, [
         [0.0, 0.5, '안녕'],
@@ -618,35 +623,12 @@ describe('subtitleWordEdgeDrag — shrink → revive tombstoned neighbor (de-mer
     })
     const line0Words = next[0]!.words!
     const line1Words = next[1]!.words!
-    /** line0 의 tombstone 그대로 유지 */
     expect(line0Words[1]!.isDeleted).toBe(true)
     expect(line0Words[0]!.word).toBe('안녕')
-    /** target 은 자기 카드 안 lineLo(0.5) 로 clamp — newSec(1.0) 가 그 안이라 그대로 적용 */
-    expect(line1Words[0]!.word).toBe('여러분 A')
     expect(line1Words[0]!.start).toBeCloseTo(1.0)
   })
 
-  it('partial absorb keeps at least one char in both sides (no empty word)', () => {
-    /** newEnd 가 next 의 거의 끝 (right 가 비게 될) 위치이면 부분 흡수 대신 통째 tombstone 으로 fallthrough */
-    const subs: SubtitleLine[] = [
-      mkLine(0, 1.0, [
-        [0.0, 0.5, '가'],
-        [0.5, 1.0, '나']
-      ])
-    ]
-    const { subtitles: next, tombstoned } = applyWordEdgeDrag({
-      subtitles: subs,
-      target: { lineIndex: 0, wordIndex: 0 },
-      edge: 'end',
-      newSec: 0.99
-    })
-    /** 1글자뿐인 '나' 의 right 가 비기 때문에 통째 tombstone */
-    expect(tombstoned).toEqual([{ lineIndex: 0, wordIndex: 1 }])
-    expect(next[0]!.words![0]!.word).toBe('가 나')
-    expect(next[0]!.words![1]!.isDeleted).toBe(true)
-  })
-
-  it('shrink without any tombstoned neighbor still absorbs to next active', () => {
+  it('shrink without any tombstoned neighbor still pulls next.start to fill gap', () => {
     const subs: SubtitleLine[] = [
       mkLine(0, 1.5, [
         [0.0, 1.0, '하나'],

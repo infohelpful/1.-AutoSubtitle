@@ -108,6 +108,28 @@ export type UseWordEdgeDragOptions = {
 
   minWordWidthSec?: number
 
+  /**
+
+   * `anchorEdgeSec + delta` 로 계산한 newSec 을 `applyWordEdgeDrag` 에 넣기 전에 한 번 더 자른다.
+
+   *  파형 viewWin 밖으로 엣지가 나가지 않게 할 때 사용.
+
+   */
+
+  clampNewSec?: (sec: number) => number
+
+  /**
+
+   * preview 결과에 대해 마우스 떼지 않고도 즉시 commit 처리할지 판단.
+
+   * `true` 반환 시 그 preview 의 newSec 으로 commit + drag 자동 종료.
+
+   * 사용자가 같은 작업을 이어 하려면 마우스를 떼고 다시 클릭해야 한다.
+
+   */
+
+  shouldAutoCommit?: (result: EdgeDragResult) => boolean
+
 }
 
 
@@ -159,6 +181,10 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
   const dragSnapshotRef = useRef<SubtitleLine[] | null>(null)
 
   const lastResultRef = useRef<EdgeDragResult | null>(null)
+
+  /** `finish` 가 `onMove` 보다 뒤에 선언되어 TDZ — ref 로 우회해 onMove 에서 호출 */
+
+  const finishRef = useRef<((cancelled: boolean) => void) | null>(null)
 
 
 
@@ -226,7 +252,9 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
 
       // 까지 단어가 쓸려 오른쪽 끝으로 점프하는 버그가 있었다.
 
-      const sec = drag.anchorEdgeSec + delta
+      const secRaw = drag.anchorEdgeSec + delta
+
+      const sec = opts.clampNewSec ? opts.clampNewSec(secRaw) : secRaw
 
       drag.lastSec = sec
 
@@ -254,6 +282,12 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
       lastResultRef.current = result
 
       opts.onPreview?.(result)
+
+      if (opts.shouldAutoCommit?.(result)) {
+
+        finishRef.current?.(false)
+
+      }
 
     },
 
@@ -359,6 +393,8 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
          * 핸들이 prev.start 까지 끌려가 있어도 tombstone 이 안 들어가 있다.
          */
 
+        const commitSec = opts.clampNewSec ? opts.clampNewSec(drag.lastSec) : drag.lastSec
+
         const commitResult = applyWordEdgeDrag({
 
           subtitles: snap,
@@ -367,7 +403,7 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
 
           edge: drag.edge,
 
-          newSec: drag.lastSec,
+          newSec: commitSec,
 
           minWordWidthSec: opts.minWordWidthSec ?? MIN_WORD_DURATION_SEC,
 
@@ -396,6 +432,8 @@ export function useWordEdgeDrag(opts: UseWordEdgeDragOptions): WordEdgeDragHandl
     [onMove, opts]
 
   )
+
+  finishRef.current = finish
 
 
 

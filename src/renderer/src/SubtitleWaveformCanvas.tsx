@@ -204,9 +204,6 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       toL: { x: number; y: number }
       toR: { x: number; y: number }
     } | null>(null)
-    /** 좌·우 단어 경계 넘김 시 한 단어씩 뷰 확장 */
-    const [expandL, setExpandL] = useState(0)
-    const [expandR, setExpandR] = useState(0)
     /** 재생·컷에 쓰는 트림 구간(편집 축 초) */
     const [editRange, setEditRange] = useState<{ start: number; end: number } | null>(null)
     /** 자르기·재생 시작 라인 (편집축 초) — 항상 `editRange` 안에서만 이동 */
@@ -226,9 +223,21 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
      * UI 가 핸들 색을 빨갛게 바꿔 사용자에게 "여기서 떼면 통째 합쳐진다" 를 알려준다.
      */
     const [handleAtLimit, setHandleAtLimit] = useState<'start' | 'end' | null>(null)
-    /** 한 번의 드래그에서 좌·우로 단어 경계 넘김 확장 시도 횟수(대부분 1회면 충분) */
-    const expandLeftTokensRef = useRef(4)
-    const expandRightTokensRef = useRef(4)
+
+    /**
+     * **고정 PPS 정책** — 활성 단어를 처음 선택했을 때 (`activeWordId` 가 새로 잡힐 때) 한 번
+     *  `pps = boxWidth0 / initialViewSpan` 으로 계산해 박제. 이후 흡수 commit 으로 viewWin 시간폭이
+     *  늘어나도 PPS 는 변하지 않고, 박스 픽셀 폭이 시간폭에 비례해 늘어난다 (zoom-out 없이 물리적 추가).
+     */
+    const ppsRef = useRef<number | null>(null)
+    /** 박스 left/width 픽셀 — mount 좌측 기준. portal 인라인 스타일로 직접 매핑된다. */
+    const [boxLayoutPx, setBoxLayoutPx] = useState<{ left: number; width: number } | null>(null)
+    const boxLayoutPxRef = useRef<{ left: number; width: number } | null>(null)
+    boxLayoutPxRef.current = boxLayoutPx
+    /** 마지막 트림 핸들 방향 — commit 직후 viewWin 확장 시 어느 쪽 픽셀을 고정할지 결정. */
+    const lastTrimEdgeRef = useRef<'start' | 'end' | null>(null)
+    /** 현재 PPS 가 박제된 단어 ID — 같으면 PPS/박스 left 유지, 다르면 새로 캡처. */
+    const lockedPpsWordIdRef = useRef<string | null>(null)
 
     const rowsRef = useRef(rows)
     rowsRef.current = rows
@@ -264,8 +273,6 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       return `${waveformCardBounds.start}|${waveformCardBounds.end}`
     }, [waveformCardBounds])
 
-    const metricsDurationKey = metrics != null ? metrics.durationSec.toFixed(8) : ''
-
     useEffect(() => {
       lastPublishedZoomSigRef.current = null
     }, [activeLineIndex])
@@ -289,13 +296,19 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     }, [onZoomViewRange])
 
     /**
-     * 마지막으로 viewWin 을 *재계산* 한 키 — `activeLineIndex|가시단어슬롯|expandL|expandR`.
-     * 자르기 직후 `activeWordId` 만 바뀌고(좌측 조각의 새 id) **같은 슬롯**이면 키가 동일해
-     *  `computeWordContextWindow` 를 다시 돌리지 않아 파형 뷰가 튀지 않는다.
+     * **viewWin 박제** — `activeLineIndex|activeWordId|wordStartEnd` 가 바뀔 때만 ±1 이웃으로
+     *  `computeWordContextWindow(..., 0, 0)` 한 번 잡는다. 드래그 중에는 `setViewWin` 호출이 없어
+     *  파형이 절대 움직이지 않는다(스크롤 0). 흡수 commit 으로 활성 단어의 start/end 가 바뀌면
+     *  anchor 가 바뀌어 새로운 ±1 V0 가 즉시 재고정되고, 이때만 다음/이전 단어의 파동이 한 칸씩 붙는다.
      */
-    const lastViewKeyRef = useRef<string | null>(null)
+    const viewWinLockedAnchorRef = useRef<string | null>(null)
+    /**
+     * 단어 블록 선택(`activeWordId` 있음) 시 ±1 컨텍스트 창을 **한 번만** 잡고 ref 에 박제.
+     * `viewWinRef` 가 아직 커밋 전이거나 deps 로 effect 가 재돌아도 동일 anchor 면 `setViewWin` 호출 안 함.
+     */
+    const frozenWordViewWinRef = useRef<{ anchorKey: string; start: number; end: number } | null>(null)
 
-    /** 활성 단어 ±이웃 중심 줌(확장 시 한 단어씩) — 선택 없을 때만 전체 줄 폴백 */
+    /** 활성 단어 ±1 이웃 V0 한 번만 — 이후 viewWin 고정 */
     useLayoutEffect(() => {
       /**
        * **트림 드래그 중에는 viewWin 을 고정** — 미리보기에서 `setViewWin` 을 호출하지 않지만,
@@ -306,48 +319,211 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       if (draggingHandle === 'trimStart' || draggingHandle === 'trimEnd') return
 
       if (activeLineIndex === null || !metrics) {
+        wfLog('peaks', 'setViewWin [diag-vw] reset(null)', {
+          reason: activeLineIndex === null ? 'no-active-line' : 'no-metrics'
+        })
         setViewWin(null)
-        lastViewKeyRef.current = null
+        viewWinLockedAnchorRef.current = null
+        frozenWordViewWinRef.current = null
+        ppsRef.current = null
+        lockedPpsWordIdRef.current = null
+        lastTrimEdgeRef.current = null
+        setBoxLayoutPx(null)
         return
       }
       const row = rowsRef.current[activeLineIndex]
       const words = row?.words ?? []
       const wid = activeWordIdRef.current
       const wi = wid ? words.findIndex((x) => x.id === wid) : -1
-      const key = `${activeLineIndex}|${wi}|${expandL}|${expandR}`
-      if (key === lastViewKeyRef.current && viewWinRef.current) return
+      const activeW = wi >= 0 ? words[wi] : null
+      /**
+       * **anchor 에 활성 단어 start/end 포함** — 흡수 commit 후 단어 폭이 바뀌면 자동으로 재고정.
+       *  rows 의 Word 는 화면용(visible) 단어만 포함하므로 흡수된 단어는 이미 빠져 있어 ±1 이웃이
+       *  자연스레 새 이웃으로 갱신된다 → 다음/이전 단어 파동이 한 단어씩 추가된다.
+       */
+      const wSig = activeW ? `${activeW.start.toFixed(6)}:${activeW.end.toFixed(6)}` : ''
+      const anchorKey = `${activeLineIndex}|${wid ?? ''}|${wSig}`
+      /**
+       * 같은 단어 앵커면 ref 기준으로 즉시 종료 — `viewWinRef`/deps 재실행과 무관하게 박제.
+       */
+      if (wid && frozenWordViewWinRef.current?.anchorKey === anchorKey) return
       /**
        * **stale id 보호** — split 직후처럼 부모가 activeWordId 를 새 조각으로 옮기기 전 한 프레임,
        *  자식 effect 가 `wi === -1` 상태에서 먼저 돌아 전체 라인 폴백 뷰로 빠지면서 파형이 “휙” 튀어 보인다.
-       *  그 짧은 transient 동안 기존 viewWin 을 그대로 유지하고 lastViewKey 도 업데이트하지 않는다.
-       *  다음 렌더에서 새 id 가 도착하면 정상적으로 재계산.
+       *  그 짧은 transient 동안 기존 viewWin 을 그대로 유지하고 locked anchor 도 업데이트하지 않는다.
        */
       if (wid && wi < 0 && viewWinRef.current) return
-      lastViewKeyRef.current = key
 
       const mediaCap = metrics.durationSec
 
-      if (wi >= 0 && words.length > 0 && wid) {
-        const ctx = computeWordContextWindow(words, wi, expandL, expandR, {
+      if (wi >= 0 && words.length > 0 && wid && activeW) {
+        /** ±1 컨텍스트(좌1·활성·우1) — 처음 박스에 들어갈 시간 폭의 기준 */
+        const ctx = computeWordContextWindow(words, wi, 0, 0, {
           mediaDurationSec: mediaCap
         })
-        if (ctx) {
-          const ns = ctx.windowStart
-          const ne = ctx.windowEnd
+        if (!ctx) {
+          if (viewWinRef.current) return
+        } else {
+          const isFirstLockForWord = lockedPpsWordIdRef.current !== wid
+          const PANEL_MAX_PX = 448
+
+          if (isFirstLockForWord) {
+            /**
+             * **첫 lock** — PPS / 박스 left·width / viewWin 을 모두 처음 캡처.
+             *  활성 단어 mid 가 단어 칩(`data-word-id`) 의 가로 중앙 픽셀에 오도록 박스 left 결정.
+             *  mount/chip 이 아직 렌더되지 않았으면 lock 자체를 미룬다 — viewWin 유지하고 effect 재시도.
+             */
+            const mountEl = portalHost ?? null
+            const cardEl = articleEl ?? null
+            if (!mountEl || !cardEl) return
+            const mountRect = mountEl.getBoundingClientRect()
+            const mountW = mountRect.width
+            const mountLeft = mountRect.left
+            if (mountW <= 0) return
+
+            let chipEl: HTMLElement | null = null
+            try {
+              chipEl = cardEl.querySelector(
+                `[data-word-id="${CSS.escape(wid)}"]`
+              ) as HTMLElement | null
+            } catch {
+              chipEl = null
+            }
+            if (!chipEl) {
+              chipEl = cardEl.querySelector(
+                '[data-waveform-active-word-chip="1"]'
+              ) as HTMLElement | null
+            }
+            if (!chipEl) return
+
+            const boxWidth0 = Math.max(1, Math.min(mountW, PANEL_MAX_PX))
+            const span = Math.max(ctx.windowEnd - ctx.windowStart, 1e-6)
+            const pps = boxWidth0 / span
+
+            const wa = Math.min(activeW.start, activeW.end)
+            const wb = Math.max(activeW.start, activeW.end)
+            const wMid = (wa + wb) / 2
+
+            const chipRect = chipEl.getBoundingClientRect()
+            const chipCenterFromMount = (chipRect.left + chipRect.right) / 2 - mountLeft
+
+            /** 박스 안에서 wMid 가 위치할 픽셀(박스 left 기준). */
+            const wMidPxOnBox = (wMid - ctx.windowStart) * pps
+            const idealLeft = chipCenterFromMount - wMidPxOnBox
+            /** 최초 lock 때만 mount 폭 안으로 클램프 — 카드 안에서 시작이 잘 보이게. */
+            const maxLeft = Math.max(0, (mountW || boxWidth0) - boxWidth0)
+            const left = clampPx(idealLeft, 0, maxLeft)
+
+            const nextWin = { start: ctx.windowStart, end: ctx.windowEnd }
+            ppsRef.current = pps
+            lockedPpsWordIdRef.current = wid
+            lastTrimEdgeRef.current = null
+            viewWinLockedAnchorRef.current = anchorKey
+            frozenWordViewWinRef.current = { anchorKey, ...nextWin }
+            setBoxLayoutPx({ left, width: boxWidth0 })
+            setViewWin((prev) => {
+              if (
+                prev != null &&
+                Math.abs(prev.start - nextWin.start) < 1e-5 &&
+                Math.abs(prev.end - nextWin.end) < 1e-5
+              ) {
+                return prev
+              }
+              wfLog('peaks', 'setViewWin [diag-vw] first-lock', {
+                anchorKey,
+                pps,
+                boxWidth0,
+                left,
+                viewWin: { s: +nextWin.start.toFixed(4), e: +nextWin.end.toFixed(4) }
+              })
+              return nextWin
+            })
+            return
+          }
+
+          /**
+           * **재고정** — 같은 단어 ID, 단어 start/end 가 바뀐 경우(=흡수 commit 직후).
+           *  PPS 유지, 흡수 방향에 따라 한쪽 픽셀만 고정하고 viewWin 시간폭을 늘려 박스 width 증가.
+           */
+          const pps = ppsRef.current
+          const prevWin = frozenWordViewWinRef.current
+          const prevLayout = boxLayoutPxRef.current
+          const dir = lastTrimEdgeRef.current
+          if (pps != null && prevWin != null && prevLayout != null && dir != null) {
+            let nextStart = prevWin.start
+            let nextEnd = prevWin.end
+            let nextLeft = prevLayout.left
+            if (dir === 'end') {
+              /** 우측 흡수 — 좌측 픽셀 고정, 우측만 자람. ctx.windowEnd 가 새 우 이웃 끝. */
+              nextEnd = Math.max(prevWin.end, ctx.windowEnd)
+            } else {
+              /** 좌측 흡수 — 우측 픽셀 고정, 좌측만 자람. ctx.windowStart 가 새 좌 이웃 시작. */
+              nextStart = Math.min(prevWin.start, ctx.windowStart)
+              const widthDelta = (prevWin.start - nextStart) * pps
+              nextLeft = prevLayout.left - widthDelta
+            }
+            const newWidth = pps * Math.max(nextEnd - nextStart, 1e-6)
+            const nextWin = { start: nextStart, end: nextEnd }
+            const nextBox = { left: nextLeft, width: newWidth }
+            viewWinLockedAnchorRef.current = anchorKey
+            frozenWordViewWinRef.current = { anchorKey, ...nextWin }
+            /** 트림 방향 소비 — 다음 흡수 전까지는 다시 적용되지 않게 */
+            lastTrimEdgeRef.current = null
+            setBoxLayoutPx((p) =>
+              p != null &&
+              Math.abs(p.left - nextBox.left) < 0.5 &&
+              Math.abs(p.width - nextBox.width) < 0.5
+                ? p
+                : nextBox
+            )
+            setViewWin((prev) => {
+              if (
+                prev != null &&
+                Math.abs(prev.start - nextWin.start) < 1e-5 &&
+                Math.abs(prev.end - nextWin.end) < 1e-5
+              ) {
+                return prev
+              }
+              wfLog('peaks', 'setViewWin [diag-vw] re-lock after absorb', {
+                anchorKey,
+                dir,
+                prevWin: { s: +prevWin.start.toFixed(4), e: +prevWin.end.toFixed(4) },
+                nextWin: { s: +nextWin.start.toFixed(4), e: +nextWin.end.toFixed(4) },
+                boxLeft: nextLeft,
+                boxWidth: newWidth
+              })
+              return nextWin
+            })
+            return
+          }
+
+          /**
+           * 흡수 방향 정보가 없거나 prev 상태가 빠진 비정상 — 기존 박스 폭 유지하고 ctx 범위만 반영.
+           */
+          const fallbackWin = { start: ctx.windowStart, end: ctx.windowEnd }
+          viewWinLockedAnchorRef.current = anchorKey
+          frozenWordViewWinRef.current = { anchorKey, ...fallbackWin }
           setViewWin((prev) => {
             if (
               prev != null &&
-              Math.abs(prev.start - ns) < 1e-5 &&
-              Math.abs(prev.end - ne) < 1e-5
+              Math.abs(prev.start - fallbackWin.start) < 1e-5 &&
+              Math.abs(prev.end - fallbackWin.end) < 1e-5
             ) {
               return prev
             }
-            return { start: ns, end: ne }
+            return fallbackWin
           })
           return
         }
       }
 
+      /**
+       * **단어 박제 보호** — 활성 단어가 있고 박제된 viewWin 이 살아있다면, ctx 가 잠시 못 잡혔다는
+       *  이유로 폴백(라인/카드) 으로 떨어져 `setViewWin` 을 호출하면 파형이 흔들린다. 그대로 유지.
+       */
+      if (wid && frozenWordViewWinRef.current) return
+
+      frozenWordViewWinRef.current = null
       const win =
         waveformCardBounds != null
           ? computeLineZoomWindowFromCardBounds(waveformCardBounds.start, waveformCardBounds.end, {
@@ -365,6 +541,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       if (!win) return
       const ns = win.windowStart
       const ne = win.windowEnd
+      viewWinLockedAnchorRef.current = null
       setViewWin((prev) => {
         if (
           prev != null &&
@@ -373,18 +550,24 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         ) {
           return prev
         }
+        wfLog('peaks', 'setViewWin [diag-vw] line-fallback commit', {
+          reason: waveformCardBounds != null ? 'card-bounds' : 'line-words',
+          prev: prev ? { s: +prev.start.toFixed(4), e: +prev.end.toFixed(4) } : null,
+          next: { s: +ns.toFixed(4), e: +ne.toFixed(4) },
+          hasActiveWord: Boolean(wid)
+        })
         return { start: ns, end: ne }
       })
     }, [
       activeLineIndex,
-      metrics,
-      metricsDurationKey,
-      cardBoundsSig,
-      activeRowTimesSig,
-      expandL,
-      expandR,
       activeWordId,
-      draggingHandle
+      activeRowTimesSig,
+      metrics,
+      draggingHandle,
+      cardBoundsSig,
+      portalHost,
+      articleEl,
+      setViewWin
     ])
 
     useEffect(() => {
@@ -477,19 +660,12 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     wordEdgeBridgeRef.current = wordEdgeSubtitleBridge
 
     const contextClampLimits = useMemo(() => {
-      if (centerWordIndex < 0 || activeWords.length === 0) return null
-      const li = Math.max(0, centerWordIndex - 1 - expandL)
-      const ri = Math.min(activeWords.length - 1, centerWordIndex + 1 + expandR)
-      let lo = Infinity
-      let hi = -Infinity
-      for (let i = li; i <= ri; i++) {
-        const w = activeWords[i]!
-        lo = Math.min(lo, w.start, w.end)
-        hi = Math.max(hi, w.start, w.end)
-      }
+      if (!viewWin) return null
+      const lo = Math.min(viewWin.start, viewWin.end)
+      const hi = Math.max(viewWin.start, viewWin.end)
       if (!(hi > lo + 1e-9)) return null
       return { lo, hi }
-    }, [activeWords, centerWordIndex, expandL, expandR])
+    }, [viewWin])
 
     const waveFillBands = useMemo((): WaveformFillBand[] | null => {
       if (centerWordIndex < 0 || !viewWin || !editRange) return null
@@ -537,17 +713,15 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     useEffect(() => {
       /**
        * **stale id 보호** — split 직후처럼 activeWordId 가 새 행 배열에 아직 없는 transient 동안에는
-       *  editRange/expand 를 비우지 않고 그대로 둔다. 다음 렌더에 부모가 새 id 로 갱신하면
+       *  editRange 를 비우지 않고 그대로 둔다. 다음 렌더에 부모가 새 id 로 갱신하면
        *  centerWordIndex 가 다시 유효해져 이 effect 가 정상 경로로 들어간다.
        */
       if (activeLineIndex == null || !activeWordId) {
         setEditRange(null)
-        setExpandL(0)
-        setExpandR(0)
         return
       }
       if (centerWordIndex < 0) {
-        // stale: 다음 렌더 기다림 — 기존 editRange/expand 유지
+        // stale: 다음 렌더 기다림 — 기존 editRange 유지
         return
       }
       const w = rowsRef.current[activeLineIndex]?.words?.[centerWordIndex]
@@ -555,8 +729,6 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       const lo = Math.min(w.start, w.end)
       const hi = Math.max(w.start, w.end)
       setEditRange({ start: lo, end: hi })
-      setExpandL(0)
-      setExpandR(0)
     }, [activeLineIndex, activeWordId, centerWordIndex, activeWordSpanSig])
 
     /** 타임코드·외부 편집으로 단어 경계가 바뀌면 트림만 클램프 */
@@ -609,15 +781,34 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       [pointerToTimeOnStrip]
     )
 
+    /**
+     * `applyWordEdgeDrag` 축(미디어 초) — 현재 viewWin(=V0) 안으로 양방향 클램프.
+     *  트림 핸들은 절대 V0 밖으로 못 나가고 viewWin 도 드래그 중 확장되지 않는다(스크롤 0).
+     *  V0 끝에서 손을 떼면 commit 의 흡수 로직이 이웃 단어를 합치고, 그 결과 활성 단어의 start/end 가
+     *  바뀌면 위쪽 layout effect 의 `anchorKey`(start/end 포함) 가 바뀌어 **±1 V0 를 새 단어 기준으로 재고정**.
+     *  → 흡수된 쪽에 이전엔 보이지 않던 다음/이전 단어 파동이 자연스럽게 한 칸씩 붙는다.
+     */
+    const clampNewSecToViewWinMedia = useCallback((sec: number): number => {
+      const b = wordEdgeBridgeRef.current
+      const vw = viewWinRef.current
+      if (!b || !vw) return sec
+      const loE = Math.min(vw.start, vw.end)
+      const hiE = Math.max(vw.start, vw.end)
+      const loM = b.editSecToMediaSec(loE)
+      const hiM = b.editSecToMediaSec(hiE)
+      const minE = Math.min(loM, hiM)
+      const maxE = Math.max(loM, hiM)
+      return clampPx(sec, minE, maxE)
+    }, [])
+
     const onWordEdgePreview = useCallback((result: EdgeDragResult) => {
       const b = wordEdgeBridgeRef.current
       if (!b) return
       /**
        * **SSOT 미리보기는 의도적으로 호출하지 않는다** — 드래그 중에는 단어블록이 움직이지 않고,
        *  포인터를 떼는 순간(`onCommit`)에 한 번에 합치기가 적용된다.
-       *  트림 핸들 시각만 `setEditRange` 로 갱신한다. **`viewWin` 은 건드리지 않는다** — 단어 구간이
-       *  짧아질수록 `viewWin = [start,end]` 맞춤 줌이 극단적으로 커지는(로그의 ~0.04s 구간 등) 문제가 있어서,
-       *  트림 중 파형 줌·스크롤은 고정이고 핸들만 움직인다.
+       *  트림 핸들 시각만 `setEditRange` 로 갱신한다. `viewWin` 은 기본 박제이며,
+       *  핸들이 창 끝 밖으로 나가려 할 때만 `clampNewSecToViewWinMedia` 가 이웃 단어 구간을 붙인다.
        */
       const li = activeLineIndexRef.current
       const cwi = centerWordIndexRef.current
@@ -655,12 +846,18 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
           }
         }
         const limitEps = 1e-5
-        let nextLimit: 'start' | 'end' | null = null
-        if (prevActive && Math.abs(w.start - prevActive.start) < limitEps) {
-          nextLimit = 'start'
-        } else if (nextActive && Math.abs(w.end - nextActive.end) < limitEps) {
-          nextLimit = 'end'
+        const vw = viewWinRef.current
+        const wEditS = b.mediaSecToEditSec(lo)
+        const wEditE = b.mediaSecToEditSec(hi)
+        let atStart = Boolean(prevActive && Math.abs(w.start - prevActive.start) < limitEps)
+        let atEnd = Boolean(nextActive && Math.abs(w.end - nextActive.end) < limitEps)
+        if (vw) {
+          const vLo = Math.min(vw.start, vw.end)
+          const vHi = Math.max(vw.start, vw.end)
+          if (Math.abs(wEditS - vLo) < limitEps) atStart = true
+          if (Math.abs(wEditE - vHi) < limitEps) atEnd = true
         }
+        const nextLimit: 'start' | 'end' | null = atStart ? 'start' : atEnd ? 'end' : null
         setHandleAtLimit((prev) => (prev === nextLimit ? prev : nextLimit))
       }
     }, [])
@@ -698,6 +895,12 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         mutatedDetail,
         tombstoneDetail
       })
+
+      /**
+       * **viewWin** — commit 시에는 `setViewWin` 하지 않음. 트림 중 이웃 붙이기는
+       *  `clampNewSecToViewWinMedia` 가 담당한다.
+       */
+
       wordEdgeBridgeRef.current?.onSubtitleLinesCommit(result.subtitles)
 
       /**
@@ -721,11 +924,6 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     const onWordEdgeDragFinish = useCallback(({ cancelled }: { cancelled: boolean }) => {
       setDraggingHandle(null)
       setHandleAtLimit(null)
-      /**
-       * 종료 후 통상 viewWin 정책으로 복귀하도록 lastViewKey 를 무효화한다.
-       * 다음 useLayoutEffect 실행에서 새 viewWin 이 계산된다.
-       */
-      lastViewKeyRef.current = null
       if (!cancelled) return
       const li = activeLineIndexRef.current
       const cwi = centerWordIndexRef.current
@@ -740,6 +938,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     const { startDrag: startWordEdgeDrag } = useWordEdgeDrag({
       getSubtitles: getSubtitleLinesStable,
       secAtClientX: mediaSecAtPointerX,
+      clampNewSec: clampNewSecToViewWinMedia,
       onPreview: onWordEdgePreview,
       onCommit: onWordEdgeCommit,
       onDragFinish: onWordEdgeDragFinish,
@@ -749,10 +948,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     })
 
     /**
-     * 트림 핸들 드래그 — 끝 단어 경계(=현재 뷰 좌·우 끝)에 닿으면 잠시 브레이크를 걸어
-     * 핸들이 그 자리에서 멈추도록 한다. 커서가 경계 밖으로 일정 픽셀(`BRAKE_PX_OVERSHOOT`)
-     * 이상 더 끌리면 그제서야 한 단어만큼 뷰를 확장한다.
-     * — 사용자가 드래그 도중 파형이 갑자기 휙 따라 움직이지 않도록 하기 위함.
+     * 트림 핸들 드래그 — 브리지 없을 때만 로컬 `editRange` 갱신. 한계는 `viewWin`(±1 이웃 V0) 과 동일.
      */
     const onTrimHandlePointerDown = useCallback(
       (which: 'start' | 'end') => (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -769,6 +965,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
               centerWordIndex: cwi,
               storageWi
             })
+            /** 흡수 commit 후 layout effect 가 어느 쪽 픽셀을 고정할지 결정 — 즉시 기록 */
+            lastTrimEdgeRef.current = which
             setDraggingHandle(which === 'start' ? 'trimStart' : 'trimEnd')
             startWordEdgeDrag(
               e,
@@ -788,8 +986,6 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         })
         e.stopPropagation()
         e.preventDefault()
-        expandLeftTokensRef.current = 4
-        expandRightTokensRef.current = 4
         const target = e.currentTarget
         try {
           target.setPointerCapture(e.pointerId)
@@ -797,14 +993,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
           /* ignore */
         }
         setDraggingHandle(which === 'start' ? 'trimStart' : 'trimEnd')
-        /** 경계 밖으로 이만큼(px) 더 끌어야 뷰가 확장된다 */
-        const BRAKE_PX_OVERSHOOT = 18
 
         const move = (ev: PointerEvent): void => {
-          const outer = zoomOuterRef.current
-          const vw = viewWinRef.current
-          if (!outer || !vw) return
-          const rect = outer.getBoundingClientRect()
           const t = pointerToTimeOnStrip(ev.clientX)
           const er = editRangeRef.current
           const limits = contextClampLimitsRef.current
@@ -816,43 +1006,11 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
           const minSpan = MIN_TRIM_SPAN_SEC
 
           if (which === 'start') {
-            if (t < lo - 1e-9) {
-              const a = Math.min(vw.start, vw.end)
-              const b = Math.max(vw.start, vw.end)
-              const span = Math.max(b - a, 1e-9)
-              const edgePx = ((lo - a) / span) * rect.width
-              const curPx = ev.clientX - rect.left
-              const overshoot = Math.max(0, edgePx - curPx)
-              if (overshoot >= BRAKE_PX_OVERSHOOT && expandLeftTokensRef.current > 0) {
-                expandLeftTokensRef.current -= 1
-                setExpandL((x) => x + 1)
-                setEditRange({ start: lo, end: e0 })
-              } else {
-                setEditRange({ start: lo, end: e0 })
-              }
-            } else {
-              const ns = clampPx(t, lo, e0 - minSpan)
-              setEditRange({ start: ns, end: e0 })
-            }
+            const ns = clampPx(t, lo, e0 - minSpan)
+            setEditRange({ start: ns, end: e0 })
           } else {
-            if (t > hi + 1e-9) {
-              const a = Math.min(vw.start, vw.end)
-              const b = Math.max(vw.start, vw.end)
-              const span = Math.max(b - a, 1e-9)
-              const edgePx = ((hi - a) / span) * rect.width
-              const curPx = ev.clientX - rect.left
-              const overshoot = Math.max(0, curPx - edgePx)
-              if (overshoot >= BRAKE_PX_OVERSHOOT && expandRightTokensRef.current > 0) {
-                expandRightTokensRef.current -= 1
-                setExpandR((x) => x + 1)
-                setEditRange({ start: s, end: hi })
-              } else {
-                setEditRange({ start: s, end: hi })
-              }
-            } else {
-              const ne = clampPx(t, s + minSpan, hi)
-              setEditRange({ start: s, end: ne })
-            }
+            const ne = clampPx(t, s + minSpan, hi)
+            setEditRange({ start: s, end: ne })
           }
         }
         const up = (ev: PointerEvent): void => {
@@ -1083,12 +1241,20 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
      * 활성 단어 칩 ↔ 파형 트림 시작/끝 라인을 잇는 SVG 좌표 재계산.
      * - `data-word-id` 로 칩 DOM 을 찾고, `zoomOuterRef` 와 `trimHandlePct` 로 파형 위 끝점을 잡는다.
      * - 좌표는 모두 `<article>` 로컬 — viewport 스크롤/리사이즈 변화에도 정확히 따라감.
+     *
+     * **위치 박제 정책** — 같은 활성 단어 동안 트림으로 칩 폭/위치가 바뀌어도 연결선은 처음 측정한 좌표로 고정.
+     *   다른 단어를 더블클릭(`activeWordId` 변경) 하면 그 시점 한 번 재측정.
      */
-    const recomputeConnectorGeom = useCallback((): void => {
+    const connectorAnchorRef = useRef<string | null>(null)
+    const recomputeConnectorGeom = useCallback((force = false): void => {
       if (!activeWordId || !articleEl || !trimHandlePct) {
         setConnectorGeom(null)
+        connectorAnchorRef.current = null
         return
       }
+      const anchorKey = `${activeLineIndex ?? -1}|${activeWordId}`
+      if (!force && connectorAnchorRef.current === anchorKey) return
+
       const waveEl = zoomOuterRef.current
       if (!waveEl) {
         setConnectorGeom(null)
@@ -1144,6 +1310,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
           y: waveRect.top - articleRect.top
         }
       }
+      connectorAnchorRef.current = anchorKey
       setConnectorGeom((prev) => {
         if (
           prev &&
@@ -1162,47 +1329,35 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         }
         return next
       })
-    }, [activeWordId, articleEl, trimHandlePct])
+    }, [activeLineIndex, activeWordId, articleEl, trimHandlePct])
 
-    /** 트림 위치·뷰 변화 시 즉시 재계산 (paint 전) */
+    /** 활성 단어 / 줄 변경 시 한 번 재측정 (paint 전) */
     useLayoutEffect(() => {
-      recomputeConnectorGeom()
-    }, [recomputeConnectorGeom, mountLayoutKey, viewWin])
+      connectorAnchorRef.current = null
+      recomputeConnectorGeom(true)
+    }, [activeLineIndex, activeWordId, articleEl, recomputeConnectorGeom])
 
-    /** 카드/칩/파형 박스 리사이즈 + 윈도우 스크롤·리사이즈 동기화 */
+    /**
+     * **첫 측정이 한 프레임 늦게 들어오는 케이스** — 칩이 아직 렌더 전이면 위 effect 가 조용히 실패한다.
+     *  ResizeObserver 로 카드 layout 첫 안정화만 잡아서 1회 측정 후 즉시 자기 자신을 해제.
+     *  그 다음 트림으로 인한 layout 변화는 무시 → 연결선 박제.
+     */
     useEffect(() => {
       if (!articleEl) return
-      let rafPending = 0
-      const schedule = (): void => {
-        if (rafPending) return
-        rafPending = window.requestAnimationFrame(() => {
-          rafPending = 0
-          recomputeConnectorGeom()
-        })
-      }
-      const ro = new ResizeObserver(schedule)
+      if (connectorAnchorRef.current != null) return
+      let settled = false
+      const ro = new ResizeObserver(() => {
+        if (settled) return
+        recomputeConnectorGeom(true)
+        if (connectorAnchorRef.current != null) {
+          settled = true
+          ro.disconnect()
+        }
+      })
       ro.observe(articleEl)
       const waveEl = zoomOuterRef.current
       if (waveEl) ro.observe(waveEl)
-      let chip: HTMLElement | null = null
-      if (activeWordId) {
-        try {
-          chip = articleEl.querySelector(
-            `[data-word-id="${CSS.escape(activeWordId)}"]`
-          ) as HTMLElement | null
-        } catch {
-          chip = null
-        }
-      }
-      if (chip) ro.observe(chip)
-      window.addEventListener('resize', schedule)
-      window.addEventListener('scroll', schedule, true)
-      return () => {
-        if (rafPending) cancelAnimationFrame(rafPending)
-        ro.disconnect()
-        window.removeEventListener('resize', schedule)
-        window.removeEventListener('scroll', schedule, true)
-      }
+      return () => ro.disconnect()
     }, [articleEl, activeWordId, recomputeConnectorGeom])
 
     const peaksReportedOnce = useRef(false)
@@ -1308,20 +1463,37 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     const waveformPortal =
       portalHost &&
       createPortal(
-        <div className="subtitle-waveform-flow-root relative w-full min-w-0">
-          <div className="subtitle-waveform-stack w-full min-w-0 px-1 pb-1 pt-0">
-            <div className="w-full min-w-0">
+        <div
+          className="subtitle-waveform-flow-root relative w-full min-w-0"
+          style={{ overflow: 'visible' }}
+        >
+          <div
+            className="subtitle-waveform-stack w-full min-w-0 px-1 pb-1 pt-0"
+            style={{ overflow: 'visible' }}
+          >
+            <div className="w-full min-w-0" style={{ overflow: 'visible' }}>
               {/*
                 패널 가로 위치 — `--subwave-panel-left-px` 가 있으면 그 픽셀만큼 왼쪽에서 시프트,
                 없으면 `margin: 0 auto` 로 가운데 정렬. 부모(`SubtitleVirtualList`) 가 활성 단어 칩
                 중앙을 기준으로 계산해 카드 영역 안에서 클램프한 값을 넣어 준다.
               */}
               <div
-                className="w-[min(100%,21rem)] max-w-full"
-                style={{
-                  marginLeft: 'var(--subwave-panel-left-px, auto)',
-                  marginRight: 'auto'
-                }}
+                className="min-w-0"
+                style={
+                  boxLayoutPx != null
+                    ? {
+                        marginLeft: `${boxLayoutPx.left}px`,
+                        marginRight: 0,
+                        width: `${boxLayoutPx.width}px`,
+                        maxWidth: 'none'
+                      }
+                    : {
+                        marginLeft: 'var(--subwave-panel-left-px, auto)',
+                        marginRight: 'auto',
+                        width: 'min(100%, 28rem)',
+                        maxWidth: '100%'
+                      }
+                }
               >
                 {/*
                   ── 박스 위쪽 라벨 스트립 ──
@@ -1361,7 +1533,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                 {/* 흰 라인 둥근 사각형 — 안쪽으로 파형·핸들·자르기 라인만 (라벨은 위 스트립으로 분리) */}
                 <div
                   ref={zoomOuterRef}
-                  className="relative isolate h-28 w-full min-w-0 overflow-hidden rounded-xl border-2 border-white/85 bg-[#0c1018]"
+                  className="relative isolate h-36 w-full min-w-0 overflow-hidden rounded-xl border-2 border-white/85 bg-[#0c1018]"
                 >
                   {/**
                    * 파형 본체 드래그(패닝) **비활성** — 사용자가 파형을 잡아 좌우로 끌면

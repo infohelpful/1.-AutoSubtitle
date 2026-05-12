@@ -685,10 +685,14 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
 
   /**
    * 활성 단어 칩 중앙에 파형 패널을 정렬한다.
-   * - 더블클릭한 칩의 가로 중앙 좌표를 기준으로 패널이 가운데 정렬되도록 `--subwave-panel-left-px` CSS 변수를
+   * - 더블클릭한 칩의 가로 중앙 좌표를 기준으로 `--subwave-panel-left-px` CSS 변수를 **활성 단어가 바뀐 직후 1회만**
    *   파형 마운트(`subtitle-waveform-mount`)에 기록한다.
    * - 카드 좌/우 경계를 벗어나면 가능한 만큼 좌·우 가까이 붙도록 `[0, mountW - panelW]` 로 클램프한다.
    * - 활성 칩을 찾을 수 없으면 변수 제거 → 패널은 기본 `margin: auto` 로 가운데 정렬된다.
+   *
+   * **위치 박제 정책** — 활성 단어 ID 가 같은 동안은 트림으로 칩 폭/텍스트가 바뀌어도 패널 위치를 재계산하지 않는다.
+   *   ResizeObserver / window resize 도 무시. 다른 단어를 더블클릭(`waveformActiveWordId` 변경) 하거나 줄/카드 가
+   *   바뀔 때만 1회 재측정한다.
    */
   useLayoutEffect(() => {
     if (!(waveformEnabled && waveformExpandedLineIndex === index)) return
@@ -696,11 +700,11 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     const card = articleRef.current
     if (!mount || !card) return
 
-    const PANEL_MAX_PX = 336
+    const PANEL_MAX_PX = 448
 
-    const applyOffset = (): void => {
+    const computeAndApply = (): boolean => {
       const mountRect = mount.getBoundingClientRect()
-      if (mountRect.width <= 0) return
+      if (mountRect.width <= 0) return false
 
       let chipEl: HTMLElement | null = null
       if (waveformActiveWordId != null) {
@@ -719,7 +723,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       }
       if (!chipEl) {
         mount.style.removeProperty('--subwave-panel-left-px')
-        return
+        return false
       }
 
       const chipRect = chipEl.getBoundingClientRect()
@@ -729,26 +733,34 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       const maxLeft = Math.max(0, mountRect.width - panelWidth)
       const clamped = Math.max(0, Math.min(maxLeft, ideal))
       mount.style.setProperty('--subwave-panel-left-px', `${Math.round(clamped)}px`)
+      return true
     }
 
-    applyOffset()
+    /**
+     * 첫 측정이 한 프레임 늦게 들어오면(chip 이 아직 렌더 전) ResizeObserver 한 번에만 의존해서 잡는다.
+     * 성공하면 자기 자신을 즉시 해제 — 그 다음 트림으로 인한 layout 변화는 무시.
+     */
+    if (computeAndApply()) return
 
-    const ro = new ResizeObserver(() => applyOffset())
+    let settled = false
+    const ro = new ResizeObserver(() => {
+      if (settled) return
+      if (computeAndApply()) {
+        settled = true
+        ro.disconnect()
+      }
+    })
     ro.observe(mount)
     ro.observe(card)
-    const onWin = (): void => applyOffset()
-    window.addEventListener('resize', onWin)
     return () => {
       ro.disconnect()
-      window.removeEventListener('resize', onWin)
       mount.style.removeProperty('--subwave-panel-left-px')
     }
   }, [
     waveformEnabled,
     waveformExpandedLineIndex,
     index,
-    waveformActiveWordId,
-    wordRail
+    waveformActiveWordId
   ])
 
   useEffect(() => {
@@ -1774,16 +1786,17 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
           </div>
         {waveformEnabled ? (
           <div
-            className={`subtitle-waveform-accordion min-h-0 w-full overflow-hidden transition-[max-height] duration-100 ease-out ${
+            className={`subtitle-waveform-accordion min-h-0 w-full transition-[max-height] duration-100 ease-out ${
               waveformExpandedLineIndex === index
-                ? 'max-h-[min(760px,78vh)]'
-                : 'max-h-0 min-h-0'
+                ? 'max-h-[min(760px,78vh)] overflow-visible'
+                : 'max-h-0 min-h-0 overflow-hidden'
             }`}
           >
             <div
               ref={setWaveformMountEl}
               data-waveform-mount-for-open-line={waveformExpandedLineIndex === index ? '1' : undefined}
               className="subtitle-waveform-mount relative z-10 w-full min-h-0 min-w-0 border-t border-white/[0.08] bg-transparent"
+              style={waveformExpandedLineIndex === index ? { overflow: 'visible' } : undefined}
             />
           </div>
         ) : null}

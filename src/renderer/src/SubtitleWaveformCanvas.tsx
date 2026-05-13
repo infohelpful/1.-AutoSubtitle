@@ -183,10 +183,18 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     void _autoFocusSeekBlockToken
     void _onTimeRangeCut
 
+    /**
+     * 자르기 라인 라벨 포매터.
+     *  - playhead 내부 양자화는 1ms (`PLAYHEAD_STEP_SEC=0.001`) 라 매 frame paint 가 일어나지만,
+     *    라벨까지 ms 자릿수를 노출하면 60Hz 로 끝자리가 깜박여 가독성이 떨어진다.
+     *  - 따라서 기본 포매터는 **10ms(centisecond) 정밀도**로 고정 — 위치는 부드럽게,
+     *    라벨은 안정적으로 표시.
+     *  - 호출 측이 `formatEditSec` 을 지정한 경우(타임코드 표시 등) 는 그대로 존중.
+     */
     const fmtSec =
       typeof formatEditSec === 'function'
         ? formatEditSec
-        : (sec: number) => (Number.isFinite(sec) ? sec.toFixed(3) : '—')
+        : (sec: number) => (Number.isFinite(sec) ? sec.toFixed(2) : '—')
 
     const mergedCutRanges = useMemo(() => mergeCutRanges([...cutRanges]), [cutRanges])
     const cutDiagSig = useMemo(() => cutRangesSignature(mergedCutRanges), [mergedCutRanges])
@@ -1400,6 +1408,33 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     fmtSecRef.current = fmtSec
 
     /**
+     * **paintCutLine perf 누산기** — App tick 의 `syncPlayheadFromEditSec` 진입 횟수와
+     * 그 안에서 paintCutLine 이 실제 DOM 갱신을 한 횟수를 분리해 측정한다.
+     * tick 수 ≠ paint 수 면 early-return 분기(refs stale/유효 범위 아님 등) 가 의심됨.
+     */
+    const paintPerfRef = useRef<{
+      active: boolean
+      calls: number
+      shorts: number
+      pxMin: number
+      pxMax: number
+      sumPaintMs: number
+      maxPaintMs: number
+      lastPct: number
+      maxPctJumpPx: number
+    }>({
+      active: false,
+      calls: 0,
+      shorts: 0,
+      pxMin: 1e9,
+      pxMax: -1e9,
+      sumPaintMs: 0,
+      maxPaintMs: 0,
+      lastPct: -1,
+      maxPctJumpPx: 0
+    })
+
+    /**
      * playhead(editSec) 를 받아 cut 라인 두 DOM 의 `style.left` 와 라벨 텍스트를 즉시 갱신.
      *  - `paintCutLine(editT)` 는 App 의 매 frame `commitEditSecToUi → syncPlayheadFromEditSec`
      *    체인에서 호출되어 1-프레임 lag 없이 즉시 paint 전 좌표 반영.
@@ -1407,13 +1442,24 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
      */
     const paintCutLine = useCallback(
       (editT: number): void => {
+        const t0 = performance.now()
         const er = editRangeRef.current
         const map = skipMappingRef.current
-        if (!er || !map) return
-        if (typeof editT !== 'number' || !Number.isFinite(editT)) return
+        const perf = paintPerfRef.current
+        if (!er || !map) {
+          if (perf.active) perf.shorts += 1
+          return
+        }
+        if (typeof editT !== 'number' || !Number.isFinite(editT)) {
+          if (perf.active) perf.shorts += 1
+          return
+        }
         const s = Math.min(er.start, er.end)
         const e = Math.max(er.start, er.end)
-        if (!(e > s + 1e-9)) return
+        if (!(e > s + 1e-9)) {
+          if (perf.active) perf.shorts += 1
+          return
+        }
         const live = Math.min(e, Math.max(s, editT))
         const span = Math.max(map.activeSpanSec, 1e-9)
         const activeSec = map.mediaSecToActiveSec(live)
@@ -1433,6 +1479,19 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         if (hdl) {
           if (hdl.style.left !== lt) hdl.style.left = lt
         }
+        if (perf.active) {
+          perf.calls += 1
+          if (pct < perf.pxMin) perf.pxMin = pct
+          if (pct > perf.pxMax) perf.pxMax = pct
+          const dt = performance.now() - t0
+          perf.sumPaintMs += dt
+          if (dt > perf.maxPaintMs) perf.maxPaintMs = dt
+          if (perf.lastPct >= 0) {
+            const jump = Math.abs(pct - perf.lastPct)
+            if (jump > perf.maxPctJumpPx) perf.maxPctJumpPx = jump
+          }
+          perf.lastPct = pct
+        }
       },
       []
     )
@@ -1449,6 +1508,41 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       const editT = playheadEditSecRef?.current
       if (typeof editT === 'number' && Number.isFinite(editT)) paintCutLine(editT)
     })
+
+    /**
+     * **재생 세션 단위 paintCutLine perf 송신** — App 의 rAF tick 측정 (App side perf)
+     * 과 짝이 되어, "App 이 호출한 횟수" vs "Canvas 가 실제 paint 한 횟수" 가 일치하는지
+     * 확인할 수 있다. 일치하면 imperative chain 정상, 차이 나면 early-return 분기 의심.
+     */
+    useEffect(() => {
+      const perf = paintPerfRef.current
+      if (isPlaying) {
+        perf.active = true
+        perf.calls = 0
+        perf.shorts = 0
+        perf.pxMin = 1e9
+        perf.pxMax = -1e9
+        perf.sumPaintMs = 0
+        perf.maxPaintMs = 0
+        perf.lastPct = -1
+        perf.maxPctJumpPx = 0
+      } else if (perf.calls > 0 || perf.shorts > 0) {
+        wfLog('perf', 'paintCutLine session', {
+          calls: perf.calls,
+          shorts: perf.shorts,
+          pctMin: +perf.pxMin.toFixed(2),
+          pctMax: +perf.pxMax.toFixed(2),
+          pctSpan: +(perf.pxMax - perf.pxMin).toFixed(2),
+          maxPctJump: +perf.maxPctJumpPx.toFixed(2),
+          avgPaintMs:
+            perf.calls > 0 ? +(perf.sumPaintMs / perf.calls).toFixed(3) : 0,
+          maxPaintMs: +perf.maxPaintMs.toFixed(3)
+        })
+        perf.active = false
+      } else {
+        perf.active = false
+      }
+    }, [isPlaying])
 
     /**
      * 재생 토글 시 will-change 힌트만 토글 — GPU 레이어 합성 비용을 idle 상태에서 회수.
@@ -1768,6 +1862,15 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
      *  - 사용자 요구: "재생이 끝나면 자동으로 시작지점으로 가야하고 무조건이야".
      *  - 자연 종료/임의 일시정지 구분 없이 동일하게 시작점으로 되돌린다.
      *  - 다음 ▶/Space 가 곧바로 트림 시작점부터 재생을 시작.
+     *
+     * **부드러운 rewind 애니메이션 (시각 점프 방지)**
+     *  - 단순 `setCutSec(start)` 만 호출하면 React 가 즉시 새 `left` 를 commit → cut 라인이
+     *    오른쪽 끝에서 왼쪽 시작점까지 **순간 이동(teleport)** → 짧은 단어일수록 "막 건너뜀" 으로 체감.
+     *  - 따라서 transition: left 220ms 를 켠 뒤, **다음 rAF 에서** setCutSec 을 호출해
+     *    React 가 새 `left` 를 commit 하는 시점에 브라우저가 부드럽게 보간하도록 한다.
+     *  - 220ms 후 transition 을 제거해 다음 사용자 드래그가 지연되지 않게 회수.
+     *  - cleanup 에서도 즉시 회수 — 사용자가 rewind 도중 다시 ▶ 누르면 paintCutLine 이 transition 없이
+     *    즉시 동작해야 함.
      */
     const prevIsPlayingForRewindRef = useRef<boolean>(Boolean(isPlaying))
     useEffect(() => {
@@ -1782,7 +1885,43 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       const e = Math.max(er.start, er.end)
       const eps = 1e-4
       const back = Math.min(e - eps, s + eps)
-      setCutSec(back)
+
+      const animTargets = [
+        cutLineLabelRef.current,
+        cutLineSliderRef.current,
+        cutLineHandleRef.current
+      ].filter((el): el is HTMLElement => el != null)
+
+      const REWIND_MS = 220
+      const TRANSITION = `left ${REWIND_MS}ms cubic-bezier(0.4, 0, 0.2, 1)`
+      animTargets.forEach((el) => {
+        el.style.transition = TRANSITION
+        el.style.willChange = 'left'
+      })
+
+      /**
+       * **rAF 다음 frame 에서 setCutSec** — transition 을 DOM 에 commit 한 뒤 left 가 바뀌어야
+       * 브라우저가 보간을 트리거. 같은 task 안에서 둘 다 바꾸면 "최종값으로 즉시 이동" 처럼 보일 수 있다.
+       */
+      const rafId = window.requestAnimationFrame(() => {
+        setCutSec(back)
+      })
+
+      const tid = window.setTimeout(() => {
+        animTargets.forEach((el) => {
+          el.style.transition = ''
+          el.style.willChange = ''
+        })
+      }, REWIND_MS + 40)
+
+      return (): void => {
+        window.cancelAnimationFrame(rafId)
+        window.clearTimeout(tid)
+        animTargets.forEach((el) => {
+          el.style.transition = ''
+          el.style.willChange = ''
+        })
+      }
     }, [isPlaying])
 
     /**

@@ -104,7 +104,15 @@ const VIDEO_EXTENSIONS = ['mp4', 'mkv', 'avi'] as const
 /** `python_sidecar/main.py` 의 `_PEAKS_MAX_SAMPLES_PER_PIXEL_STALE` 와 맞출 것 */
 const PEAKS_JSON_MAX_SAMPLES_PER_PIXEL = 128
 
-const PLAYHEAD_STEP_SEC = 0.01
+/**
+ * Playhead 시각화 quantize 단위 — 작을수록 cut/재생 라인 모션이 부드럽다.
+ *  - 0.01s (10ms) 였을 때는 60Hz rAF (16.67ms) 와 불균등 정합으로 한 frame 은 10ms, 다음 frame 은 20ms 씩 이동해
+ *    "점프" 가 시각적으로 도드라졌음.
+ *  - 0.001s (1ms) 로 낮추면 매 frame ~16~17 quantum 씩 거의 일정하게 이동 → 연속 운동 인상.
+ *  - audio 클럭(WebAudio) 은 sample-accurate (수µs 정확도) 라 1ms 양자화가 의미 있음.
+ *  - 단어 토글/시킹 등 라우팅 이외 비교에서는 부동소수 epsilon 사용을 가정 (정수 step 비교 X).
+ */
+const PLAYHEAD_STEP_SEC = 0.001
 
 /**
  * Phase 2 / 8 — 자막 **목록 표시**만 가상 타임라인 파생으로 바꿀 때 사용.
@@ -1046,6 +1054,64 @@ export default function App(): ReactElement {
   const wordHighlightPrevCardRef = useRef<number | null>(null)
   const wordHighlightActiveChipElRef = useRef<HTMLElement | null>(null)
   const activeSubtitleCardIdxRef = useRef<number | null>(null)
+  /**
+   * **활성 카드 chip 캐시** — `commitEditSecToUi` 가 매 rAF (60Hz) 마다
+   * `querySelectorAll('.subtitle-word-chip')` + `parseFloat × N` 을 돌리던 비용 (~100~150μs/tick)
+   * 을 카드 단위로 한 번만 수집하도록 캐시한다. 단어가 많은 카드일수록 frame budget 의 차이가
+   * 커서 단어별 모션 거칠음 편차의 한 원인이 됨.
+   * - `cardIdx` 가 바뀌면 (다른 카드로 이동) 다음 호출에서 다시 수집.
+   * - `subtitles` 가 변하면 (단어 split/삭제 등) `useEffect` 가 캐시를 무효화.
+   */
+  const wordHighlightChipsCacheRef = useRef<{
+    cardIdx: number | null
+    chips: Array<{ el: HTMLElement; s: number; e: number }>
+  }>({ cardIdx: null, chips: [] })
+  /**
+   * **재생 세션 perf 측정** — 한 번의 단어 재생(`isPlaying` true→false) 단위로
+   *  - rAF tick 횟수 / 평균 fps
+   *  - 프레임 간격(maxGap, ≥25ms 프레임 누락 횟수)
+   *  - `commitEditSecToUi` 평균/최대 소요시간 (60Hz 예산 16.67ms 대비)
+   *  - editT 진행 최대 폭(이상치/jump 감지)
+   *  - paintCutLine 호출 횟수 (`waveformPeaksRef` 의 sync 가 실제 도달했는지)
+   *
+   * 를 한 줄로 `wfLog('perf', 'playback session', …)` 에 남긴다. 호출지점에서 부담을 최소화하기 위해
+   * 모든 누산은 ref 즉석 산술로만 처리하고, 세션 종료 시 한 번만 직렬화·송신한다.
+   */
+  const playbackPerfRef = useRef<{
+    active: boolean
+    startWallMs: number
+    lastTickMs: number
+    ticks: number
+    sumGapMs: number
+    maxGapMs: number
+    largeGaps: number
+    sumCommitMs: number
+    maxCommitMs: number
+    commits: number
+    branches: Record<string, number>
+    prevEditT: number
+    startEditT: number
+    maxEditDeltaMs: number
+    wordId: string | null
+    effectStarts: number
+  }>({
+    active: false,
+    startWallMs: 0,
+    lastTickMs: 0,
+    ticks: 0,
+    sumGapMs: 0,
+    maxGapMs: 0,
+    largeGaps: 0,
+    sumCommitMs: 0,
+    maxCommitMs: 0,
+    commits: 0,
+    branches: {},
+    prevEditT: -1,
+    startEditT: -1,
+    maxEditDeltaMs: 0,
+    wordId: null,
+    effectStarts: 0
+  })
   const waveformPeaksRef = useRef<SubtitleWaveformPeaksHandle>(null)
   const [durationSec, setDurationSec] = useState(0)
   /** Peaks 플레이어가 보고한 길이 — 미디어 메타 로드 후 다시 비교 */
@@ -1876,15 +1942,33 @@ export default function App(): ReactElement {
         wordHighlightActiveChipElRef.current?.classList.remove('subtitle-word-chip--active')
         wordHighlightActiveChipElRef.current = null
       } else if (ai !== null) {
-        const cardEl = document.getElementById(`subtitle-card-${ai}`)
+        /**
+         * **캐시된 chip 배열로 활성 단어 탐색** — DOM 조회·parseFloat 를 카드 단위로 한 번만.
+         * 카드 인덱스가 바뀐 경우(첫 호출 / 다른 카드 진입) 만 querySelectorAll 로 재수집.
+         * 활성 chip 발견 시 즉시 break — 단어 chip 은 비중첩 시간 구간이라 첫 hit 이 곧 정답.
+         */
+        let cache = wordHighlightChipsCacheRef.current
+        if (cache.cardIdx !== ai) {
+          const cardEl = document.getElementById(`subtitle-card-${ai}`)
+          const collected: Array<{ el: HTMLElement; s: number; e: number }> = []
+          if (cardEl) {
+            cardEl.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
+              const s = parseFloat(el.dataset.wordStart ?? 'NaN')
+              const e = parseFloat(el.dataset.wordEnd ?? 'NaN')
+              if (Number.isFinite(s) && Number.isFinite(e)) collected.push({ el, s, e })
+            })
+          }
+          cache = { cardIdx: ai, chips: collected }
+          wordHighlightChipsCacheRef.current = cache
+        }
         let nextChip: HTMLElement | null = null
-        if (cardEl) {
-          cardEl.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
-            const s = parseFloat(el.dataset.wordStart ?? 'NaN')
-            const e = parseFloat(el.dataset.wordEnd ?? 'NaN')
-            if (!Number.isFinite(s) || !Number.isFinite(e)) return
-            if (t >= s && t < e) nextChip = el
-          })
+        const arr = cache.chips
+        for (let i = 0; i < arr.length; i++) {
+          const c = arr[i]
+          if (t >= c.s && t < c.e) {
+            nextChip = c.el
+            break
+          }
         }
         const prevChip = wordHighlightActiveChipElRef.current
         if (prevChip !== nextChip) {
@@ -1908,6 +1992,14 @@ export default function App(): ReactElement {
   useLayoutEffect(() => {
     commitEditSecToUi(playheadEditSecRef.current)
   }, [subtitles, durationSec, timelineMediaEndHint, mapMediaToEditSec, commitEditSecToUi])
+
+  /**
+   * `subtitles` 가 바뀌면 (단어 split/삭제·gapFill 재구성 등) 활성 카드의 chip DOM 도 재마운트되거나
+   * 순서·시간이 바뀌므로 `commitEditSecToUi` 의 chip 캐시를 무효화. 다음 tick 에서 새 DOM 로 재수집.
+   */
+  useEffect(() => {
+    wordHighlightChipsCacheRef.current = { cardIdx: null, chips: [] }
+  }, [subtitles])
 
   useEffect(() => {
     if (!videoPath) return
@@ -4930,7 +5022,71 @@ export default function App(): ReactElement {
     finalizePlaybackStop('pausePlayback', { markUserPause: true })
   }, [clearOneShotSession, finalizePlaybackStop, isBuffering])
 
+  /**
+   * **재생 세션 perf 초기화 / emit** — isPlaying 만 의존하므로 mid-playback 의 viewWin /
+   * sentenceTimeline 갱신으로 인한 dep 변동에서 자유롭다. 한 단어 재생 전체에 걸쳐 누적된
+   * 누산기를 세션 종료 시점에 단 한 번 emit.
+   */
   useEffect(() => {
+    const perf = playbackPerfRef.current
+    if (isPlaying) {
+      perf.active = true
+      perf.startWallMs = performance.now()
+      perf.lastTickMs = perf.startWallMs
+      perf.ticks = 0
+      perf.sumGapMs = 0
+      perf.maxGapMs = 0
+      perf.largeGaps = 0
+      perf.sumCommitMs = 0
+      perf.maxCommitMs = 0
+      perf.commits = 0
+      perf.branches = {}
+      perf.prevEditT = -1
+      perf.startEditT = -1
+      perf.maxEditDeltaMs = 0
+      perf.effectStarts = 0
+      perf.wordId = lastWaveformPlayRangeIntentRef.current?.wordId ?? null
+    } else if (perf.active) {
+      const elapsedMs = performance.now() - perf.startWallMs
+      wfLog('perf', 'playback session', {
+        wordId: perf.wordId,
+        elapsedMs: Math.round(elapsedMs),
+        ticks: perf.ticks,
+        commits: perf.commits,
+        effectStarts: perf.effectStarts,
+        avgFps:
+          elapsedMs > 0 && perf.ticks > 0
+            ? +((perf.ticks / elapsedMs) * 1000).toFixed(1)
+            : 0,
+        avgGapMs: perf.ticks > 0 ? +(perf.sumGapMs / perf.ticks).toFixed(2) : 0,
+        maxGapMs: +perf.maxGapMs.toFixed(2),
+        largeGaps_gt25ms: perf.largeGaps,
+        avgCommitMs:
+          perf.commits > 0 ? +(perf.sumCommitMs / perf.commits).toFixed(2) : 0,
+        maxCommitMs: +perf.maxCommitMs.toFixed(2),
+        maxEditDeltaMs: +perf.maxEditDeltaMs.toFixed(2),
+        startEditSec: +perf.startEditT.toFixed(3),
+        endEditSec: +perf.prevEditT.toFixed(3),
+        branches: perf.branches
+      })
+      perf.active = false
+    }
+  }, [isPlaying])
+
+  useEffect(() => {
+    /**
+     * **주의**: 본 useEffect 는 deps 에 `commitEditSecToUi` / `mapMediaToEditSec` 등이 있어
+     * 재생 중 viewWin / sentenceTimeline 갱신 등으로 dep 식별자가 바뀌면 cleanup → 재진입.
+     * 그때마다 rAF 가 끊겼다 재시작되면 paint 가 끊기므로 perf 초기화/emit 은 위쪽 별도 effect
+     * 에서 처리. 여기서는 rAF 시작/취소만 담당.
+     *
+     * **mid-playback 재시작 카운트** — 재시작이 잦으면 매번 ~16~50ms rAF 공백이 발생해 cut 라인이
+     * 끊긴다. perf 로그의 `effectStarts` 가 1 보다 크면 dep 변동으로 인한 재시작이 stutter 원인.
+     */
+    if (isPlaying) {
+      const perfBoot = playbackPerfRef.current
+      perfBoot.effectStarts = (perfBoot.effectStarts ?? 0) + 1
+    }
     if (!isPlaying) {
       if (rafPlayheadRef.current !== null) {
         window.cancelAnimationFrame(rafPlayheadRef.current)
@@ -4942,18 +5098,77 @@ export default function App(): ReactElement {
     const r4 = (x: number) => Math.round(x * 10000) / 10000
     const tick = () => {
       tickRef.current = tick
+      /**
+       * **per-tick 측정 (모든 branch 공통)** — 이전엔 bottom branch 만 계측해 WebAudio engine 경로로
+       * 흘러간 tick (= 거의 대부분의 단어 재생) 이 통계에서 빠져 `ticks:0` 로 보였다.
+       * 여기서 매 tick 1회만 누산.
+       */
+      const perfTick = playbackPerfRef.current
+      if (perfTick.active) {
+        const wallNow = performance.now()
+        const gap = wallNow - perfTick.lastTickMs
+        perfTick.sumGapMs += gap
+        if (gap > perfTick.maxGapMs) perfTick.maxGapMs = gap
+        if (gap > 25) perfTick.largeGaps += 1
+        perfTick.lastTickMs = wallNow
+        perfTick.ticks += 1
+      }
       const el = videoRef.current
       const masterAudio = masterAudioRef.current
       if (!el || !masterAudio) {
+        if (perfTick.active) {
+          perfTick.branches['noMedia'] = (perfTick.branches['noMedia'] ?? 0) + 1
+        }
         rafPlayheadRef.current = null
         return
       }
 
       /**
-       * Task 1 — `videoSeekUi` 잠금: video.seeking 동안 디코딩 지연이 끝날 때까지
-       * 재생 헤드 커밋·강제 시크를 건너뛴다(낙관적 UI 는 슬라이더가 직접 갱신).
+       * **wrappedCommit** — 모든 branch 의 `commitEditSecToUi` 호출을 이 헬퍼로 감싸
+       * commit 비용(ms) / 호출 수 / editT 진행을 한 곳에서 측정. branch 이름까지 받아 어느
+       * 경로가 paint 를 만드는지 분포까지 본다.
        */
-      if (videoSeekUiLockedRef.current) {
+      const wrappedCommit = (branch: string, editT: number): void => {
+        if (perfTick.active) {
+          perfTick.branches[branch] = (perfTick.branches[branch] ?? 0) + 1
+          if (perfTick.prevEditT >= 0) {
+            const dMs = Math.abs(editT - perfTick.prevEditT) * 1000
+            if (dMs > perfTick.maxEditDeltaMs) perfTick.maxEditDeltaMs = dMs
+          } else {
+            perfTick.startEditT = editT
+          }
+          perfTick.prevEditT = editT
+          const t0 = performance.now()
+          commitEditSecToUi(editT)
+          const dt = performance.now() - t0
+          perfTick.sumCommitMs += dt
+          if (dt > perfTick.maxCommitMs) perfTick.maxCommitMs = dt
+          perfTick.commits += 1
+        } else {
+          commitEditSecToUi(editT)
+        }
+      }
+
+      /**
+       * Task 1 — `videoSeekUi` 잠금: **사용자 슬라이더 스크럽** 중에만 RAF 커밋을 건너뛴다.
+       *
+       * **버그 히스토리**: 원래 `videoSeekUiLockedRef.current` 만 검사했더니, `el.currentTime = …`
+       * 가 호출될 때마다 (재생 중 sync, skip-cut, jump-cut 등 programmatic seek 도 포함) `seeking`
+       * 이벤트가 발화 → lock=true → tick 이 50~250ms 동안 commit 자체를 안 함 → cut 라인이
+       * paint 안 되고 멈춰 보이고, 짧은 단어는 재생이 "안 되는 것처럼" 보였다.
+       *
+       * **수정**: lock 본래 의도(슬라이더 드래그 중 낙관적 UI 보호)를 살리기 위해 사용자 스크럽
+       * 표지인 `optimisticVirtualMsRef.current != null` 일 때만 lock 을 존중한다. 사용자 드래그가
+       * 없는 한 (대부분의 단어 재생 경로) tick 은 정상 진행 → 60Hz paint.
+       */
+      if (
+        videoSeekUiLockedRef.current &&
+        optimisticVirtualMsRef.current != null
+      ) {
+        if (perfTick.active) {
+          perfTick.branches['videoSeekLocked'] =
+            (perfTick.branches['videoSeekLocked'] ?? 0) + 1
+        }
         rafPlayheadRef.current = window.requestAnimationFrame(tick)
         return
       }
@@ -5023,7 +5238,7 @@ export default function App(): ReactElement {
             el.currentTime = tWa
           }
           const editWa = mapMediaToEditSec(tWa)
-          commitEditSecToUi(editWa)
+          wrappedCommit('wa-master', editWa)
           maybePlaybackTrace('wa-master', tWa, editWa, { wm: wm != null ? r4(wm) : null })
         } else {
           const tvRaw = el.currentTime
@@ -5035,7 +5250,7 @@ export default function App(): ReactElement {
           const pm = playbackTimelineMappingRef.current
           const rawNull = pm.masterAudioToProgramSec(masterAudio.currentTime)
           const editWaNull = Math.round(rawNull / PLAYHEAD_STEP_SEC) * PLAYHEAD_STEP_SEC
-          commitEditSecToUi(editWaNull)
+          wrappedCommit('wa-master-wm-null', editWaNull)
           const probeM = masterAudioToMediaSec(masterAudio.currentTime)
           maybePlaybackTrace('wa-master-wm-null', probeM, editWaNull)
         }
@@ -5044,6 +5259,10 @@ export default function App(): ReactElement {
       }
 
       if (masterAudio.paused) {
+        if (perfTick.active) {
+          perfTick.branches['masterPaused'] =
+            (perfTick.branches['masterPaused'] ?? 0) + 1
+        }
         /**
          * **WebAudio 자연 종료 후 oneShotSession 정리.**
          * `WebAudioMasterPlayback.scheduleFromEdl` 의 BufferSource 가 onended 로 종료되면
@@ -5081,7 +5300,7 @@ export default function App(): ReactElement {
         const rawBuf = pmBuf.masterAudioToProgramSec(masterAudio.currentTime)
         const editBuf = Math.round(rawBuf / PLAYHEAD_STEP_SEC) * PLAYHEAD_STEP_SEC
         const probeBuf = masterAudioToMediaSec(masterAudio.currentTime)
-        commitEditSecToUi(editBuf)
+        wrappedCommit('html-buffering', editBuf)
         maybePlaybackTrace('html-buffering', probeBuf, editBuf, {
           readyState: masterAudio.readyState
         })
@@ -5112,7 +5331,7 @@ export default function App(): ReactElement {
         const pmSk = playbackTimelineMappingRef.current
         const rawSk = pmSk.masterAudioToProgramSec(masterAudio.currentTime)
         const editSk = Math.round(rawSk / PLAYHEAD_STEP_SEC) * PLAYHEAD_STEP_SEC
-        commitEditSecToUi(editSk)
+        wrappedCommit('html-master-skip-cut', editSk)
         maybePlaybackTrace('html-master-skip-cut', masterAudioToMediaSec(masterAudio.currentTime), editSk, {
           videoMediaWas: r4(tMedia)
         })
@@ -5143,7 +5362,7 @@ export default function App(): ReactElement {
           const pmJ = playbackTimelineMappingRef.current
           const rawJ = pmJ.masterAudioToProgramSec(masterAudio.currentTime)
           const editHead = Math.round(rawJ / PLAYHEAD_STEP_SEC) * PLAYHEAD_STEP_SEC
-          commitEditSecToUi(editHead)
+          wrappedCommit('html-master-jump-cut', editHead)
           maybePlaybackTrace('html-master-jump-cut', masterAudioToMediaSec(masterAudio.currentTime), editHead)
           rafPlayheadRef.current = window.requestAnimationFrame(tick)
           return
@@ -5248,7 +5467,7 @@ export default function App(): ReactElement {
         el.currentTime = targetMediaFromAudio
       }
 
-      commitEditSecToUi(editT)
+      wrappedCommit('html-master-audio', editT)
       maybePlaybackTrace('html-master-audio', probeMedia, editT)
       rafPlayheadRef.current = window.requestAnimationFrame(tick)
     }

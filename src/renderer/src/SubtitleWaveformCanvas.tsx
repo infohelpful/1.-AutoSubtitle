@@ -36,6 +36,7 @@ import {
   drawWaveformCanvas,
   type WaveformFillBand
 } from './waveform/waveformCanvasDrawing'
+import { buildEdlSkipMapping, type EdlSkipMapping } from './waveform/edlSkipMapping'
 import { useWaveformViewWindow } from './waveform/useWaveformViewWindow'
 import { useWordEdgeDrag } from './useWordEdgeDrag'
 
@@ -115,6 +116,13 @@ export type SubtitleWaveformPeaksProps = {
    * `gapFill` Vrew 행과는 저장소 인덱스가 어긋날 수 있어 비활성화하는 편이 안전하다.
    */
   wordEdgeSubtitleBridge?: WordEdgeSubtitleBridge | null
+  /**
+   * EDL skip 표시 압축에 쓰이는 통합 컷 리스트 (하드컷 + 단어 tombstone + 가상삭제).
+   *  - viewWin 안에 들어오는 구간만 시각적으로 압축되어 strip 의 픽셀↔초 매핑이 piecewise-linear 로 동작.
+   *  - **데이터/재생/SSOT 시간 자체는 그대로** — 미디어 축 단일 정책 유지.
+   *  - 미지정/빈 배열 시: 종래 선형 매핑(viewSpan 전체를 strip 폭에 매핑).
+   */
+  playbackSkipRanges?: ReadonlyArray<CutRange> | null
 }
 
 function clampPx(n: number, lo: number, hi: number): number {
@@ -161,7 +169,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       onPeaksDurationComparedToMedia,
       onUndo,
       formatEditSec,
-      wordEdgeSubtitleBridge
+      wordEdgeSubtitleBridge,
+      playbackSkipRanges
     },
     ref
   ) {
@@ -423,8 +432,16 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
             if (!chipEl) return
 
             const boxWidth0 = Math.max(1, Math.min(mountW, PANEL_MAX_PX))
-            const span = Math.max(ctx.windowEnd - ctx.windowStart, 1e-6)
-            const pps = boxWidth0 / span
+            /**
+             * **PPS 박제 정책 — activeSpan 기준**. EDL skip(=tombstone/하드컷) 으로 시각 압축된
+             *  실제 표시 시간폭을 분모로 잡아야 흡수/복구로 viewWin 이 늘어도 박스 폭이 표시 폭에 비례.
+             */
+            const futureMap = buildEdlSkipMapping(
+              { start: ctx.windowStart, end: ctx.windowEnd },
+              playbackSkipRangesRef.current
+            )
+            const activeSpan = Math.max(futureMap.activeSpanSec, 1e-6)
+            const pps = boxWidth0 / activeSpan
 
             const wa = Math.min(activeW.start, activeW.end)
             const wb = Math.max(activeW.start, activeW.end)
@@ -433,8 +450,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
             const chipRect = chipEl.getBoundingClientRect()
             const chipCenterFromMount = (chipRect.left + chipRect.right) / 2 - mountLeft
 
-            /** 박스 안에서 wMid 가 위치할 픽셀(박스 left 기준). */
-            const wMidPxOnBox = (wMid - ctx.windowStart) * pps
+            /** 박스 안에서 wMid 가 위치할 픽셀(박스 left 기준) — piecewise 매핑으로 활성 좌표에 정렬 */
+            const wMidPxOnBox = futureMap.mediaSecToActiveSec(wMid) * pps
             const idealLeft = chipCenterFromMount - wMidPxOnBox
             /** 최초 lock 때만 mount 폭 안으로 클램프 — 카드 안에서 시작이 잘 보이게. */
             const maxLeft = Math.max(0, (mountW || boxWidth0) - boxWidth0)
@@ -488,17 +505,27 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
           if (pps != null && prevWin != null && prevLayout != null && dir != null) {
             let nextStart = prevWin.start
             let nextEnd = prevWin.end
-            let nextLeft = prevLayout.left
             if (dir === 'end') {
-              /** 우측 흡수 — 좌측 픽셀 고정, 우측만 자람. ctx.windowEnd 가 새 우 이웃 끝. */
+              /** 우측 흡수 — 좌측 픽셀(left) 고정, 우측만 자람. ctx.windowEnd 가 새 우 이웃 끝. */
               nextEnd = Math.max(prevWin.end, ctx.windowEnd)
             } else {
-              /** 좌측 흡수 — 우측 픽셀 고정, 좌측만 자람. ctx.windowStart 가 새 좌 이웃 시작. */
+              /** 좌측 흡수 — 우측 픽셀(right edge) 고정, 좌측만 자람. ctx.windowStart 가 새 좌 이웃 시작. */
               nextStart = Math.min(prevWin.start, ctx.windowStart)
-              const widthDelta = (prevWin.start - nextStart) * pps
-              nextLeft = prevLayout.left - widthDelta
             }
-            const newWidth = pps * Math.max(nextEnd - nextStart, 1e-6)
+            /**
+             * **새 박스 폭 = pps × 새 activeSpan**. viewSpan 기반(`nextEnd - nextStart`) 으로 계산하던
+             *  옛 식은 EDL skip 압축 적용 시 표시 시간폭과 어긋나 박스가 카드 폭을 넘어가는 현상이 났다.
+             *  좌측 흡수 시 우측 픽셀을 고정하려면 `nextLeft = oldRight - newWidth` 로 직접 잡는다.
+             */
+            const newMap = buildEdlSkipMapping(
+              { start: nextStart, end: nextEnd },
+              playbackSkipRangesRef.current
+            )
+            const newWidth = pps * Math.max(newMap.activeSpanSec, 1e-6)
+            const nextLeft =
+              dir === 'end'
+                ? prevLayout.left
+                : prevLayout.left + prevLayout.width - newWidth
             const nextWin = { start: nextStart, end: nextEnd }
             const nextBox = { left: nextLeft, width: newWidth }
             viewWinLockedAnchorRef.current = anchorKey
@@ -734,6 +761,46 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     const wordEdgeBridgeRef = useRef(wordEdgeSubtitleBridge)
     wordEdgeBridgeRef.current = wordEdgeSubtitleBridge
 
+    /**
+     * **EDL skip 표시 압축** — viewWin 안의 통합 컷(하드컷 + tombstone + 가상삭제) 을
+     *  piecewise-linear 픽셀↔초 매핑으로 변환한다. 데이터/재생 시간은 미디어 축 그대로.
+     *  - viewWin 이 없으면 항상 활성폭 0 의 *비어 있는* 매핑을 만들어 호출부의 null 분기를 줄인다 (skipMapping 이 항상 valid).
+     *  - playbackSkipRanges 가 비어 있거나 viewWin 밖이면 `skipsClipped.length === 0` 이라 종래 선형 매핑과 동등.
+     */
+    const skipMapping = useMemo<EdlSkipMapping>(() => {
+      const win = viewWin ?? { start: 0, end: 0 }
+      const skips = playbackSkipRanges ?? []
+      return buildEdlSkipMapping(win, skips)
+    }, [viewWin, playbackSkipRanges])
+    const skipMappingRef = useRef(skipMapping)
+    skipMappingRef.current = skipMapping
+    /**
+     * **원본 skipRanges ref** — `clampNewSecToViewWinMedia` 가 *흡수 후의 가상 viewWin* 으로
+     *  새 activeSpan 을 예측할 때, 현재 viewWin 에 클립된 `skipMapping.skipsClipped` 가 아니라
+     *  *전체 원본 skip 리스트* 로 다시 build 해야 한다. ref 로 잡아 callback 의 stale closure 회피.
+     */
+    const playbackSkipRangesRef = useRef<ReadonlyArray<CutRange>>(playbackSkipRanges ?? [])
+    playbackSkipRangesRef.current = playbackSkipRanges ?? []
+
+    /**
+     * **activeSpan 변동 시 박스 폭 재맞춤** — 같은 활성 단어/viewWin 상태에서 사용자가 *다른 단어를 삭제* 해
+     *  새 tombstone 이 viewWin 안에 들어오면 `skipMapping.activeSpanSec` 가 감소한다. PPS 박제 정책상
+     *  박스 픽셀 폭은 `pps × activeSpan` 이어야 표시 시간폭과 일치한다. lock effect 는 anchor 변경 시에만 도므로
+     *  여기서 별도로 activeSpan 변경을 잡아 폭만 동기화.
+     */
+    useEffect(() => {
+      const pps = ppsRef.current
+      const layout = boxLayoutPxRef.current
+      if (pps == null || layout == null) return
+      const newWidth = pps * Math.max(skipMapping.activeSpanSec, 1e-6)
+      if (Math.abs(layout.width - newWidth) < 0.5) return
+      setBoxLayoutPx((prev) => {
+        if (!prev) return prev
+        if (Math.abs(prev.width - newWidth) < 0.5) return prev
+        return { left: prev.left, width: newWidth }
+      })
+    }, [skipMapping])
+
     const contextClampLimits = useMemo(() => {
       if (!viewWin) return null
       const lo = Math.min(viewWin.start, viewWin.end)
@@ -831,12 +898,22 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     editRangeRef.current = editRange
     const contextClampLimitsRef = useRef(contextClampLimits)
     contextClampLimitsRef.current = contextClampLimits
+    /**
+     * 클라이언트 X 좌표 → 미디어 축 초. EDL skip 압축 매핑이 활성이면 piecewise-linear,
+     *  매핑이 없으면(=skipsClipped 0 개) viewWin 선형. 출력은 항상 *미디어 축* 단일 정의.
+     */
     const pointerToTimeOnStrip = useCallback((clientX: number): number => {
       const outer = zoomOuterRef.current
       const vw = viewWinRef.current
+      const map = skipMappingRef.current
       if (!outer || !vw) return 0
       const rect = outer.getBoundingClientRect()
-      const fr = clampPx((clientX - rect.left) / Math.max(rect.width, 1), 0, 1)
+      const width = Math.max(rect.width, 1)
+      const xPx = clampPx(clientX - rect.left, 0, width)
+      if (map.activeSpanSec > 0) {
+        return map.pixelToMediaSec(xPx, width)
+      }
+      const fr = xPx / width
       const a = Math.min(vw.start, vw.end)
       const b = Math.max(vw.start, vw.end)
       return a + fr * (b - a)
@@ -901,6 +978,18 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
           const mediaCap = metricsRef.current?.durationSec ?? Number.POSITIVE_INFINITY
           const limit = Wcard * MAX_WAVE_TO_CARD_RATIO
           if (Wcard > 1 && activeW) {
+            /**
+             * **미래 박스 폭 예측** — EDL skip 표시 압축 적용 후의 실제 시간폭(activeSpan) 으로 계산.
+             *  - 흡수가 발생해도 트림 commit 의 tombstone 은 `mergedByEdgeTrim: true` 라
+             *    `mergeWaveformPeaksStitchCutRanges` 에서 제외되어 *추가* 되지 않는다 (= 기존 컷 리스트 유지).
+             *  - 새 viewWin 안에 들어오는 *기존 컷* 길이만 빼면 그 흡수 직후의 activeSpan 이 정확히 나옴.
+             */
+            const allSkips = playbackSkipRangesRef.current
+            const futureActiveSpan = (ws: number, we: number): number => {
+              if (!(we > ws + 1e-9)) return 0
+              const m = buildEdlSkipMapping({ start: ws, end: we }, allSkips)
+              return m.activeSpanSec
+            }
             if (dir === 'end' && cwi + 1 < words.length) {
               const nextW = words[cwi + 1]!
               const newWords = words.slice()
@@ -913,7 +1002,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                 mediaDurationSec: mediaCap
               })
               if (ctx) {
-                const nextWidth = pps * Math.max(ctx.windowEnd - ctx.windowStart, 1e-6)
+                const nextActive = Math.max(futureActiveSpan(ctx.windowStart, ctx.windowEnd), 1e-6)
+                const nextWidth = pps * nextActive
                 if (nextWidth > limit) {
                   const mediaNextEnd = b.editSecToMediaSec(nEnd)
                   const restricted = mediaNextEnd - ABSORB_GUARD_SEC
@@ -934,7 +1024,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                 mediaDurationSec: mediaCap
               })
               if (ctx) {
-                const nextWidth = pps * Math.max(ctx.windowEnd - ctx.windowStart, 1e-6)
+                const nextActive = Math.max(futureActiveSpan(ctx.windowStart, ctx.windowEnd), 1e-6)
+                const nextWidth = pps * nextActive
                 if (nextWidth > limit) {
                   const mediaPrevStart = b.editSecToMediaSec(pStart)
                   const restricted = mediaPrevStart + ABSORB_GUARD_SEC
@@ -1180,20 +1271,24 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       [pointerToTimeOnStrip, startWordEdgeDrag]
     )
 
+    /**
+     * 트림 핸들 좌·우 픽셀 위치 (%). EDL skip 압축 매핑 적용 시 *activeSpan* 기준 비율이라
+     *  삭제 구간이 viewWin 안에 있어도 핸들이 시각적으로 압축된 위치에 정확히 붙는다.
+     */
     const trimHandlePct = useMemo(() => {
       if (!viewWin || !editRange) return null
-      const a = Math.min(viewWin.start, viewWin.end)
-      const b = Math.max(viewWin.start, viewWin.end)
-      const span = Math.max(b - a, 1e-9)
+      const span = Math.max(skipMapping.activeSpanSec, 1e-9)
       const s = Math.min(editRange.start, editRange.end)
       const e = Math.max(editRange.start, editRange.end)
+      const sActive = skipMapping.mediaSecToActiveSec(s)
+      const eActive = skipMapping.mediaSecToActiveSec(e)
       return {
-        startPct: clampPx(((s - a) / span) * 100, 0, 100),
-        endPct: clampPx(((e - a) / span) * 100, 0, 100),
+        startPct: clampPx((sActive / span) * 100, 0, 100),
+        endPct: clampPx((eActive / span) * 100, 0, 100),
         startSec: s,
         endSec: e
       }
-    }, [viewWin, editRange])
+    }, [viewWin, editRange, skipMapping])
 
     /**
      * 자르기 라인 — 트림 구간 내부에서만 자유롭게 이동.
@@ -1272,14 +1367,13 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
 
     const cutLinePct = useMemo(() => {
       if (!viewWin || cutSec == null || !Number.isFinite(cutSec)) return null
-      const a = Math.min(viewWin.start, viewWin.end)
-      const b = Math.max(viewWin.start, viewWin.end)
-      const span = Math.max(b - a, 1e-9)
+      const span = Math.max(skipMapping.activeSpanSec, 1e-9)
+      const activeSec = skipMapping.mediaSecToActiveSec(cutSec)
       return {
-        pct: clampPx(((cutSec - a) / span) * 100, 0, 100),
+        pct: clampPx((activeSec / span) * 100, 0, 100),
         sec: cutSec
       }
-    }, [viewWin, cutSec])
+    }, [viewWin, cutSec, skipMapping])
 
     /**
      * 자르기·재생 라인 부드러운 움직임 — `cutSec` 은 이미 0.01s 단위로 quantize 된 값을 받지만
@@ -1302,7 +1396,15 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     /** 진폭 게인 — 박스 크기를 키우지 않고 막대만 더 크게 보이게 (전 영역 사용) */
     const WAVE_PEAK_GAIN = 2.0
 
-    /** 메인 파형 그리기 */
+    /**
+     * 메인 파형 그리기.
+     *
+     * **EDL skip 표시 압축** — `skipMapping` 을 `drawWaveformCanvas` 에 넘기면 픽셀→시간 변환이
+     *  piecewise-linear 로 동작해 삭제 구간(tombstone/하드컷) 의 시간대는 어떤 픽셀도 매핑되지 않아
+     *  완전히 사라지고 양옆 활성 파동이 시각적으로 이어붙는다.
+     *  - `deletedRanges` (= `collectDeletedRangesSec` 의 row 기반 결과) 는 호환을 위해 그대로 넘기지만
+     *    `skipMapping` 적용 시 어떤 픽셀도 그 구간에 매핑되지 않아 muted 분기는 dead.
+     */
     useEffect(() => {
       const canvas = zoomCanvasRef.current
       const outer = zoomOuterRef.current
@@ -1319,7 +1421,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         const useBands = bands != null && bands.length > 0
         const baseOpts = {
           topPaddingPx: WAVE_TOP_LABEL_BAND_PX,
-          gain: WAVE_PEAK_GAIN
+          gain: WAVE_PEAK_GAIN,
+          skipMapping
         }
         drawWaveformCanvas(
           canvas,
@@ -1343,7 +1446,16 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       const ro = new ResizeObserver(() => window.requestAnimationFrame(paint))
       ro.observe(outer)
       return () => ro.disconnect()
-    }, [metrics, viewWin, activeWordSpan, waveFillBands, mountLayoutKey, rows, activeLineIndex])
+    }, [
+      metrics,
+      viewWin,
+      activeWordSpan,
+      waveFillBands,
+      mountLayoutKey,
+      rows,
+      activeLineIndex,
+      skipMapping
+    ])
 
     /**
      * 재생 중에만 호출 — playhead(편집축 초)를 트림 구간으로 클램프해 `cutSec` 상태로 반영한다.

@@ -1,4 +1,5 @@
 import { mediaSecToPeakPixelIndex, type PeaksTimelineMetrics } from './peakPixelMapping'
+import type { EdlSkipMapping } from './edlSkipMapping'
 
 export function collectDeletedRangesSec(
   words: readonly { start: number; end: number; isDeleted?: boolean }[],
@@ -61,6 +62,13 @@ export function drawWaveformCanvas(
     topPaddingPx?: number
     /** 진폭 추가 게인 (기본 1.0) — 1보다 크면 막대가 더 커 보이고 끝은 클램프된다 */
     gain?: number
+    /**
+     * EDL 표시 압축 매핑 — 지정 시 픽셀→시간 변환이 piecewise-linear 로 동작.
+     *  - 삭제 구간(skip) 의 시간대는 *어떤 픽셀도 매핑되지 않아* 막대가 그려지지 않음.
+     *  - viewSpan 이 같아도 strip 의 실제 시간폭은 `skipMapping.activeSpanSec` 로 줄어든 게 정상 — 호출부에서 박스 폭을 같이 줄여야 시각이 자연스럽게 이어붙음.
+     *  - 미지정 시 종래 선형 매핑(전체 viewSpan 을 wPx 에 매핑) 그대로 동작.
+     */
+    skipMapping?: EdlSkipMapping | null
   }
 ): void {
   const { data } = metrics
@@ -76,6 +84,7 @@ export function drawWaveformCanvas(
 
   ctx.clearRect(0, 0, wPx, hPx)
   const span = Math.max(winEnd - winStart, 1e-9)
+  const skipMapping = opts?.skipMapping ?? null
   const topPadPx = Math.max(0, Math.floor((opts?.topPaddingPx ?? 0) * dpr))
   const drawTop = topPadPx
   const drawBottom = hPx
@@ -111,7 +120,9 @@ export function drawWaveformCanvas(
   const minBarPx = Math.max(1, Math.round(dpr))
 
   for (let x = 0; x < wPx; x += 1) {
-    const t = winStart + ((x + 0.5) / wPx) * span
+    const t = skipMapping
+      ? skipMapping.pixelToMediaSec(x + 0.5, wPx)
+      : winStart + ((x + 0.5) / wPx) * span
     const pi = mediaSecToPeakPixelIndex(metrics, t)
     const i = pi * 2
     const mn = (data[i] ?? 0) / 127

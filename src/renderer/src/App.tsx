@@ -74,16 +74,13 @@ import {
 import { timelineEditLog } from './timelineEditLog'
 import { wfLog } from './components/vrewPeaksEditor/waveformDebugLog'
 import {
-  cutRemovedIntervalsExpandOnly,
   cutRangesSignature,
-  exactTimelineDurationSecFromWaveformJson,
-  stitchWaveformJsonByCuts,
-  stitchWaveformJsonExpandCutsIncremental,
-  stitchedEditAxisDurationSecFromCuts
+  exactTimelineDurationSecFromWaveformJson
 } from './timeline/stitchWaveformJson'
 import { StitchedPeaksJsonLruCache } from './timeline/stitchedPeaksJsonCache'
 import { cutRangeShallowEqual, useStableArrayReference } from './useStableArrayReference'
 import {
+  buildTimelineClips,
   createTimelineMapping,
   jumpVideoPastClipTailIfNeeded,
   programDurationSec,
@@ -99,11 +96,6 @@ import {
 import { USE_WORD_BASED_PLAYBACK_SCHEDULE } from './timeline/playbackPolicy'
 import { WebAudioMasterPlayback } from './timeline/webAudioMasterPlayback'
 import { useVideoSeekUi } from './sync/useVideoSeekUi'
-import {
-  WordCanvasPanel,
-  buildEditorSnapshotFromSentenceTokenTimeline,
-  useEditorStore
-} from './wordCanvas'
 
 type OverlayPhase = 'working' | 'success' | 'error'
 
@@ -1586,100 +1578,19 @@ export default function App(): ReactElement {
   }, [durationSec, waveformMediaSpanSec, waveformPeaksJsonData])
 
   /**
-   * 단어 tombstone/가상 삭제 구간을 피크 배열에서 실제로 잘라 낸 편집축 Peaks JSON — 동기 계산.
-   * 디바운스/setState 폴백 없이 항상 `stitchedWaveformJsonComputed ?? waveformPeaksJsonData` 두 가지 중 하나만 그린다.
+   * **EDL-only single media axis** — 파형 JSON 은 항상 원본 한 장. 컷/tombstone 시 stitched 합성을 하지 않는다.
    *
-   * **컷이 하나라도 있으면 스티치** — 하드 타임라인 컷(`mergedCutRanges`) 없이 단어 tombstone(`isDeleted`) 만
-   * 발생한 경우에도 `mergedWaveformPeaksStitchCuts` 에는 들어가므로 동일하게 스티치를 돌려 파형 UI 에 삭제 구간을
-   * 즉시 반영한다. (이전에는 `mergedCutRanges.length === 0` 이면 무조건 null 로 폴백 → 단어 삭제 시 파형이
-   * 줄어들지 않던 버그가 있었음.)
+   * 이전 정책: 컷이 하나라도 있으면 `stitchWaveformJsonByCuts` / `stitchWaveformJsonExpandCutsIncremental` 로
+   * 픽셀 배열을 잘라 합성된 편집축 파형을 만들었다 → UI 가 edit-axis, 재생/storage 가 media-axis 가 되어
+   * 단어 클릭 시 +cumulativeCut 만큼 어긋났다.
    *
-   * 비용 — 스티치 자체는 동기 픽셀 복사이지만 컷 시그니처가 바뀔 때만 재계산되며, Peaks `precomputedWaveformSig`
-   * 도 길이/데이터 길이 기반이라 같은 시그니처 결과면 `destroy/init` 루프는 발생하지 않는다.
-   *
-   * 입력 컷은 `mergedWaveformPeaksStitchCutsForPeaksJsonOnly`(deferred subtitles) — 삭제 직후 첫 paint 에
-   * 거대 버퍼 생성이 메인 스레드를 막지 않도록 한다.
+   * 새 정책: 파형은 원본 미디어 그대로 그리고, 컷 영역은 (별도 시각 마킹/오버레이로) 표시만 한다.
+   * 캐시는 더 이상 사용하지 않으나, 파형/타임라인이 다시 mount 될 때를 대비해 비워둔다.
    */
   const stitchedWaveformJsonComputed = useMemo((): JsonWaveformData | null => {
-    const cache = stitchedPeaksJsonCacheRef.current
-    if (!videoPath || !waveformPeaksJsonData) {
-      cache.clear()
-      return null
-    }
-    const wf = waveformPeaksJsonData
-    const newCuts = mergedWaveformPeaksStitchCutsForPeaksJsonOnly
-    const stitchDur = rawWaveformTimelineDurationSec
-    if (!(stitchDur > 0)) return null
-    if (newCuts.length === 0) return null
-
-    const srcKey = `${videoPath}|${wf.length ?? 0}|${stitchDur.toFixed(4)}`
-    const newSig = cutRangesSignature(newCuts)
-
-    /**
-     * 1) **Exact hit** — 같은 시그니처가 캐시에 있으면 이전 reference 그대로 반환.
-     *    Undo/Redo 가 직전 상태로 돌아갈 때 사실상 0ms 이고, 다운스트림 cascade 도 reference 동일성으로 스킵.
-     */
-    const exact = cache.get(srcKey, newSig)
-    if (exact) {
-      wfLog('perf', 'stitched peaks JSON 캐시 hit (LRU)', {
-        cutCount: newCuts.length,
-        outPixels: exact.out.length ?? 0,
-        cacheEntries: cache.size()
-      })
-      return exact.out
-    }
-
-    /**
-     * 2) **Miss + expansion-only** — MRU 항목의 컷이 새 컷의 부분집합이면 splice 만으로 확장.
-     *    1473 word 환경에서 단일 단어 삭제의 일반 경로.
-     */
-    const mru = cache.peekMru(srcKey, newSig)
-    if (mru && cutRemovedIntervalsExpandOnly(mru.mergedCuts, newCuts)) {
-      const tInc = performance.now()
-      const inc = stitchWaveformJsonExpandCutsIncremental(mru.out, mru.mergedCuts, wf, newCuts, stitchDur)
-      if (inc) {
-        const entry = cache.set(srcKey, newSig, { mergedCuts: mergeCutRanges([...newCuts]), out: inc })
-        wfLog('perf', 'stitchWaveformJsonExpandCutsIncremental', {
-          ms: Math.round(performance.now() - tInc),
-          cutCount: newCuts.length,
-          outPixels: inc.length ?? 0,
-          cacheEntries: cache.size(),
-          cacheBytes: cache.bytes()
-        })
-        return entry.out
-      }
-    }
-
-    /**
-     * 3) **Full fallback** — 전체 계산. 결과는 LRU 에 등록되어 다음 Undo/Redo 때 0ms hit.
-     */
-    try {
-      const t0 = performance.now()
-      const out = stitchWaveformJsonByCuts(wf, newCuts, stitchDur)
-      wfLog('perf', 'stitchWaveformJsonByCuts 동기 계산', {
-        ms: Math.round(performance.now() - t0),
-        cutCount: newCuts.length,
-        srcPixels: wf.length ?? 0,
-        outPixels: out?.length ?? 0,
-        stitchDurSec: Math.round(stitchDur * 100) / 100
-      })
-      if (out) {
-        const entry = cache.set(srcKey, newSig, { mergedCuts: mergeCutRanges([...newCuts]), out })
-        return entry.out
-      }
-      return null
-    } catch (e) {
-      wfLog('perf', 'stitchWaveformJsonByCuts 예외', {
-        message: e instanceof Error ? e.message : String(e)
-      })
-      return null
-    }
-  }, [
-    videoPath,
-    waveformPeaksJsonData,
-    mergedWaveformPeaksStitchCutsForPeaksJsonOnly,
-    rawWaveformTimelineDurationSec
-  ])
+    stitchedPeaksJsonCacheRef.current.clear()
+    return null
+  }, [])
 
   /**
    * 과거 시도: stitched **출력** 전체를 `useDeferredValue` 하면 인라인 단어 레일과 픽셀 축이 어긋져 싱크가 깨졌다.
@@ -1702,35 +1613,14 @@ export default function App(): ReactElement {
   }, [waveformPeaksStitchCutSig])
 
   /**
-   * 편집축 미디어 끝 — 스티치 파형 → 원본 파형 → Peaks 보조 → 컨테이너 메타.
-   * 정책: “끝은 실오디오(파형) 기준”. Peaks JSON 로딩 중에는 컨테이너 `durationSec` 와
-   * 이전 세션 잔존 `waveformMediaSpanSec` 를 무시하고 자막 끝만 임시 상한으로 쓴다.
+   * **EDL-only single media axis** — 타임라인 끝은 **원본 미디어 축**의 길이.
+   *
+   * 컷/tombstone 으로 압축하지 않는다. 컷 구간은 시각 마킹만 하고 시간 라벨은 원본 그대로.
+   * 우선순위: 원본 Peaks JSON 길이 → 파형 미디어 span → 컨테이너 duration → 자막 끝.
    */
   const timelineMediaEndHint = useMemo(() => {
     const subtitleEnd = subtitles.reduce((m, line) => Math.max(m, line.end ?? 0), 0)
     const durHint = durationSec > 0 ? durationSec : undefined
-    /**
-     * 편집축 길이는 **즉시** `mergedWaveformPeaksStitchCuts` 로 계산한다.
-     * `stitchedWaveformJsonComputed` 는 deferred 입력이라 삭제 직후 한두 프레임 옛 길이를 유지하면
-     * `createTimelineMapping` 의 클립·`mapMediaToEditSec` 과 실제 오디오·단어 하이라이트가 어긋난다.
-     */
-    if (
-      waveformPeaksJsonData &&
-      mergedWaveformPeaksStitchCuts.length > 0 &&
-      rawWaveformTimelineDurationSec > 0
-    ) {
-      const fromImmediateCuts = stitchedEditAxisDurationSecFromCuts(
-        waveformPeaksJsonData,
-        mergedWaveformPeaksStitchCuts,
-        rawWaveformTimelineDurationSec,
-        durHint
-      )
-      if (fromImmediateCuts != null && fromImmediateCuts > 0) return fromImmediateCuts
-    }
-    if (stitchedWaveformJsonComputed) {
-      const fromStitched = exactTimelineDurationSecFromWaveformJson(stitchedWaveformJsonComputed, durHint)
-      if (fromStitched != null && fromStitched > 0) return fromStitched
-    }
     if (waveformPeaksJsonData) {
       const fromJson = exactTimelineDurationSecFromWaveformJson(waveformPeaksJsonData, durHint)
       if (fromJson != null && fromJson > 0) return fromJson
@@ -1744,26 +1634,37 @@ export default function App(): ReactElement {
     subtitles,
     waveformMediaSpanSec,
     waveformPeaksJsonData,
-    waveformPeaksJsonLoading,
-    mergedWaveformPeaksStitchCuts,
-    rawWaveformTimelineDurationSec,
-    stitchedWaveformJsonComputed
+    waveformPeaksJsonLoading
   ])
 
-  /** 하드 컷 + 단어 tombstone 미디어 구간 — 편집↔미디어 클립·재생 EDL·스킵 공통 입력 */
-  const timelineMapping = useMemo((): TimelineMapping => {
-    return createTimelineMapping(mergedWaveformPeaksStitchCuts, timelineMediaEndHint)
-  }, [mergedWaveformPeaksStitchCuts, timelineMediaEndHint])
   /**
-   * 재생 매핑 — 클립은 하드 컷 + tombstone 모두 빼고, masterMode 는 **실제 하드 컷**이 있을 때만 stitched.
-   * tombstone 만 있으면 passthrough + 클립 갭으로 미디어 구간을 빼면 RAF·skipCutRangeAt 가 동일 리스트로 jump.
+   * **EDL-only single media axis** — 편집축↔미디어축 변환을 모두 항등으로 만든다.
+   *
+   * 단어 storage·UI 카드·파형·viewWin·재생 dispatch 모두 미디어 축(원본) 한 줄로 통일.
+   * 컷/tombstone 구간은 별도 `playbackEdlClips` 와 `mergedPlaybackSkipRangesRef` 가 들고 있어
+   * 재생기가 그 구간을 EDL 로 자연 skip 한다 — UI 축은 그대로 둔 채.
+   *
+   * 결과: `programToMediaSec(p) === p`, `mediaToProgramSec(m) === m`, `programToMasterAudioSec(p) === p`.
+   */
+  const timelineMapping = useMemo((): TimelineMapping => {
+    return createTimelineMapping([], timelineMediaEndHint, { masterMode: 'passthrough' })
+  }, [timelineMediaEndHint])
+  /**
+   * 재생 매핑도 항등. 마스터 오디오는 항상 원본 파일(passthrough) 이고, 컷 skip 은
+   * `armPlaybackSchedule(playbackEdlClips, ...)` + `mergedPlaybackSkipRangesRef` 가 담당.
    */
   const playbackTimelineMapping = useMemo((): TimelineMapping => {
-    const stitchedPlayback = mergedCutRanges.length > 0
-    return createTimelineMapping(mergedWaveformPeaksStitchCuts, timelineMediaEndHint, {
-      masterMode: stitchedPlayback ? 'stitched' : 'passthrough'
-    })
-  }, [mergedCutRanges.length, mergedWaveformPeaksStitchCuts, timelineMediaEndHint])
+    return createTimelineMapping([], timelineMediaEndHint, { masterMode: 'passthrough' })
+  }, [timelineMediaEndHint])
+  /**
+   * **EDL 전용 cut-aware clips** — `timelineMapping.clips` 는 항등이 되어 컷 정보를 잃었으므로,
+   * `armPlaybackSchedule` / `buildScheduledMediaSegments` 가 컷 사이 활성 구간만 재생하도록 별도로 보관한다.
+   * 입력 컷은 `mergedWaveformPeaksStitchCuts` (하드 컷 + tombstone + 가상 삭제).
+   */
+  const playbackEdlClips = useMemo(
+    () => buildTimelineClips(mergedWaveformPeaksStitchCuts, timelineMediaEndHint),
+    [mergedWaveformPeaksStitchCuts, timelineMediaEndHint]
+  )
   const playbackTimelineMappingRef = useRef(playbackTimelineMapping)
   playbackTimelineMappingRef.current = playbackTimelineMapping
   /** Web Audio·스티치 빌드 시 동일하게 쓸 원본 미디어 URL(blob 아님) */
@@ -1782,22 +1683,13 @@ export default function App(): ReactElement {
   )
   const isPlaybackMapperReady = useCallback((): boolean => {
     /**
-     * 하드 타임라인 컷(`mergedCutRanges`)이 없을 때는 단어 tombstone 만으로
-     * `mergedWaveformPeaksStitchCuts` 가 생긴다. 이때 UI용 `timelineMapping` 은 stitched,
-     * `playbackTimelineMapping` 은 의도적으로 passthrough — `committed >= pending` 동기화는
-     * 마스터 오디오 URL 이 바뀌지 않아 master audio effect 가 layoutKey 같음으로 early-return 하면 영원히 안 따라잡는다.
-     * 이 조합에서는 `mapperReady` / `masterMode` 검사를 모두 건너뛰고 즉시 ready 로 본다.
-     * (그러지 않으면 `isPlaybackTransactionLocked` → `playRange` 가 큐에만 쌓이고 재생이 멈춘다.)
+     * **EDL-only single media axis** — UI(`timelineMapping`) 와 재생(`playbackTimelineMapping`) 매핑이
+     * 항상 동일한 passthrough 항등이므로 mode mismatch 가드가 의미를 잃었다.
+     * 마스터 오디오는 항상 원본 파일 (URL 변경 없음) 이므로 mapper rebuild 대기 자체도 발생하지 않는다.
+     * 항상 ready 로 간주해 단어 tombstone 발생 직후 클릭이 큐에 영구히 갇히는 문제도 함께 사라진다.
      */
-    if (mergedCutRanges.length === 0) return true
-    if (!playbackSnapshot.mapperReady) return false
-    return timelineMapping.masterMode === playbackSnapshot.masterMode
-  }, [
-    playbackSnapshot.mapperReady,
-    playbackSnapshot.masterMode,
-    timelineMapping.masterMode,
-    mergedCutRanges.length
-  ])
+    return true
+  }, [])
   useEffect(() => {
     playbackCommandRouterRef.current.setMappingRevision(
       playbackSnapshot.pendingRevision,
@@ -2127,50 +2019,11 @@ export default function App(): ReactElement {
       }
     ): boolean => {
       /**
-       * 하드 컷이 없을 때(`mergedCutRanges.length === 0`)는 tombstone·가상 삭제만으로 `timelineMapping` 은
-       * stitched, `playbackTimelineMapping` 은 의도적으로 passthrough 가 된다. 두 가드 전부를 건너뛰고
-       * 즉시 재생을 허용 — 그러지 않으면 단어 자르기·삭제 직후 모든 단어 재생 클릭이 `onMapperBlocked`
-       * → 큐 → mapper revision 영원히 안 따라잡힘 사이클에 영구히 막힌다. (`isPlaybackMapperReady` 와 동일 정책.)
+       * **EDL-only single media axis** — `timelineMapping` 과 `playbackTimelineMapping` 모두 항상 passthrough 항등.
+       * 두 매핑이 같은 축이라 mode mismatch / mapper rebuild 가드가 동작할 필요가 없다.
+       * (이전엔 tombstone 만으로도 timelineMapping 이 stitched 로 자동 승격되어 mismatch 가드를 우회하는 분기가
+       *  필요했지만, 이제는 두 mapping 이 동일 축이므로 그 분기 자체가 dead path.)
        */
-      if (mergedCutRanges.length === 0) {
-        wfLog('peaks', 'startSyncedPlayback mapper 가드 우회 [diag-5] tombstone-only', {
-          targetEditSec,
-          timelineMasterMode: timelineMapping.masterMode,
-          playbackMasterMode: playbackSnapshot.masterMode,
-          mapperReady: playbackSnapshot.mapperReady
-        })
-      } else {
-        if (!playbackSnapshot.mapperReady) {
-          options?.onMapperBlocked?.()
-          timelineEditLog('playback', `${source} 차단(mapper rebuild)`, {
-            targetEditSec,
-            playbackPendingRevision: playbackSnapshot.pendingRevision,
-            playbackCommittedRevision: playbackSnapshot.committedRevision
-          })
-          wfLog('peaks', 'startSyncedPlayback 차단 [diag-5] mapper rebuild', {
-            targetEditSec,
-            playbackPendingRevision: playbackSnapshot.pendingRevision,
-            playbackCommittedRevision: playbackSnapshot.committedRevision
-          })
-          return false
-        }
-        if (timelineMapping.masterMode !== playbackSnapshot.masterMode) {
-          options?.onMapperBlocked?.()
-          timelineEditLog('playback', `${source} 차단(mode mismatch)`, {
-            targetEditSec,
-            timelineMasterMode: timelineMapping.masterMode,
-            playbackMasterMode: playbackSnapshot.masterMode,
-            playbackPendingRevision: playbackSnapshot.pendingRevision,
-            playbackCommittedRevision: playbackSnapshot.committedRevision
-          })
-          wfLog('peaks', 'startSyncedPlayback 차단 [diag-5] mode mismatch', {
-            targetEditSec,
-            timelineMasterMode: timelineMapping.masterMode,
-            playbackMasterMode: playbackSnapshot.masterMode
-          })
-          return false
-        }
-      }
       const el = videoRef.current
       const masterAudio = masterAudioRef.current
       if (!el || !masterAudio) {
@@ -2417,9 +2270,13 @@ export default function App(): ReactElement {
 
   const armPlaybackSchedule = useCallback(
     (startMediaSec: number, endMediaSec: number | null, kind: 'oneshot' | 'continuous'): ScheduledMediaSegment[] => {
+      /**
+       * `timelineMapping` 은 항등이라 컷 정보를 잃었다. EDL 세그먼트는 `playbackEdlClips`
+       * (cut-aware) 또는 단어 기반 (storage media-axis) 으로 계산해 컷 구간을 자연 skip 한다.
+       */
       const segments = USE_WORD_BASED_PLAYBACK_SCHEDULE
         ? buildScheduledMediaSegmentsFromSubtitleWords(subtitles, startMediaSec, endMediaSec)
-        : buildScheduledMediaSegments(timelineMapping.clips, startMediaSec, endMediaSec)
+        : buildScheduledMediaSegments(playbackEdlClips, startMediaSec, endMediaSec)
       activePlaybackScheduleRef.current = segments.length > 0 ? { kind, index: 0, segments } : null
       timelineEditLog('playback', 'EDL schedule armed', {
         kind,
@@ -2432,7 +2289,7 @@ export default function App(): ReactElement {
       })
       return segments
     },
-    [timelineMapping, subtitles]
+    [playbackEdlClips, subtitles]
   )
 
   const clearPlaybackSchedule = useCallback((reason: string): void => {
@@ -3390,61 +3247,6 @@ export default function App(): ReactElement {
     }
   }, [videoPath])
 
-  /**
-   * 정규화 wordCanvas 스토어 — 타임라인 SSOT + 원본 미디어 축 peaks JSON 만 사용
-   * (스티치 편집축 JSON 과 시간축이 안 맞아 혼용 금지).
-   *
-   * 빠른 경로 (구조 동일):
-   *  1) `tryPatchTombstonesFromTimeline` — 시간·텍스트 동일 + `is_deleted` 만 토글 → 가상 접두만 갱신.
-   *  2) `patchFromTimelineIfStructureMatches` — 리플 삭제처럼 토큰 시간이 바뀐 경우에도 `audioChunks` 는 재사용.
-   * 느린 경로 (구조 변경: 분할/병합/문장 삭제): 전체 hydrate 1회.
-   *
-   * 효과: 단어 1개 삭제 시 매번 모든 문장에 대해 `slicePeaksJsonToRmsChunk` 가 도는 O(N) 경로 차단.
-   */
-  useEffect(() => {
-    if (sentenceTokenTimeline.length === 0) {
-      return
-    }
-    const store = useEditorStore.getState()
-    const tStart = performance.now()
-    const tokenCount = sentenceTokenTimeline.reduce(
-      (acc, s) => acc + (s.tokens?.length ?? 0),
-      0
-    )
-    if (store.tryPatchTombstonesFromTimeline(sentenceTokenTimeline)) {
-      wfLog('perf', 'editor store hydrate — fast tombstone patch', {
-        ms: Math.round(performance.now() - tStart),
-        sentenceCount: sentenceTokenTimeline.length,
-        tokenCount
-      })
-      return
-    }
-    if (store.patchFromTimelineIfStructureMatches(sentenceTokenTimeline)) {
-      wfLog('perf', 'editor store hydrate — structure-match patch', {
-        ms: Math.round(performance.now() - tStart),
-        sentenceCount: sentenceTokenTimeline.length,
-        tokenCount
-      })
-      return
-    }
-    const snap = buildEditorSnapshotFromSentenceTokenTimeline(
-      sentenceTokenTimeline,
-      waveformPeaksJsonData ?? null,
-      rawWaveformTimelineDurationSec > 0 ? rawWaveformTimelineDurationSec : undefined
-    )
-    const tBuilt = performance.now()
-    store.hydrate(snap)
-    wfLog('perf', 'editor store hydrate — full snapshot (slow path)', {
-      buildMs: Math.round(tBuilt - tStart),
-      hydrateMs: Math.round(performance.now() - tBuilt),
-      totalMs: Math.round(performance.now() - tStart),
-      sentenceCount: sentenceTokenTimeline.length,
-      tokenCount,
-      hasPeaksJson: !!waveformPeaksJsonData,
-      peakPixels: waveformPeaksJsonData?.length ?? 0
-    })
-  }, [sentenceTokenTimeline, waveformPeaksJsonData, rawWaveformTimelineDurationSec])
-
   /** 디바운스 없이 동기 useMemo 로 만든 stitched 결과의 로그/진단만 별도 effect 에서 처리 */
   useEffect(() => {
     const wf = waveformPeaksJsonData
@@ -3832,12 +3634,14 @@ export default function App(): ReactElement {
    * 매 vrewRows useMemo 호출에서 새 화살표 함수를 넘기면 `vrewRowCache` 가 모든 line 에서 miss 되어
    * 1473 word 전체가 재빌드. mapMediaToEditSec 가 변할 때만 새 reference 가 되도록 useCallback.
    */
+  /**
+   * **EDL-only single media axis** — vrewRow 단어 시간은 storage media-axis 그대로.
+   * 이전엔 `mapMediaToEditSec` 으로 +cumulativeCut 빼 줘 edit-axis 로 압축했지만,
+   * 매핑이 항등이 된 후로는 변환 자체가 불필요하다. (단어 클릭 → dispatch → 재생 = media 일관.)
+   */
   const mapWordMediaToProgramForVrew = useCallback(
-    (ms: number, me: number) => ({
-      start: mapMediaToEditSec(ms),
-      end: mapMediaToEditSec(me)
-    }),
-    [mapMediaToEditSec]
+    (ms: number, me: number) => ({ start: ms, end: me }),
+    []
   )
 
   const vrewRowsRaw = useMemo(
@@ -6966,10 +6770,8 @@ export default function App(): ReactElement {
                         mediaDurationSec={waveformMediaDurationCapSec ?? waveformUiDurationSec}
                         onPeaksDurationComparedToMedia={onPeaksDurationComparedToMedia}
                         wordEdgeSubtitleBridge={wordEdgeSubtitleBridge}
+                        playbackSkipRanges={mergedWaveformPeaksStitchCuts}
                       />
-                    ) : null}
-                    {modelReady && subtitlesForList.length > 0 ? (
-                      <WordCanvasPanel className="mt-3 border-t border-slate-800/90 pt-3" />
                     ) : null}
                   </>
                 )}

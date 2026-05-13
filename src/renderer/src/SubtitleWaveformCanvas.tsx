@@ -180,6 +180,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
 
     const zoomCanvasRef = useRef<HTMLCanvasElement>(null)
     const zoomOuterRef = useRef<HTMLDivElement | null>(null)
+    /** PPS 박스 래퍼 — 카드(`article`) 대비 동적 위치 보정 시 실제 뷰포트 bbox 측정용 */
+    const waveStripBoxRef = useRef<HTMLDivElement | null>(null)
     const playheadLineRef = useRef<HTMLDivElement | null>(null)
     /** App 의 setPeaksZoomViewRange 가 매번 새 객체로 재렌더 → 자식·ref 연쇄 — 동일 구간은 통과 금지 */
     const lastPublishedZoomSigRef = useRef<string | null>(null)
@@ -254,6 +256,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     )
 
     const { viewWin, setViewWin, viewWinRef } = useWaveformViewWindow(metrics, zoomOuterRef)
+    const metricsRef = useRef(metrics)
+    metricsRef.current = metrics
 
     const durExact = useMemo(
       () => exactTimelineDurationSecFromWaveformJson(precomputedWaveformJson, mediaHint),
@@ -307,6 +311,28 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
      * `viewWinRef` 가 아직 커밋 전이거나 deps 로 effect 가 재돌아도 동일 anchor 면 `setViewWin` 호출 안 함.
      */
     const frozenWordViewWinRef = useRef<{ anchorKey: string; start: number; end: number } | null>(null)
+
+    /**
+     * viewWin 박제 effect 전용 — `portalHost` / `articleEl` state 에 의존하면 형제 layout effect 의
+     *  setState 와 같은 틱에서 순서·재실행이 꼬이거나, 박스 폭 변경 → ResizeObserver → bumpPortal 과
+     *  맞물려 Maximum update depth 가 날 수 있다. ref 로 잡은 마운트 DOM 에서 `<article>` 만 올라간다.
+     */
+    const getWaveformMountAndArticleEl = useCallback((): {
+      mount: HTMLElement
+      article: HTMLElement
+    } | null => {
+      const li = activeLineIndex
+      if (li == null) return null
+      const raw = waveMountByLineRef.current.get(li)
+      const mount = raw && raw.isConnected ? raw : null
+      if (!mount) return null
+      let cur: HTMLElement | null = mount
+      while (cur && cur.tagName.toLowerCase() !== 'article') {
+        cur = cur.parentElement
+      }
+      if (!cur) return null
+      return { mount, article: cur }
+    }, [activeLineIndex, waveMountByLineRef])
 
     /** 활성 단어 ±1 이웃 V0 한 번만 — 이후 viewWin 고정 */
     useLayoutEffect(() => {
@@ -373,9 +399,9 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
              *  활성 단어 mid 가 단어 칩(`data-word-id`) 의 가로 중앙 픽셀에 오도록 박스 left 결정.
              *  mount/chip 이 아직 렌더되지 않았으면 lock 자체를 미룬다 — viewWin 유지하고 effect 재시도.
              */
-            const mountEl = portalHost ?? null
-            const cardEl = articleEl ?? null
-            if (!mountEl || !cardEl) return
+            const mc = getWaveformMountAndArticleEl()
+            if (!mc) return
+            const { mount: mountEl, article: cardEl } = mc
             const mountRect = mountEl.getBoundingClientRect()
             const mountW = mountRect.width
             const mountLeft = mountRect.left
@@ -420,7 +446,17 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
             lastTrimEdgeRef.current = null
             viewWinLockedAnchorRef.current = anchorKey
             frozenWordViewWinRef.current = { anchorKey, ...nextWin }
-            setBoxLayoutPx({ left, width: boxWidth0 })
+            setBoxLayoutPx((p) => {
+              const next = { left, width: boxWidth0 }
+              if (
+                p != null &&
+                Math.abs(p.left - next.left) < 0.5 &&
+                Math.abs(p.width - next.width) < 0.5
+              ) {
+                return p
+              }
+              return next
+            })
             setViewWin((prev) => {
               if (
                 prev != null &&
@@ -565,14 +601,53 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       metrics,
       draggingHandle,
       cardBoundsSig,
-      portalHost,
-      articleEl,
+      portalRev,
+      getWaveformMountAndArticleEl,
       setViewWin
     ])
 
     useEffect(() => {
       publishZoom()
     }, [publishZoom, viewWin, activeLineIndex])
+
+    /**
+     * **동적 위치 보정 (카드 경계)** — PPS 박스(`boxLayoutPx`) 사용 시에만.
+     *  스트립 전 너비 ≤ 단어 카드(`article`) 안쪽 가용 너비(=Wcard − 2×pad) 일 때, 좌/우 짤림을
+     *  `marginLeft` 만큼 보정해 카드 안에 들어오게 한다. PPS·viewWin·트림 클램프는 건드리지 않는다.
+     *
+     * `pad = Wcard × 1%` — 카드 좌·우 끝선에 파동이 딱 붙어서 짤린건지 헷갈리는 현상을 막기 위한
+     *  시각적 여백. 95% 흡수 차단(`MAX_WAVE_TO_CARD_RATIO`)과는 직교 — 박스 폭은 그대로 두고
+     *  표시 위치만 안쪽으로 보정한다.
+     */
+    useLayoutEffect(() => {
+      if (boxLayoutPx == null) return
+      const mc = getWaveformMountAndArticleEl()
+      const stripEl = waveStripBoxRef.current
+      if (!mc || !stripEl?.isConnected) return
+      const ar = mc.article.getBoundingClientRect()
+      const sr = stripEl.getBoundingClientRect()
+      const Wwave = sr.width
+      const Wcard = ar.width
+      if (!(Wcard > 1)) return
+      const pad = Wcard * 0.01
+      if (Wwave > Wcard - 2 * pad + 0.75) return
+
+      const lo = ar.left + pad - sr.left
+      const hi = ar.right - pad - sr.right
+      if (lo > hi + 0.5) return
+
+      const delta = Math.max(lo, Math.min(hi, 0))
+      if (Math.abs(delta) < 0.25) return
+
+      const nextLeft = boxLayoutPx.left + delta
+      setBoxLayoutPx((prev) => {
+        if (!prev) return prev
+        if (Math.abs(prev.left - nextLeft) < 0.25 && Math.abs(prev.width - boxLayoutPx.width) < 0.25) {
+          return prev
+        }
+        return { left: nextLeft, width: prev.width }
+      })
+    }, [boxLayoutPx, portalRev, activeLineIndex, getWaveformMountAndArticleEl])
 
     /** 줌 해제는 publishZoom 한 경로만 — 별도 effect 로 onZoomViewRange(null) 하면 부모 이중 setState·연쇄 렌더 유발 */
 
@@ -787,6 +862,12 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
      *  V0 끝에서 손을 떼면 commit 의 흡수 로직이 이웃 단어를 합치고, 그 결과 활성 단어의 start/end 가
      *  바뀌면 위쪽 layout effect 의 `anchorKey`(start/end 포함) 가 바뀌어 **±1 V0 를 새 단어 기준으로 재고정**.
      *  → 흡수된 쪽에 이전엔 보이지 않던 다음/이전 단어 파동이 자연스럽게 한 칸씩 붙는다.
+     *
+     * **카드 95% 흡수 차단** — PPS 가 박제된 상태에서, *다음 흡수가 발생하면* viewWin 시간폭이 늘어
+     *  `pps × span` 으로 계산되는 박스 폭이 단어카드(`<article>`) 폭의 95% 를 넘는 경우,
+     *  해당 방향의 클램프 한계를 흡수 임계점 직전(`±ABSORB_GUARD_SEC`)으로 좁혀
+     *  사용자가 끝까지 끌어도 흡수가 발생하지 않게 한다. `Wwave > 0.95 × Wcard` 가 되는 시점부터는
+     *  새 이웃 파동이 더 이상 추가되지 않으므로 카드 밖 짤림이 발생하지 않는다.
      */
     const clampNewSecToViewWinMedia = useCallback((sec: number): number => {
       const b = wordEdgeBridgeRef.current
@@ -796,10 +877,78 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       const hiE = Math.max(vw.start, vw.end)
       const loM = b.editSecToMediaSec(loE)
       const hiM = b.editSecToMediaSec(hiE)
-      const minE = Math.min(loM, hiM)
-      const maxE = Math.max(loM, hiM)
+      let minE = Math.min(loM, hiM)
+      let maxE = Math.max(loM, hiM)
+
+      /** 카드 95% 상한 흡수 차단 — 미래 박스 폭 예측 */
+      const pps = ppsRef.current
+      const li = activeLineIndexRef.current
+      const cwi = centerWordIndexRef.current
+      const dir = lastTrimEdgeRef.current
+      const ABSORB_GUARD_SEC = 0.005
+      const MAX_WAVE_TO_CARD_RATIO = 0.95
+      if (pps != null && li != null && cwi >= 0 && dir != null) {
+        const rawMount = waveMountByLineRef.current.get(li)
+        const mount = rawMount && rawMount.isConnected ? rawMount : null
+        let article: HTMLElement | null = mount
+        while (article && article.tagName.toLowerCase() !== 'article') {
+          article = article.parentElement
+        }
+        if (article) {
+          const Wcard = article.getBoundingClientRect().width
+          const words = rowsRef.current[li]?.words ?? []
+          const activeW = cwi >= 0 && cwi < words.length ? words[cwi] : null
+          const mediaCap = metricsRef.current?.durationSec ?? Number.POSITIVE_INFINITY
+          const limit = Wcard * MAX_WAVE_TO_CARD_RATIO
+          if (Wcard > 1 && activeW) {
+            if (dir === 'end' && cwi + 1 < words.length) {
+              const nextW = words[cwi + 1]!
+              const newWords = words.slice()
+              newWords.splice(cwi + 1, 1)
+              const aStart = Math.min(activeW.start, activeW.end)
+              const aEnd = Math.max(activeW.start, activeW.end)
+              const nEnd = Math.max(nextW.start, nextW.end)
+              newWords[cwi] = { ...activeW, start: aStart, end: Math.max(aEnd, nEnd) }
+              const ctx = computeWordContextWindow(newWords, cwi, 0, 0, {
+                mediaDurationSec: mediaCap
+              })
+              if (ctx) {
+                const nextWidth = pps * Math.max(ctx.windowEnd - ctx.windowStart, 1e-6)
+                if (nextWidth > limit) {
+                  const mediaNextEnd = b.editSecToMediaSec(nEnd)
+                  const restricted = mediaNextEnd - ABSORB_GUARD_SEC
+                  const newMaxE = Math.min(maxE, restricted)
+                  if (newMaxE > minE + 1e-6) maxE = newMaxE
+                }
+              }
+            } else if (dir === 'start' && cwi - 1 >= 0) {
+              const prevW = words[cwi - 1]!
+              const newWords = words.slice()
+              newWords.splice(cwi - 1, 1)
+              const newCwi = cwi - 1
+              const aStart = Math.min(activeW.start, activeW.end)
+              const aEnd = Math.max(activeW.start, activeW.end)
+              const pStart = Math.min(prevW.start, prevW.end)
+              newWords[newCwi] = { ...activeW, start: Math.min(aStart, pStart), end: aEnd }
+              const ctx = computeWordContextWindow(newWords, newCwi, 0, 0, {
+                mediaDurationSec: mediaCap
+              })
+              if (ctx) {
+                const nextWidth = pps * Math.max(ctx.windowEnd - ctx.windowStart, 1e-6)
+                if (nextWidth > limit) {
+                  const mediaPrevStart = b.editSecToMediaSec(pStart)
+                  const restricted = mediaPrevStart + ABSORB_GUARD_SEC
+                  const newMinE = Math.max(minE, restricted)
+                  if (newMinE < maxE - 1e-6) minE = newMinE
+                }
+              }
+            }
+          }
+        }
+      }
+
       return clampPx(sec, minE, maxE)
-    }, [])
+    }, [waveMountByLineRef])
 
     const onWordEdgePreview = useCallback((result: EdgeDragResult) => {
       const b = wordEdgeBridgeRef.current
@@ -1329,13 +1478,13 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         }
         return next
       })
-    }, [activeLineIndex, activeWordId, articleEl, trimHandlePct])
+    }, [activeLineIndex, activeWordId, articleEl, trimHandlePct, boxLayoutPx])
 
     /** 활성 단어 / 줄 변경 시 한 번 재측정 (paint 전) */
     useLayoutEffect(() => {
       connectorAnchorRef.current = null
       recomputeConnectorGeom(true)
-    }, [activeLineIndex, activeWordId, articleEl, recomputeConnectorGeom])
+    }, [activeLineIndex, activeWordId, articleEl, boxLayoutPx, recomputeConnectorGeom])
 
     /**
      * **첫 측정이 한 프레임 늦게 들어오는 케이스** — 칩이 아직 렌더 전이면 위 effect 가 조용히 실패한다.
@@ -1478,6 +1627,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                 중앙을 기준으로 계산해 카드 영역 안에서 클램프한 값을 넣어 준다.
               */}
               <div
+                ref={waveStripBoxRef}
                 className="min-w-0"
                 style={
                   boxLayoutPx != null

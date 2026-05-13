@@ -11,7 +11,12 @@
     "noEmit": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "@renderer/*": ["src/renderer/src/*"],
+      "@resources/*": ["resources/*"]
+    }
   },
   "include": [
     "src/renderer/src/**/*",

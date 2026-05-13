@@ -39,6 +39,10 @@ import {
 import { buildEdlSkipMapping, type EdlSkipMapping } from './waveform/edlSkipMapping'
 import { useWaveformViewWindow } from './waveform/useWaveformViewWindow'
 import { useWordEdgeDrag } from './useWordEdgeDrag'
+import playIconUrl from '@resources/Play.svg'
+import pauseIconUrl from '@resources/Pause.svg'
+import cutIconUrl from '@resources/cut.svg'
+import undoIconUrl from '@resources/undo.svg'
 
 export type SubtitleWaveformPeaksHandle = {
   onWaveMountDirty: () => void
@@ -1376,20 +1380,102 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     }, [viewWin, cutSec, skipMapping])
 
     /**
-     * 자르기·재생 라인 부드러운 움직임 — `cutSec` 은 이미 0.01s 단위로 quantize 된 값을 받지만
-     * 60Hz 화면에선 매 프레임 다른 위치로 React 가 강제 점프 그리므로 띄엄띄엄 보인다.
-     * 재생 중일 때만 `left` 에 12ms 선형 transition 을 걸어 프레임 사이 빈 구간을 CSS 가 채워
-     * 사용자 시야에서 0.01s 단위 진행이 자연스럽게 흐르도록 한다.
-     *
-     * - 드래그 중: transition 해제(드래그 추적이 지연되면 안 됨).
-     * - 정지/일시정지/단어 전환: transition 해제(시작점으로 즉시 스냅).
+     * 재생 중 cut 라인 위치/라벨을 **React 리렌더 없이** App 의 매 프레임 콜백 안에서
+     * 직접 DOM 갱신하기 위한 ref/상태.
+     *  - `cutLineLabelRef` : 시간 라벨 (`fmtSec` 결과를 textContent 로 imperative 갱신)
+     *  - `cutLineSliderRef`: 캔버스 내부 자르기·재생 슬라이더 (style.left 만 갱신)
+     *  - 재생 중 React 가 SubtitleWaveformCanvas 를 리렌더하지 않도록 `setCutSec` 호출은
+     *    drag/seek/start/stop 시점에만 — 재생 도중에는 어떠한 state 도 변경 안 함.
      */
-    const cutLineMotionStyle = useMemo<{ transition: string; willChange?: string }>(() => {
-      if (isPlaying && draggingHandle !== 'cut') {
-        return { transition: 'left 12ms linear', willChange: 'left' }
+    const cutLineLabelRef = useRef<HTMLSpanElement | null>(null)
+    const cutLineSliderRef = useRef<HTMLDivElement | null>(null)
+    const cutLineHandleRef = useRef<HTMLDivElement | null>(null)
+    const isCutLinePlayingMotion = isPlaying && draggingHandle !== 'cut'
+
+    /**
+     * **fmtSec 의 ref-안정 버전** — `useCallback` 으로 받지 못한 외부 prop fn 을 ref 로 보관해
+     * 재생 중 라벨 텍스트 imperative 갱신에서 dep 변화로 인한 effect 재시작 없이 사용.
+     */
+    const fmtSecRef = useRef(fmtSec)
+    fmtSecRef.current = fmtSec
+
+    /**
+     * playhead(editSec) 를 받아 cut 라인 두 DOM 의 `style.left` 와 라벨 텍스트를 즉시 갱신.
+     *  - `paintCutLine(editT)` 는 App 의 매 frame `commitEditSecToUi → syncPlayheadFromEditSec`
+     *    체인에서 호출되어 1-프레임 lag 없이 즉시 paint 전 좌표 반영.
+     *  - 별도 rAF 루프 불필요(이전엔 두 rAF 순서 문제로 1프레임 지연 발생) — App 의 tick 에 piggyback.
+     */
+    const paintCutLine = useCallback(
+      (editT: number): void => {
+        const er = editRangeRef.current
+        const map = skipMappingRef.current
+        if (!er || !map) return
+        if (typeof editT !== 'number' || !Number.isFinite(editT)) return
+        const s = Math.min(er.start, er.end)
+        const e = Math.max(er.start, er.end)
+        if (!(e > s + 1e-9)) return
+        const live = Math.min(e, Math.max(s, editT))
+        const span = Math.max(map.activeSpanSec, 1e-9)
+        const activeSec = map.mediaSecToActiveSec(live)
+        const pct = clampPx((activeSec / span) * 100, 0, 100)
+        const lt = `${pct}%`
+        const lbl = cutLineLabelRef.current
+        const sld = cutLineSliderRef.current
+        const hdl = cutLineHandleRef.current
+        if (lbl) {
+          if (lbl.style.left !== lt) lbl.style.left = lt
+          const txt = fmtSecRef.current(live)
+          if (lbl.textContent !== txt) lbl.textContent = txt
+        }
+        if (sld) {
+          if (sld.style.left !== lt) sld.style.left = lt
+        }
+        if (hdl) {
+          if (hdl.style.left !== lt) hdl.style.left = lt
+        }
+      },
+      []
+    )
+
+    /**
+     * **React 렌더 직후 1회 동기 보정** (브라우저 paint 전).
+     *  - isCutLinePlayingMotion 이 true 로 막 전환된 직후엔 JSX 의 `left` 가 비워져 React 가 inline `left`
+     *    를 지운 상태로 commit → 곧바로 paintCutLine 으로 복원.
+     *  - 재생 중에는 cutSec/cutLinePct 가 바뀌지 않으므로 SubtitleWaveformCanvas 리렌더 자체가 거의 없음.
+     *  - deps 없음 → 매 렌더마다 동작하되 isCutLinePlayingMotion 가 false 면 즉시 return.
+     */
+    useLayoutEffect(() => {
+      if (!isCutLinePlayingMotion) return
+      const editT = playheadEditSecRef?.current
+      if (typeof editT === 'number' && Number.isFinite(editT)) paintCutLine(editT)
+    })
+
+    /**
+     * 재생 토글 시 will-change 힌트만 토글 — GPU 레이어 합성 비용을 idle 상태에서 회수.
+     */
+    useEffect(() => {
+      const lbl = cutLineLabelRef.current
+      const sld = cutLineSliderRef.current
+      const hdl = cutLineHandleRef.current
+      if (isCutLinePlayingMotion) {
+        if (lbl) lbl.style.willChange = 'left'
+        if (sld) sld.style.willChange = 'left'
+        if (hdl) hdl.style.willChange = 'left'
+      } else {
+        if (lbl) {
+          lbl.style.willChange = ''
+          lbl.style.transition = ''
+        }
+        if (sld) {
+          sld.style.willChange = ''
+          sld.style.transition = ''
+        }
+        if (hdl) {
+          hdl.style.willChange = ''
+          hdl.style.transition = ''
+        }
       }
-      return { transition: 'none' }
-    }, [isPlaying, draggingHandle])
+    }, [isCutLinePlayingMotion])
 
     /** 라벨이 박스 밖으로 옮겨졌으므로 상단 패딩은 최소만(중심선 여유) */
     const WAVE_TOP_LABEL_BAND_PX = 4
@@ -1458,11 +1544,14 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     ])
 
     /**
-     * 재생 중에만 호출 — playhead(편집축 초)를 트림 구간으로 클램프해 `cutSec` 상태로 반영한다.
-     * 정지 중에는 사용자의 드래그가 cut 라인을 움직이므로 절대 덮어쓰지 않음.
+     * App 의 `commitEditSecToUi` → `syncPlayheadFromEditSec(editSec)` 진입점.
+     *  - 재생 중: `paintCutLine(editT)` 로 cut 라인 DOM 만 imperative 갱신 (React 리렌더 0).
+     *  - 정지 중: 사용자의 드래그/seek 가 cutSec 의 단일 출처이므로 어떤 갱신도 하지 않음.
      *
-     * (이전 구현은 DOM `style.left` 를 직접 갱신해 React render 와 충돌했고, 그 결과
-     *  사용자 드래그가 즉시 덮여 cut 라인이 안 움직이는 것처럼 보였다. 단일 출처(state)로 통일.)
+     * **이전 구현 (setCutSec throttle 25Hz)** 의 문제:
+     *  - 25Hz React 리렌더 → 매번 큰 컴포넌트 reconcile → 50–100ms longtask 다발 → 화면이 그 동안 freeze.
+     *  - App tick rAF 와 별도 rAF 가 비결정 순서로 돌아 한 프레임 lag 발생.
+     *  → 두 문제 모두 “재생 중 setCutSec 미호출 + App tick 콜백 안에서 직접 DOM paint” 로 제거.
      */
     const syncPlayheadLineFromEditSec = useCallback(
       (editT: number) => {
@@ -1472,15 +1561,9 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
 
         if (!isPlayingWaveRef.current) return
         if (typeof editT !== 'number' || !Number.isFinite(editT)) return
-        const er = editRangeRef.current
-        if (!er) return
-        const s = Math.min(er.start, er.end)
-        const e = Math.max(er.start, er.end)
-        if (!(e > s + 1e-9)) return
-        const live = Math.min(e, Math.max(s, editT))
-        setCutSec((prev) => (prev != null && Math.abs(prev - live) < 1e-4 ? prev : live))
+        paintCutLine(editT)
       },
-      []
+      [paintCutLine]
     )
 
     useImperativeHandle(
@@ -1758,37 +1841,56 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                 }
               >
                 {/*
-                  ── 박스 위쪽 라벨 스트립 ──
-                  시작/자르기/끝 시간 라벨이 박스 외부에 떠 있고, 박스 안의 라인과 동일한
-                  좌표계(부모 폭 기준 %) 로 정렬된다. 라벨은 라인 움직임을 그대로 따라가며
-                  너비가 박스에 영향을 주지 않도록 `pointer-events-none` 으로 둔다.
+                  ── 박스 위쪽 라벨 + 자르기 핸들 스트립 ──
+                  자르기(=재생) 라인의 현재 시간 라벨(상단) 과 ▽ 역삼각형 그립(하단) 이 같은 X 위치에서
+                  세로로 쌓인다. 박스 외부라 `overflow-hidden` 제약이 없어 ▽ 크기를 충분히 키울 수 있다.
+                  ▽ 의 hit-zone 이 자르기 드래그 진입점 — 박스 안의 dashed 라인은 시각만(pointer-events-none).
                 */}
-                {activeWordId && (trimHandlePct || cutLinePct) ? (
-                  <div className="pointer-events-none relative mb-1 h-5 w-full">
-                    {trimHandlePct ? (
-                      <>
-                        <span
-                          className="absolute -translate-x-1/2 whitespace-nowrap rounded-md bg-slate-900/95 px-1.5 py-[2px] font-mono text-[10px] leading-tight text-white/95 shadow-sm ring-1 ring-white/15"
-                          style={{ left: `${trimHandlePct.startPct}%`, top: 0 }}
-                        >
-                          {fmtSec(trimHandlePct.startSec)}
-                        </span>
-                        <span
-                          className="absolute -translate-x-1/2 whitespace-nowrap rounded-md bg-slate-900/95 px-1.5 py-[2px] font-mono text-[10px] leading-tight text-white/95 shadow-sm ring-1 ring-white/15"
-                          style={{ left: `${trimHandlePct.endPct}%`, top: 0 }}
-                        >
-                          {fmtSec(trimHandlePct.endSec)}
-                        </span>
-                      </>
-                    ) : null}
-                    {cutLinePct != null ? (
-                      <span
-                        className="absolute -translate-x-1/2 whitespace-nowrap rounded-md bg-sky-500 px-1.5 py-[2px] font-mono text-[10px] font-semibold leading-tight text-white shadow-[0_2px_6px_rgba(2,132,199,0.55)]"
-                        style={{ left: `${cutLinePct.pct}%`, top: 0, ...cutLineMotionStyle }}
-                      >
-                        {fmtSec(cutLinePct.sec)}
-                      </span>
-                    ) : null}
+                {activeWordId && cutLinePct != null ? (
+                  <div className="relative mb-1 h-9 w-full">
+                    <span
+                      ref={cutLineLabelRef}
+                      className="pointer-events-none absolute -translate-x-1/2 whitespace-nowrap rounded-md bg-sky-500 px-1.5 py-[2px] font-mono text-[10px] font-semibold leading-tight text-white shadow-[0_2px_6px_rgba(2,132,199,0.55)]"
+                      style={
+                        isCutLinePlayingMotion
+                          ? { top: 0 }
+                          : { left: `${cutLinePct.pct}%`, top: 0 }
+                      }
+                    >
+                      {fmtSec(cutLinePct.sec)}
+                    </span>
+                    {/**
+                     * ▽ 역삼각형 그립 — 박스 외부에 위치해 크기 자유. CSS border 트릭으로 그림.
+                     *  - 시각 size: 30px(가로) × 22px(세로) — 라인의 “큰 화살촉” 처럼 보임.
+                     *  - hit-zone: 가로 40px × 세로 28px (여백 포함) — 정확히 잡기 쉬움.
+                     *  - apex 가 박스 상단을 향해 박스 아래쪽 시작점에 자연스럽게 이어짐.
+                     */}
+                    <div
+                      ref={cutLineHandleRef}
+                      className="absolute -translate-x-1/2 cursor-ew-resize touch-none"
+                      style={
+                        isCutLinePlayingMotion
+                          ? { bottom: -4, width: 40, height: 28 }
+                          : { left: `${cutLinePct.pct}%`, bottom: -4, width: 40, height: 28 }
+                      }
+                      onPointerDown={onCutLinePointerDown}
+                      role="slider"
+                      aria-label="자르기·재생 시작 라인"
+                    >
+                      <div
+                        className="pointer-events-none absolute left-1/2 bottom-0 -translate-x-1/2 transition-opacity duration-75"
+                        style={{
+                          width: 0,
+                          height: 0,
+                          borderLeft: '15px solid transparent',
+                          borderRight: '15px solid transparent',
+                          borderTop: '22px solid rgb(56 189 248)',
+                          filter: 'drop-shadow(0 2px 3px rgba(2,132,199,0.55))',
+                          opacity: draggingHandle === 'cut' ? 0.45 : 1
+                        }}
+                        aria-hidden
+                      />
+                    </div>
                   </div>
                 ) : null}
 
@@ -1871,15 +1973,20 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                     </div>
                   ) : null}
 
-                  {/* 자르기·재생 라인 — 점선(하늘색) + 그립 노브 (라벨 없음, 외부 스트립에서 표시) */}
+                  {/**
+                   * 자르기·재생 라인 — 박스 안에는 dashed 라인(시각만) 만 그림.
+                   *  드래그 hit-zone 과 ▽ 그립은 박스 외부 상단 라벨 스트립으로 분리됨 (`cutLineHandleRef`).
+                   *  - 그 결과 트림 핸들의 가운데 □ 그립과 같은 X 라도 클릭 충돌 없음.
+                   */}
                   {cutLinePct != null && activeWordId ? (
                     <div className="pointer-events-none absolute inset-0 z-[60]">
                       <div
-                        className="pointer-events-auto absolute inset-y-0 w-8 -translate-x-1/2 cursor-ew-resize touch-none"
-                        style={{ left: `${cutLinePct.pct}%`, ...cutLineMotionStyle }}
-                        onPointerDown={onCutLinePointerDown}
-                        role="slider"
-                        aria-label="자르기·재생 시작 라인"
+                        ref={cutLineSliderRef}
+                        className="pointer-events-none absolute inset-y-0 w-8 -translate-x-1/2"
+                        style={
+                          isCutLinePlayingMotion ? undefined : { left: `${cutLinePct.pct}%` }
+                        }
+                        aria-hidden
                       >
                         <div
                           className="pointer-events-none absolute inset-y-1 left-1/2 -translate-x-1/2 transition-opacity duration-75"
@@ -1889,12 +1996,6 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                             opacity: draggingHandle === 'cut' ? 0.25 : 1
                           }}
                         />
-                        <div
-                          className="pointer-events-none absolute left-1/2 top-1/2 flex h-6 w-3.5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-[3px] border border-sky-700 bg-sky-400 shadow-md transition-opacity duration-75"
-                          style={{ opacity: draggingHandle === 'cut' ? 0.35 : 1 }}
-                        >
-                          <span className="block h-3 w-[1px] bg-white/70" />
-                        </div>
                       </div>
                     </div>
                   ) : null}
@@ -1917,15 +2018,13 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-slate-300/45 bg-white text-slate-800 shadow-md transition hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-35"
                       onClick={togglePlayFromCutLine}
                     >
-                      {isPlaying ? (
-                        <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                          <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
-                        </svg>
-                      ) : (
-                        <svg className="ml-0.5 h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                          <path d="M8 5v14l11-7z" />
-                        </svg>
-                      )}
+                      <img
+                        src={isPlaying ? pauseIconUrl : playIconUrl}
+                        alt=""
+                        aria-hidden
+                        draggable={false}
+                        className="h-5 w-5 select-none"
+                      />
                     </button>
                     <button
                       type="button"
@@ -1943,18 +2042,13 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                         onSplitActiveWordAtEditSec?.(activeLineIndex, centerWordIndex, cutSec)
                       }}
                     >
-                      <svg
-                        className="h-4 w-4"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
+                      <img
+                        src={cutIconUrl}
+                        alt=""
                         aria-hidden
-                      >
-                        <circle cx="6" cy="6" r="3" />
-                        <circle cx="6" cy="18" r="3" />
-                        <path d="M20 4 8.12 15.88M14.47 14.48 20 20M8.12 8.12 12 12" strokeLinecap="round" />
-                      </svg>
+                        draggable={false}
+                        className="h-5 w-5 select-none"
+                      />
                     </button>
                     <button
                       type="button"
@@ -1962,20 +2056,13 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
                       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-slate-300/45 bg-white text-slate-800 shadow-md transition hover:bg-slate-50"
                       onClick={() => onUndo?.()}
                     >
-                      <svg
-                        className="h-4 w-4"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
+                      <img
+                        src={undoIconUrl}
+                        alt=""
                         aria-hidden
-                      >
-                        <path
-                          d="M9 14 4 9l5-5M4 9h11a4 4 0 014 4v1"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        />
-                      </svg>
+                        draggable={false}
+                        className="h-5 w-5 select-none"
+                      />
                     </button>
                   </div>
                 ) : null}

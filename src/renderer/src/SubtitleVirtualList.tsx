@@ -159,6 +159,14 @@ export type SubtitleListRowProps = {
   peaksZoomViewRange?: PeaksZoomViewRange | null
   waveformPeaksJson?: JsonWaveformData | null
   waveformMediaDurationHintSec?: number
+  /**
+   * 현재 마우스 hover 중인 행 index (전역). null = 어느 행도 hover 안 됨.
+   * 각 행은 `globalHoveredRowIndex !== null && globalHoveredRowIndex !== index` 일 때
+   * 자기 행의 캐럿(focused/blinking 포함)을 전부 숨겨, "마우스 따라 단일 캐럿" 정책을 강제한다.
+   */
+  globalHoveredRowIndex: number | null
+  /** 칩/캐럿 onMouseEnter 에서 자기 index 로, 워드행 onMouseLeave 에서 null 로 호출 */
+  setGlobalHoveredRow: (idx: number | null) => void
 }
 
 const shouldDeleteAudioForWords = (words: Array<{ isSilence?: boolean }> | undefined): boolean =>
@@ -205,7 +213,9 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     mediaDurationSec,
     peaksZoomViewRange,
     waveformPeaksJson,
-    waveformMediaDurationHintSec
+    waveformMediaDurationHintSec,
+    globalHoveredRowIndex,
+    setGlobalHoveredRow
   } = props
   const requestFocusCaret = requestFocusWord
   const row = subtitles[index]
@@ -395,6 +405,58 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
   const waveformExpandedThisRow = Boolean(
     waveformEnabled && waveformExpandedLineIndex === index
   )
+
+  /**
+   * 파형 닫힘 후 caret 버튼 DOM focus 복원.
+   *
+   * 파형이 펼쳐진 동안 `{!waveformExpandedThisRow}` 분기로 caret 오버레이가 unmount 되며
+   * 포커스가 unmount 직전 caret 버튼에 있었으면 브라우저 기본 동작으로 `<body>` 로 이탈한다.
+   * 또한 닫힘 트리거인 칩 더블클릭에서 **두 번째 mousedown 은 `preventDefault` 를 안 거치므로**
+   * 브라우저 기본 동작으로 **focus 가 칩 버튼으로 이동**한 상태에서 파형이 닫힌다.
+   *
+   * 두 경우 모두 시각 상태(`caretVisible`/`rowHasFocus`/`focusedCaretIndex`)는 보존되어
+   * 닫힌 직후 caret 깜빡임이 그대로 보이지만 **DOM focus 는 caret 버튼이 아님** — caret 에 묶인
+   * 키 핸들러(`onCaretKeyDown`)가 작동하지 않아 Delete/Backspace/Enter/Space 등이 묻혔다.
+   * (화살표는 `SubtitleVirtualList` 전역 keydown 리스너가 잡아 우회 복원하므로 동작했음)
+   *
+   * true → false 전이 시 시각 caret 이 살아 있다면 같은 행의 caret 버튼으로 focus 를 다시 옮긴다.
+   * 단 다음 경우엔 가로채지 않음:
+   *  - 사용자가 텍스트 입력 중(input/textarea/contenteditable)
+   *  - 이미 같은/다른 caret 버튼에 focus 가 있음
+   *  - 이 행 바깥(다른 행의 article 등) 에 focus 가 있음 — 사용자가 명시적으로 옮긴 것
+   */
+  const prevWaveformExpandedThisRowRef = useRef(waveformExpandedThisRow)
+  useEffect(() => {
+    const prev = prevWaveformExpandedThisRowRef.current
+    prevWaveformExpandedThisRowRef.current = waveformExpandedThisRow
+    if (!prev || waveformExpandedThisRow) return
+    if (!rowHasFocus || focusedCaretIndex == null) return
+    let h2 = 0
+    const h1 = window.requestAnimationFrame(() => {
+      h2 = window.requestAnimationFrame(() => {
+        const article = articleRef.current
+        const active = document.activeElement as HTMLElement | null
+        if (active && active.closest('input,textarea,[contenteditable="true"]')) return
+        if (active && active.id?.startsWith('subtitle-caret-')) return
+        if (
+          active &&
+          active !== document.body &&
+          article &&
+          !article.contains(active)
+        ) {
+          return
+        }
+        const el = document.getElementById(
+          `subtitle-caret-${index}-${focusedCaretIndex}`
+        ) as HTMLButtonElement | null
+        el?.focus({ preventScroll: true })
+      })
+    })
+    return () => {
+      window.cancelAnimationFrame(h1)
+      if (h2) window.cancelAnimationFrame(h2)
+    }
+  }, [waveformExpandedThisRow, rowHasFocus, focusedCaretIndex, index])
   /**
    * 단어 줄을 시간축 비율(%) 레이아웃으로 둘 것인가 — 항상 false.
    * 파형이 열려도 칩은 compact(줄바꿈) 모드를 그대로 유지해, 단어 블록 크기가 파형 패널 폭에
@@ -895,6 +957,12 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
   const isCaretShownAt = (ci: number) => {
     if (!caretVisible) return false
     if (isPlaying && !keyboardPauseCaret) return false
+    /**
+     * **다른 행이 hover 중이면 이 행의 모든 캐럿(깜빡이는 focused 포함)을 숨김**.
+     * 사용자가 다른 단어카드에 마우스를 올리면 캐럿은 마우스를 따라가야 한다는 정책 —
+     * 자기 행이 hover 대상일 때만 자기 hover/focus 캐럿을 표시한다.
+     */
+    if (globalHoveredRowIndex !== null && globalHoveredRowIndex !== index) return false
     // hover 중에는 회색 커서를 우선 표시한다.
     if (hoveredCaretIndex !== null) return hoveredCaretIndex === ci
     if (rowHasFocus && focusedCaretIndex !== null) return focusedCaretIndex === ci
@@ -1574,6 +1642,8 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                 setCaretVisible(false)
                 setCaretBlink(false)
               }
+              /** 마우스가 이 행의 워드행 밖으로 나가면 전역 hover 해제 — 다른 행이 인계받기 전 사이의 공백 OK */
+              setGlobalHoveredRow(null)
             }}
           >
             {/*
@@ -1643,6 +1713,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                         setCaretIndex(storageWi)
                         showStaticCaret()
                         setHoveredCaretIndex(wi)
+                        setGlobalHoveredRow(index)
                       }}
                       onClick={(e: MouseEvent<HTMLButtonElement>) => {
                         if (
@@ -1748,7 +1819,15 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                 const n = wordRail.length
                 const edgeStyle = getWordCaretEdgeStyle(k, n)
                 const ty = measuredCaretTopPx?.[k]
-                const caretCls = `subtitle-word-caret subtitle-word-caret--overlay${playbackHidesCaret ? ' subtitle-word-caret--hidden' : ''}${isCaretShownAt(k) ? ' subtitle-word-caret--visible' : ''}${!playbackHidesCaret && rowHasFocus && focusedCaretIndex === k ? ' subtitle-word-caret--active' : ''}${!playbackHidesCaret && caretBlink && rowHasFocus && focusedCaretIndex === k ? ' subtitle-word-caret--blink' : ''}`
+                /**
+                 * `--visible` / `--active` / `--blink` 셋 다 **반드시 `isCaretShownAt(k)` 통과** 후에만 부여.
+                 *  특히 `--blink` 의 keyframe 은 opacity 를 0.9↔0 으로 애니메이션해
+                 *  `--visible` 없이도 캐럿을 깜빡이며 표시한다 — 다른 행이 hover 일 때
+                 *  이 행이 자기 상태(`caretBlink/rowHasFocus`)만 보고 `--blink` 를 달면
+                 *  "다른 행도 깜빡" 버그가 발생.
+                 */
+                const caretShown = isCaretShownAt(k)
+                const caretCls = `subtitle-word-caret subtitle-word-caret--overlay${playbackHidesCaret ? ' subtitle-word-caret--hidden' : ''}${caretShown ? ' subtitle-word-caret--visible' : ''}${caretShown && !playbackHidesCaret && rowHasFocus && focusedCaretIndex === k ? ' subtitle-word-caret--active' : ''}${caretShown && !playbackHidesCaret && caretBlink && rowHasFocus && focusedCaretIndex === k ? ' subtitle-word-caret--blink' : ''}`
                 return (
                   <button
                     key={`caret-${index}-${k}`}
@@ -1773,6 +1852,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                       setCaretBlink(false)
                       setHoveredCaretIndex(k)
                       setCaretIndex(storageK)
+                      setGlobalHoveredRow(index)
                     }}
                     onKeyDown={(e) => onCaretKeyDown(e, k)}
                     aria-label={`단어 사이 커서 ${k}`}
@@ -1895,6 +1975,12 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
   const [size, setSize] = useState({ w: 0, h: 0 })
   /** 키보드로 다른 카드로 옮길 때만 프리뷰 시크 — 같은 카드 안(캐럿↔textarea)은 시크하지 않음 */
   const lastCardFocusRef = useRef<number | null>(null)
+  /**
+   * 마우스가 hover 중인 행 index — 행별 SubtitleVirtualRow 가 자기 캐럿(focused/blink 포함) 을
+   * 다른 행 hover 시 숨기기 위해 사용. 칩/캐럿 `onMouseEnter` 에서 자기 index 로,
+   * 워드행 `onMouseLeave` 에서 null 로 동기화한다.
+   */
+  const [globalHoveredRowIndex, setGlobalHoveredRowIndex] = useState<number | null>(null)
 
   const registerCardFocus = useCallback((cardIndex: number) => {
     lastCardFocusRef.current = cardIndex
@@ -2105,7 +2191,9 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       mediaDurationSec: props.mediaDurationSec,
       peaksZoomViewRange: props.peaksZoomViewRange,
       waveformPeaksJson: props.waveformPeaksJson,
-      waveformMediaDurationHintSec: props.waveformMediaDurationHintSec
+      waveformMediaDurationHintSec: props.waveformMediaDurationHintSec,
+      globalHoveredRowIndex,
+      setGlobalHoveredRow: setGlobalHoveredRowIndex
     }),
     [
       subtitles,
@@ -2146,7 +2234,8 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       navigateSubtitleField,
       requestFocusCaret,
       requestFocusCard,
-      registerCardFocus
+      registerCardFocus,
+      globalHoveredRowIndex
     ]
   )
 

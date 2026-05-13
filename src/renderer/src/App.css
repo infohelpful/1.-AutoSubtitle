@@ -787,17 +787,47 @@ body {
   min-width: 0;
 }
 
+/**
+ * 자막 가상 목록 — 카드 수가 수백 개를 넘어가는 케이스가 흔하므로
+ *  오른쪽에 슬림한 세로 스크롤바를 노출해 끝까지 빠르게 드래그 이동 가능하게 한다.
+ *  thumb 은 흰색, 다크 배경 위에서 또렷이 보이도록 hover/active 시 더 밝게.
+ */
 .subtitle-virtual-list {
   overflow-x: hidden;
-  /* react-window List 가 세로 스크롤을 쓰지만 스크롤바는 숨김 — 휠·터치로만 이동 */
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.7) rgba(15, 23, 42, 0.25);
 }
 
 .subtitle-virtual-list::-webkit-scrollbar {
-  width: 0;
+  width: 10px;
   height: 0;
-  display: none;
+}
+
+.subtitle-virtual-list::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.25);
+  border-radius: 5px;
+}
+
+.subtitle-virtual-list::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.7);
+  background-clip: content-box;
+  border: 2px solid transparent;
+  border-radius: 5px;
+}
+
+.subtitle-virtual-list::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.9);
+  background-clip: content-box;
+}
+
+.subtitle-virtual-list::-webkit-scrollbar-thumb:active {
+  background-color: #ffffff;
+  background-clip: content-box;
+}
+
+.subtitle-virtual-list::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 .subtitle-virtual-row {
@@ -1318,8 +1348,14 @@ body {
   background: rgba(196, 214, 242, 0.9);
 }
 
-.subtitle-word-caret--visible::before,
-.subtitle-word-caret:focus-visible::before {
+/**
+ * 가시성은 React 의 `isCaretShownAt` 이 SSOT — `--visible` 클래스 하나로 통제.
+ *  `:focus-visible::before` 를 같이 두면 hover 중인 다른 caret 이 있을 때도
+ *  포커스된 caret 이 CSS 단독으로 계속 표시되어 "두 캐럿 동시 출현" 버그가 났음.
+ *  포커스 자체의 가시성은 React 가 `onFocus → syncCaretFromFocus` 로 상태 동기화하므로
+ *  CSS `:focus-visible` 우회 없이도 자연스럽게 보존된다.
+ */
+.subtitle-word-caret--visible::before {
   opacity: 1;
   background: rgba(128, 132, 141, 0.92);
 }

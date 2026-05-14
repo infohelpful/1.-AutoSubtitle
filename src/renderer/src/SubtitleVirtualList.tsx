@@ -1986,32 +1986,6 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     lastCardFocusRef.current = cardIndex
   }, [])
 
-  /** 파동 펼침 줄은 가상 목록 밖으로 나가면 마운트가 사라져 포털이 보이지 않음 → 즉시 스크롤 + 짧은 재시도 */
-  useEffect(() => {
-    const idx = props.waveformExpandedLineIndex
-    if (idx === null || idx === undefined || idx < 0) return
-    const scroll = () => {
-      try {
-        listRef.current?.scrollToRow({
-          index: idx,
-          align: 'center',
-          behavior: 'instant'
-        })
-      } catch {
-        /* ignore */
-      }
-    }
-    scroll()
-    const t1 = window.setTimeout(scroll, 40)
-    const t2 = window.setTimeout(scroll, 120)
-    const t3 = window.setTimeout(scroll, 220)
-    return () => {
-      window.clearTimeout(t1)
-      window.clearTimeout(t2)
-      window.clearTimeout(t3)
-    }
-  }, [props.waveformExpandedLineIndex, size.h, size.w])
-
   const requestFocusRow = useCallback((index: number, caret: number | 'end') => {
     if (index < 0) return
     const row = subtitles[index]
@@ -2020,17 +1994,6 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.onCardNavigate(row.start)
     }
     lastCardFocusRef.current = index
-    if (crossedIntoOtherCard) {
-      try {
-        listRef.current?.scrollToRow({
-          index,
-          align: 'center',
-          behavior: 'instant'
-        })
-      } catch {
-        return
-      }
-    }
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         const ta = document.getElementById(`subtitle-v-${index}`) as HTMLTextAreaElement | null
@@ -2069,17 +2032,6 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.onCardNavigate(row.start)
     }
     lastCardFocusRef.current = cardIndex
-    if (crossedIntoOtherCard) {
-      try {
-        listRef.current?.scrollToRow({
-          index: cardIndex,
-          align: 'center',
-          behavior: 'instant'
-        })
-      } catch {
-        return
-      }
-    }
     const targetWords = row?.words ?? []
     const safe = nearestValidStorageCaret(targetWords, storageCaret)
     const rc = storageCaretToRenderableCaret(targetWords, safe)
@@ -2099,15 +2051,6 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.onCardNavigate(row.start)
     }
     lastCardFocusRef.current = cardIndex
-    try {
-      listRef.current?.scrollToRow({
-        index: cardIndex,
-        align: 'center',
-        behavior: 'smooth'
-      })
-    } catch {
-      return
-    }
     window.requestAnimationFrame(() => {
       const el = document.getElementById(`subtitle-card-${cardIndex}`) as HTMLElement | null
       el?.focus()

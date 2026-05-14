@@ -1,4 +1,4 @@
-import { SILENCE_PLACEHOLDER_TEXT } from './wordContract'
+import { shouldOmitFromSubtitleEditLineText, SILENCE_PLACEHOLDER_TEXT } from './wordContract'
 
 /** Python 사이드카(Faster-Whisper) 및 UI 공통 자막 줄 형식 */
 export type SubtitleWord = {
@@ -78,6 +78,7 @@ export function displayTextFromSubtitleWords(
 ): string {
   if (!words || words.length === 0) return ''
   return visibleSubtitleWords(words)
+    .filter((w) => !shouldOmitFromSubtitleEditLineText(w.word))
     .map((w) => w.word)
     .join(' ')
     .trim()
@@ -150,7 +151,8 @@ export function parseSubtitleLines(raw: unknown): SubtitleLine[] {
       words.push(entry)
     }
     if (!Number.isFinite(start) || !Number.isFinite(end)) continue
-    out.push({ start, end, text, words })
+    const lineText = words.length > 0 ? displayTextFromSubtitleWords(words) : text.trim()
+    out.push({ start, end, text: lineText, words })
   }
   return out
 }

@@ -8,6 +8,7 @@ import { wordsFromPeaksSegments } from './wordMerge'
 import type { SubtitleRow, Word } from './types'
 import { createSilentWavBlob } from './silentWav'
 import { safeFitPeaksContainerView } from '../../peaksSafeFit'
+import { lineEditDisplayFromVrewWordParts } from '../../../shared/wordContract'
 import { wfLog } from './waveformDebugLog'
 
 function toSegmentOptions(w: Word): SegmentOptions {
@@ -44,7 +45,7 @@ function applyWordsToPeaks(peaks: PeaksInstance, list: Word[]): void {
 
 function lineDisplay(row: SubtitleRow): string {
   if (typeof row.lineText === 'string') return row.lineText
-  return row.words.map((w) => w.text).join(' ')
+  return lineEditDisplayFromVrewWordParts(row.words)
 }
 
 /** 줄 편집 시 매 글자마다 onRowsChange → Peaks·부모 전체 리렌더 방지 — blur 시에만 반영 */

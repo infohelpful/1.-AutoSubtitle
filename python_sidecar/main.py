@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from processor import _subprocess_creationflags, _which_ffmpeg, export_video_png_overlay
+from rms_vad_word_align import apply_rms_vad_word_align
 
 # ---------------------------------------------------------------------------
 # Paths & model configuration
@@ -745,6 +746,15 @@ def handle(method: str, params: dict[str, Any]) -> Any:
             else:
                 pct = min(99.0, float(i + 1) * 3.0)
             _emit_transcribe_progress(pct)
+        if bool(params.get("rms_vad_align", True)):
+            try:
+                env_ff = os.environ.get("AUTOSUBTITLE_FFMPEG_PATH", "").strip()
+                ff_try = env_ff if (env_ff and os.path.isfile(env_ff)) else None
+                subtitles = apply_rms_vad_word_align(
+                    subtitles, audio_path, ff_try, total_duration=total_dur
+                )
+            except Exception:
+                pass
         subtitles = _fill_unvoiced_gaps(subtitles, total_dur)
         _emit_transcribe_progress(100.0)
         elapsed_ms = int((time.perf_counter() - t0) * 1000)

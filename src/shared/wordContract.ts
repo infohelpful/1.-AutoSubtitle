@@ -33,6 +33,35 @@ export const DEFAULT_GAP_THRESHOLD_SEC = 0.2
 /** 무음 더미에 표시할 문자열 */
 export const SILENCE_PLACEHOLDER_TEXT = '--'
 
+/** 피크 분할 등으로 쪼개진 말 조각 — 자막 줄 편집/미리보기 텍스트에는 포함하지 않음 */
+export const CONTINUATION_ELLIPSIS_TOKEN = '\u2026'
+
+/**
+ * 자막 카드·줄 편집 textarea 등 **사람이 고치는 한 줄 문자열**에서 빼는 토큰.
+ * (단어 배열·파형 칩에는 그대로 두고, `line.text` / `lineText` 만 정리)
+ */
+export function shouldOmitFromSubtitleEditLineText(word: string): boolean {
+  const t = String(word ?? '').trim()
+  if (t.length === 0) return true
+  if (t === SILENCE_PLACEHOLDER_TEXT) return true
+  if (t === '??') return true
+  if (t === '-') return true
+  if (t === CONTINUATION_ELLIPSIS_TOKEN) return true
+  if (/^\.{2,}$/.test(t)) return true
+  return false
+}
+
+/** Peaks/Vrew `Word[]` → 줄 편집용 한 줄 문자열 */
+export function lineEditDisplayFromVrewWordParts(
+  words: readonly { text: string; isSilence?: boolean }[]
+): string {
+  return words
+    .filter((w) => !w.isSilence && !shouldOmitFromSubtitleEditLineText(w.text))
+    .map((w) => w.text)
+    .join(' ')
+    .trim()
+}
+
 export type FillGapsOptions = {
   /** 기본 `DEFAULT_GAP_THRESHOLD_SEC` */
   gapThresholdSec?: number

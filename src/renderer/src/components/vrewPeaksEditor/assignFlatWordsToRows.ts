@@ -1,3 +1,4 @@
+import { lineEditDisplayFromVrewWordParts } from '../../../shared/wordContract'
 import type { SubtitleRow, Word } from './types'
 
 /**
@@ -42,7 +43,7 @@ export function assignFlatWordsToRows(flat: Word[], prevRows: SubtitleRow[]): Su
     return {
       ...row,
       words,
-      lineText: words.map((w) => w.text).join(' ')
+      lineText: lineEditDisplayFromVrewWordParts(words)
     }
   })
 }

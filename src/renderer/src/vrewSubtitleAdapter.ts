@@ -1,4 +1,4 @@
-import { visibleSubtitleWords, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
+import { displayTextFromSubtitleWords, visibleSubtitleWords, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
 import {
   DEFAULT_GAP_THRESHOLD_SEC,
   fillGapsInSubtitleWords,
@@ -303,7 +303,7 @@ export function vrewRowsToSubtitleLines(
       if (w.isSilence) sw.isSilence = true
       return sw
     })
-    const text = row.lineText ?? words.map((x) => x.word).join(' ')
+    const text = row.lineText ?? displayTextFromSubtitleWords(words)
     return { start, end, text, words }
   })
 }

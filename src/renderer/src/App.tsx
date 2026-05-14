@@ -15,7 +15,7 @@ import {
 import type { JsonWaveformData } from 'peaks.js'
 
 import type { CutRange, DepsStatus, ExportFormat, GpuRuntimeStatus, TranscribeMode } from '../../shared/ipc'
-import { parseSubtitleLines, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
+import { displayTextFromSubtitleWords, parseSubtitleLines, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
 import {
   AUTOSUB_FILE_FORMAT,
   AUTOSUB_VERSION,
@@ -27,6 +27,7 @@ import {
   sentenceTokenTimelineToSubtitleLines,
   subtitleLinesToSentenceTokenTimeline
 } from '../../shared/sentenceTokenTimelineAdapter'
+import { splitLeadingSilenceInSubtitleLines } from './utils/leadingSilenceSplitAfterExtract'
 import {
   buildActiveBlocksSnapshotFromSubtitles,
   deriveVisibleSubtitleLinesForUi,
@@ -296,16 +297,7 @@ function clampSubtitleBgPaddingPct(p: number): number {
 
 function textFromWords(words: NonNullable<SubtitleLine['words']> | undefined, fallback: string): string {
   if (!words || words.length === 0) return fallback
-  const validWords = words.filter(
-    (w) =>
-      !w.isDeleted &&
-      !w.isSilence &&
-      w.word !== '??' &&
-      w.word !== '-' &&
-      w.word.trim() !== SILENCE_PLACEHOLDER_TEXT
-  )
-  if (validWords.length === 0) return ''
-  return validWords.map((w) => w.word).join(' ').trim()
+  return displayTextFromSubtitleWords(words)
 }
 
 type SilenceWorkerRequest = {
@@ -3466,7 +3458,11 @@ export default function App(): ReactElement {
   const postSplitWaveformFocusRef = useRef<{ lineIndex: number; wordIndexInVrew: number } | null>(null)
   const [postSplitWaveformFocusCommit, setPostSplitWaveformFocusCommit] = useState(0)
 
+  /** 추출 후: Python RMS + `splitLeadingSilenceInSubtitleLines`만. 파형 기반 전역 단어 재스냅은 끔 */
+  const AUTO_WORD_REALIGN_BY_WAVEFORM_ENABLED = false
+
   useEffect(() => {
+    if (!AUTO_WORD_REALIGN_BY_WAVEFORM_ENABLED) return
     if (!videoPath || subtitles.length === 0) return
     if (mergedCutRanges.length > 0) return
     /** tombstone/가상 삭제만 스티치된 파형은 미디어 축 단어와 길이 불일치 — 리얼라인 금지 */
@@ -3681,11 +3677,7 @@ export default function App(): ReactElement {
           ...line,
           words: nextWords,
           /** 글자 분할로 라인 text 도 재계산 — sentenceTokenTimeline 동기화 시 일관성 유지. */
-          text: nextWords
-            .filter((x) => x.isDeleted !== true)
-            .map((x) => x.word)
-            .join(' ')
-            .trim()
+          text: displayTextFromSubtitleWords(nextWords),
         }
         return [...prev.slice(0, lineIndex), updated, ...prev.slice(lineIndex + 1)]
       })
@@ -3994,8 +3986,8 @@ export default function App(): ReactElement {
       const words = cur.words ?? []
       const leftWords = words.filter((w) => w.end <= splitTime)
       const rightWords = words.filter((w) => w.start >= splitTime)
-      const leftText = leftWords.length > 0 ? leftWords.map((w) => w.word).join(' ') : cur.text
-      const rightText = rightWords.length > 0 ? rightWords.map((w) => w.word).join(' ') : ''
+      const leftText = leftWords.length > 0 ? displayTextFromSubtitleWords(leftWords) : cur.text
+      const rightText = rightWords.length > 0 ? displayTextFromSubtitleWords(rightWords) : ''
 
       const first: SubtitleLine = { ...cur, end: splitTime, text: leftText, words: leftWords }
       const second: SubtitleLine = { ...cur, start: splitTime, end: cur.end, text: rightText, words: rightWords }
@@ -5751,41 +5743,60 @@ export default function App(): ReactElement {
         })
         return
       }
-      const t0 = performance.now()
-      wfLog('perf', '단어 추출 완료 — setSentenceTokenTimeline 시작', {
-        lineCount: lines.length,
-        wordCount,
-        droppedInvalidWords: droppedWords,
-        ts: new Date().toISOString()
-      })
-      /**
-       * 1,473 word × 303 line 의 첫 commit 은 main thread longtask 를 유발.
-       * `startTransition` + `useDeferredValue`(리스트 prop) 와 함께, 오버레이는
-       * `extractAwaitListPaint` + effect 가 deferred 가 따라잡힌 뒤에만 닫는다 (100% 직후 곧바로 정렬된 화면).
-       */
-      setProgress(100)
-      setExtractAwaitListPaint(true)
-      startTransition(() => {
-        setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(lines))
-      })
-      wfLog('perf', '단어 추출 완료 — setSentenceTokenTimeline 호출 끝', {
-        callMs: Math.round(performance.now() - t0),
-        lineCount: lines.length,
-        wordCount
-      })
-      setSilenceSplitPending(true)
-      silenceSplitRunKeyRef.current = null
-      const wp = (raw as { waveform_peaks?: { ok?: boolean; path?: string | null } }).waveform_peaks
-      if (wp?.ok && wp.path) {
-        setWaveformPeaksJsonPath(wp.path)
-        void window.api.readLocalPeaksJsonFile(wp.path).then((jr) => {
-          if (jr.ok) setWaveformPeaksJsonData(jr.json as JsonWaveformData)
-          else setWaveformPeaksJsonData(null)
+
+      void (async () => {
+        const mediaDur = Number((raw as { duration?: unknown }).duration)
+        let finalLines = lines
+        const wp = (raw as { waveform_peaks?: { ok?: boolean; path?: string | null } }).waveform_peaks
+
+        try {
+          if (wp?.ok && wp.path) {
+            setWaveformPeaksJsonPath(wp.path)
+            const jr = await window.api.readLocalPeaksJsonFile(wp.path)
+            if (jr.ok && jr.json) {
+              const j = jr.json as JsonWaveformData
+              setWaveformPeaksJsonData(j)
+              if (Number.isFinite(mediaDur) && mediaDur > 0) {
+                finalLines = splitLeadingSilenceInSubtitleLines(lines, j, mediaDur)
+              }
+            } else {
+              setWaveformPeaksJsonData(null)
+            }
+          }
+        } catch (e) {
+          wfLog('perf', '단어 추출 후 선행 무음 분할/피크 로드 실패', {
+            message: e instanceof Error ? e.message : String(e),
+            ts: new Date().toISOString()
+          })
+        }
+
+        const t0 = performance.now()
+        const finalWordCount = finalLines.reduce((acc, l) => acc + (l.words?.length ?? 0), 0)
+        wfLog('perf', '단어 추출 완료 — setSentenceTokenTimeline 시작', {
+          lineCount: finalLines.length,
+          wordCount: finalWordCount,
+          droppedInvalidWords: droppedWords,
+          ts: new Date().toISOString()
         })
-      }
-      setGapFillWhenBuildingVrew(false)
-      undoStackRef.current = []
-      redoStackRef.current = []
+        /**
+         * 1,473 word × 303 line 의 첫 commit 은 main thread longtask 를 유발.
+         * `startTransition` + `useDeferredValue`(리스트 prop) 와 함께, 오버레이는
+         * `extractAwaitListPaint` + effect 가 deferred 가 따라잡힌 뒤에만 닫는다 (100% 직후 곧바로 정렬된 화면).
+         */
+        setProgress(100)
+        setExtractAwaitListPaint(true)
+        startTransition(() => {
+          setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(finalLines))
+        })
+        wfLog('perf', '단어 추출 완료 — setSentenceTokenTimeline 호출 끝', {
+          callMs: Math.round(performance.now() - t0),
+          lineCount: finalLines.length,
+          wordCount: finalWordCount
+        })
+        setGapFillWhenBuildingVrew(false)
+        undoStackRef.current = []
+        redoStackRef.current = []
+      })()
     })
     const offE = window.api.onTranscribeError(() => {
       setExtractAwaitListPaint(false)
@@ -6135,8 +6146,6 @@ export default function App(): ReactElement {
     }
     setVirtualTimelineDeleted(tombstones)
     setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(d.subtitles))
-    setSilenceSplitPending(true)
-    silenceSplitRunKeyRef.current = null
     setGapFillWhenBuildingVrew(false)
     undoStackRef.current = []
     redoStackRef.current = []

@@ -305,7 +305,7 @@ export function visibleSubtitleLinesFromBlocks(
     const subtitleWords = words.map(toSubtitleWord)
     const start = Math.min(...subtitleWords.map((s) => s.start))
     const end = Math.max(...subtitleWords.map((s) => s.end))
-    const text = words.map((w) => w.text).join(' ').trim()
+    const text = displayTextFromSubtitleWords(subtitleWords)
     lines.push({ start, end, text, words: subtitleWords })
   }
 
@@ -314,7 +314,7 @@ export function visibleSubtitleLinesFromBlocks(
     const subtitleWords = sorted.map(toSubtitleWord)
     const start = Math.min(...subtitleWords.map((s) => s.start))
     const end = Math.max(...subtitleWords.map((s) => s.end))
-    const text = sorted.map((w) => w.text).join(' ').trim()
+    const text = displayTextFromSubtitleWords(subtitleWords)
     lines.push({ start, end, text, words: subtitleWords })
   }
 

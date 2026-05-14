@@ -1,4 +1,5 @@
 import type { Segment } from 'peaks.js'
+import { lineEditDisplayFromVrewWordParts } from '../../../shared/wordContract'
 import type { SubtitleRow, Word } from './types'
 
 function randomBlockSuffix(): string {
@@ -40,7 +41,7 @@ export function applyAdjacentWordMergesToRows(rows: SubtitleRow[]): SubtitleRow[
     return {
       ...row,
       words,
-      lineText: words.map((w) => w.text).join(' ')
+      lineText: lineEditDisplayFromVrewWordParts(words)
     }
   })
 }

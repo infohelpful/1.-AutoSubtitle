@@ -16,7 +16,7 @@ import { List, useDynamicRowHeight, useListRef } from 'react-window'
 import type { RowComponentProps } from 'react-window'
 import type { MouseEvent } from 'react'
 
-import type { SubtitleLine } from '../../shared/subtitles'
+import { subtitleLineEditDisplayText, type SubtitleLine } from '../../shared/subtitles'
 import {
   DISPLAY_CROSS_CARD_GAP_ABSORB_MS,
   DISPLAY_GAP_ABSORB_MS,
@@ -31,8 +31,9 @@ import {
   visibleWordStorageIndices
 } from '../../shared/subtitleWordCaretMap'
 import type { SubtitleRow } from './components/vrewPeaksEditor/types'
-import type { PeaksZoomViewRange } from './SubtitleWaveformPeaks'
 import { computeLineZoomWindowFromCardBounds, type LineZoomWindowResult } from './lineZoomWindow'
+import type { PeaksZoomViewRange } from './SubtitleWaveformPeaks'
+import { scrubTimelineNoiseFromWordPiece } from '../../shared/wordContract'
 import { useSubtitleData } from './subtitleDataContext'
 import { peaksJsonRawDataLength } from './wordCanvas/peaksSentenceSlice'
 import { SentenceLineWaveformCanvas } from './waveform/SentenceLineWaveformCanvas'
@@ -251,15 +252,16 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
   /** 부모 subtitles 갱신 없이 타이핑 — blur 시에만 commit (전체 vrewRows·리스트 재계산 방지) */
   const subtitleTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const [subtitleTextDraft, setSubtitleTextDraft] = useState<string | null>(null)
-  const subtitleTextDisplay = subtitleTextDraft ?? row.text
+  const lineEditDisplay = useMemo(() => subtitleLineEditDisplayText(row), [row.text, row.words])
+  const subtitleTextDisplay = subtitleTextDraft ?? lineEditDisplay
 
   useEffect(() => {
     if (subtitleTextareaRef.current === document.activeElement) {
-      setSubtitleTextDraft(row.text)
+      setSubtitleTextDraft(lineEditDisplay)
       return
     }
     setSubtitleTextDraft(null)
-  }, [row.text, row.start, row.end, index])
+  }, [lineEditDisplay, row.start, row.end, index])
 
   /**
    * 렌더링 단위 레일 — **tombstone(`isDeleted`) 제외**, 각 칩은 원본 `row.words` 의 `storageIndex` 보존.
@@ -282,7 +284,9 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       out.push({
         start: w.start,
         end: w.end,
-        label: w.isSilence ? (String(w.word).trim() || '??') : w.word,
+        label: w.isSilence
+          ? (String(w.word).trim() || '??')
+          : scrubTimelineNoiseFromWordPiece(w.word) || w.word,
         isSilence: w.isSilence,
         storageIndex: i
       })
@@ -1069,7 +1073,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       return
     }
 
-    if (e.key === 'Backspace' && row.text.length === 0 && index > 0) {
+    if (e.key === 'Backspace' && lineEditDisplay.length === 0 && index > 0) {
       e.preventDefault()
       mergeEmptySubtitleAt(index)
       window.setTimeout(() => requestFocusRow(index - 1, 'end'), 0)
@@ -1894,13 +1898,13 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
             setSubtitleTextDraft(e.target.value)
           }}
           onFocus={() => {
-            setSubtitleTextDraft(row.text)
+            setSubtitleTextDraft(lineEditDisplay)
             setCaretVisible(false)
             setCaretBlink(false)
           }}
           onBlur={() => {
             const el = subtitleTextareaRef.current
-            const cur = subtitleTextDraft !== null ? subtitleTextDraft : el?.value ?? row.text
+            const cur = subtitleTextDraft !== null ? subtitleTextDraft : el?.value ?? lineEditDisplay
             if (cur !== row.text) {
               updateSubtitleAt(index, cur)
             }

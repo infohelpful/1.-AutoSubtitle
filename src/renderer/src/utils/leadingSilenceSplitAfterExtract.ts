@@ -1,13 +1,20 @@
 /**
  * 자막 추출 직후: Whisper 단어 [start,end] 안에서 피크 기준 무음 구간을
  * `--`(isSilence) 블록으로 분리한다. 선행·중간 무음 모두 동일 게이트·최소 길이로 탐지한다.
+ * **바로 앞이 무음 블록(`isSilence`)인 비무음 단어**는 잔향·바닥잡음을 더 무음으로 보도록 게이트를 낮추고,
+ * 짧은 선행 무음(`MIN_LEAD_AFTER_SILENCE_SEC`)도 `--` 로 분리해 gap-fill `--` 뒤 단어 안의 무음이 누락되지 않게 한다.
  * 1차로 생긴 `…` 조각도 **다음 패스에서 다시 스캔**한다(최대 12패스/줄). `…`는 픽셀 게이트를
  * `continuationSplitGateRaiseDb`만큼 올리고, 각 **말 런**은 `voiceOnsetDbfs`+연속 픽셀로 선행을 `--`로 잘라
  * 실제로 들리는 구간에만 단어가 붙도록 한다.
  * 파형 툴팁과 동일한 dBFS 스케일(±127 → 20·log10).
  */
 import type { JsonWaveformData } from '../../../shared/waveformJson'
-import { displayTextFromSubtitleWords, type SubtitleLine, type SubtitleWord } from '../../../shared/subtitles'
+import {
+  displayTextFromSubtitleWords,
+  mergeConsecutiveSilenceWordsInLine,
+  type SubtitleLine,
+  type SubtitleWord
+} from '../../../shared/subtitles'
 import { DEFAULT_GAP_THRESHOLD_SEC, SILENCE_PLACEHOLDER_TEXT } from '../../../shared/wordContract'
 import { wfLog } from '../components/vrewPeaksEditor/waveformDebugLog'
 import { resolvePeaksTimelineMetrics, mediaSecondsToPeakPixelRange } from '../waveform/peakPixelMapping'
@@ -32,6 +39,10 @@ const VOICE_ONSET_MIN_CONSECUTIVE_PIXELS_DEFAULT = 2
 /** voice onset 분할 후 남는 말 조각이 이보다 짧으면 분할 안 함(꼬리만 원문·앞은 `--`로 무음에 붙는 현상 방지) */
 const VOICE_ONSET_MIN_TAIL_SEC = 0.1
 const VOICE_ONSET_MIN_TAIL_FRAC_OF_RUN = 0.28
+/** 바로 앞 단어가 `--` 무음일 때: 무음 픽셀을 더 잘 잡도록 게이트를 이 dB만큼 낮춘다. */
+const DBFS_GATE_TIGHTEN_AFTER_SILENCE_DB = 14
+/** 무음 블록 직후 비무음 단어: 이보다 짧은 선행 무음도 `--` 로 분리(초). 기본 gap(0.2)보다 작게. */
+export const MIN_LEAD_AFTER_SILENCE_SEC = 0.05
 
 function peakDbfsAtColumn(data: readonly number[], col: number): number {
   const i = col * 2
@@ -184,7 +195,8 @@ function expandWordsOnePeakSilencePass(
   voiceOnsetMinConsecutivePixels: number
 ): SubtitleWord[] {
   const next: SubtitleWord[] = []
-  for (const w of words) {
+  for (let wi = 0; wi < words.length; wi += 1) {
+    const w = words[wi]!
     if (w.isDeleted === true) {
       next.push({ ...w })
       continue
@@ -194,17 +206,23 @@ function expandWordsOnePeakSilencePass(
       continue
     }
 
+    const prev = wi > 0 ? words[wi - 1] : undefined
+    const afterSilenceBlock = prev != null && prev.isDeleted !== true && prev.isSilence === true
+    const effGate = afterSilenceBlock ? dbfsGate - DBFS_GATE_TIGHTEN_AFTER_SILENCE_DB : dbfsGate
+    const effMinLead = afterSilenceBlock ? Math.min(minLead, MIN_LEAD_AFTER_SILENCE_SEC) : minLead
+
     const pieces = splitSingleWordByPeakSilenceRuns(
       w,
       data,
       pixelCount,
       durationSec,
-      dbfsGate,
-      minLead,
+      effGate,
+      effMinLead,
       wordAnchorDbfs,
       continuationGateRaiseDb,
       voiceOnsetDbfs,
-      voiceOnsetMinConsecutivePixels
+      voiceOnsetMinConsecutivePixels,
+      afterSilenceBlock
     )
     if (pieces == null) {
       const ws = Math.min(w.start, w.end)
@@ -235,7 +253,9 @@ function splitSingleWordByPeakSilenceRuns(
   wordAnchorDbfs: number,
   continuationGateRaiseDb: number,
   voiceOnsetDbfs: number,
-  voiceOnsetMinConsecutivePixels: number
+  voiceOnsetMinConsecutivePixels: number,
+  /** 직전 토큰이 무음이면 목소리 시작 판정을 조금 느슨히(잔향·저에너지 선행) */
+  relaxVoiceOnsetAfterSilence: boolean
 ): SubtitleWord[] | null {
   const ws = Math.min(w.start, w.end)
   const we = Math.max(w.start, w.end)
@@ -328,7 +348,8 @@ function splitSingleWordByPeakSilenceRuns(
       const tailDur = segEnd - voiceOnset
       const headDb = maxDbfsInTimeRange(data, pixelCount, durationSec, segStart, voiceOnset)
       const tailDb = maxDbfsInTimeRange(data, pixelCount, durationSec, voiceOnset, segEnd)
-      if (tailDur >= minTailAfterOnset - EPS && tailDb >= headDb - 1.5) {
+      const headTailSlackDb = relaxVoiceOnsetAfterSilence ? 6 : 1.5
+      if (tailDur >= minTailAfterOnset - EPS && tailDb >= headDb - headTailSlackDb) {
         onsetSplitAt = voiceOnset
       }
     }
@@ -486,14 +507,24 @@ export function splitLeadingSilenceInSubtitleLines(
     }
   })
 
+  const inputWordCount = lines.reduce((a, l) => a + (l.words?.length ?? 0), 0)
+  const outputWordCount = outLines.reduce((a, l) => a + (l.words?.length ?? 0), 0)
+  let linesMutated = 0
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] !== outLines[i]) linesMutated += 1
+  }
+
   wfLog('perf', '피크 무음 분할(다패스) 요약', {
     lineCount: lines.length,
+    linesMutated,
+    inputWordCount,
+    outputWordCount,
     maxExpandRounds,
     continuationGateRaiseDb,
     voiceOnsetDbfs,
     voiceOnsetMinConsecutivePixels,
-    note: '말 런 선행은 voiceOnsetDbfs+연속픽셀으로 -- 재절단'
+    note: '말 런 선행은 voiceOnsetDbfs+연속픽셀; 무음 직후 단어는 게이트 강화·minLead 0.05·연속 -- 는 줄 단위 병합'
   })
 
-  return outLines
+  return outLines.map((l) => mergeConsecutiveSilenceWordsInLine(l))
 }

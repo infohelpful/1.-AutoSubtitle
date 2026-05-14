@@ -14,8 +14,13 @@
  *  두 캐시를 round-trip 마다 cross-set 하므로 `adapterA(adapterB(x))` 의 부분 reference 가 유지된다.
  *  WeakMap 이므로 메모리 누수 없음.
  */
-import type { SubtitleLine, SubtitleWord } from './subtitles'
-import { displayTextFromSubtitleWords, visibleSubtitleWords } from './subtitles'
+import {
+  displayTextFromSubtitleWords,
+  normalizeSilenceWordsForLineWords,
+  visibleSubtitleWords,
+  type SubtitleLine,
+  type SubtitleWord
+} from './subtitles'
 import type { SentenceTokenTimeline, TimelineSentence, TimelineToken } from './sentenceTokenTimeline'
 
 function sentenceIdForLineIndex(li: number): string {
@@ -68,7 +73,7 @@ function buildLineFromSentence(sentence: TimelineSentence): SubtitleLine | null 
   const raw = sentence.tokens
   if (raw.length === 0) return null
 
-  const words: SubtitleWord[] = raw.map((t) => {
+  const wordsRaw: SubtitleWord[] = raw.map((t) => {
     const w: SubtitleWord = {
       start: t.start_original,
       end: t.end_original,
@@ -79,6 +84,8 @@ function buildLineFromSentence(sentence: TimelineSentence): SubtitleLine | null 
     if (t.splitChain) w.splitChain = t.splitChain
     return w
   })
+  /** 인접 `--` 및 `…`/`--` 쇼트 런 정리 — 파형·SSOT 가 무음 구간을 한 칩으로 덮음 */
+  const words = normalizeSilenceWordsForLineWords(wordsRaw)
 
   const vis = visibleSubtitleWords(words)
   const start =

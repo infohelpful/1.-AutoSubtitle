@@ -187,4 +187,41 @@ describe('splitLeadingSilenceInSubtitleLines', () => {
     const sp = words.find((w) => w.isSilence !== true)
     expect(sp!.start).toBeGreaterThan(0.05)
   })
+
+  /** gap-fill `--` 직후 단어: 선행 무음을 `--` 로 분리한 뒤 줄 끝에서 연속 `--` 는 하나로 병합(구간 합집합) */
+  it('splits leading silence inside word after an explicit silence block', () => {
+    const pixelCount = 30
+    const silent = [0, 0] as const
+    const loud = [80, 80] as const
+    const data: number[] = []
+    for (let i = 0; i < 5; i += 1) data.push(...silent)
+    for (let i = 0; i < 8; i += 1) data.push(...silent)
+    for (let i = 0; i < 17; i += 1) data.push(...loud)
+    const wf: JsonWaveformData = {
+      sample_rate: 48000,
+      samples_per_pixel: 1000,
+      data
+    }
+    const dur = (pixelCount * 1000) / 48000
+    const t5 = (5 / pixelCount) * dur
+    const lines: SubtitleLine[] = [
+      {
+        start: 0,
+        end: dur,
+        text: '-- Hi',
+        words: [
+          { start: 0, end: t5, word: '--', isSilence: true },
+          { start: t5, end: dur, word: 'Hi' }
+        ]
+      }
+    ]
+    const out = splitLeadingSilenceInSubtitleLines(lines, wf, dur)
+    const words = out[0]!.words!
+    const silBlocks = words.filter((w) => w.isSilence === true)
+    expect(silBlocks.length).toBeGreaterThanOrEqual(1)
+    expect(silBlocks[0]!.end).toBeGreaterThan(t5 + 1e-4)
+    const hi = words.find((w) => w.isSilence !== true && w.word === 'Hi')
+    expect(hi).toBeDefined()
+    expect(hi!.start).toBeGreaterThan(t5 + 1e-4)
+  })
 })

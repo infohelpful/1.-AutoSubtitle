@@ -15,7 +15,13 @@ import {
 import type { JsonWaveformData } from 'peaks.js'
 
 import type { CutRange, DepsStatus, ExportFormat, GpuRuntimeStatus, TranscribeMode } from '../../shared/ipc'
-import { displayTextFromSubtitleWords, parseSubtitleLines, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
+import {
+  displayTextFromSubtitleWords,
+  insertMissingTemporalSilenceGapsInLine,
+  parseSubtitleLines,
+  type SubtitleLine,
+  type SubtitleWord
+} from '../../shared/subtitles'
 import {
   AUTOSUB_FILE_FORMAT,
   AUTOSUB_VERSION,
@@ -5757,7 +5763,17 @@ export default function App(): ReactElement {
               const j = jr.json as JsonWaveformData
               setWaveformPeaksJsonData(j)
               if (Number.isFinite(mediaDur) && mediaDur > 0) {
-                finalLines = splitLeadingSilenceInSubtitleLines(lines, j, mediaDur)
+                const peakLines = splitLeadingSilenceInSubtitleLines(lines, j, mediaDur)
+                const wcPeak = peakLines.reduce((a, l) => a + (l.words?.length ?? 0), 0)
+                finalLines = peakLines.map((l) => insertMissingTemporalSilenceGapsInLine(l))
+                const wcGap = finalLines.reduce((a, l) => a + (l.words?.length ?? 0), 0)
+                if (wcGap !== wcPeak) {
+                  wfLog('perf', '추출 후 타임스탬프 구간 무음 삽입', {
+                    wordCountAfterPeakSplit: wcPeak,
+                    wordCountAfterGapFill: wcGap,
+                    insertedWords: wcGap - wcPeak
+                  })
+                }
               }
             } else {
               setWaveformPeaksJsonData(null)

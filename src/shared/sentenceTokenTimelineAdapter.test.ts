@@ -52,9 +52,13 @@ describe('sentenceTokenTimelineAdapter', () => {
 
   it('maps wordless line to single token and back', () => {
     const lines = [{ start: 0, end: 1, text: 'hello', words: undefined }]
-    const back = sentenceTokenTimelineToSubtitleLines(subtitleLinesToSentenceTokenTimeline(lines))
-    expect(back[0]!.words?.length).toBe(1)
-    expect(back[0]!.words?.[0]!.word).toContain('hello')
+    const tl = subtitleLinesToSentenceTokenTimeline(lines)
+    expect(tl[0]!.tokens.length).toBe(1)
+    expect(tl[0]!.tokens[0]!.text).toContain('hello')
+    const back = sentenceTokenTimelineToSubtitleLines(tl)
+    /** WeakMap round-trip: 동일 line 객체가 그대로 반환되며 `words` 는 재구성되지 않을 수 있음 */
+    expect(back[0]).toBe(lines[0])
+    expect(back[0]!.words).toBeUndefined()
   })
 
   it('line start/end follow visible words only (tombstone outside span)', () => {
@@ -69,9 +73,11 @@ describe('sentenceTokenTimelineAdapter', () => {
         ]
       }
     ]
-    const back = sentenceTokenTimelineToSubtitleLines(subtitleLinesToSentenceTokenTimeline(lines))
-    expect(back[0]!.start).toBe(5)
-    expect(back[0]!.end).toBe(7)
-    expect(back[0]!.text).toBe('keep')
+    const tl = subtitleLinesToSentenceTokenTimeline(lines)
+    const keepTok = tl[0]!.tokens.find((t) => t.text === 'keep')
+    expect(keepTok?.start_original).toBe(5)
+    expect(keepTok?.end_original).toBe(7)
+    const back = sentenceTokenTimelineToSubtitleLines(tl)
+    expect(back[0]).toBe(lines[0])
   })
 })

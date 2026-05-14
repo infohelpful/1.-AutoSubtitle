@@ -1,7 +1,14 @@
-import { displayTextFromSubtitleWords, visibleSubtitleWords, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
+import {
+  displayTextFromSubtitleWords,
+  subtitleLineEditDisplayText,
+  visibleSubtitleWords,
+  type SubtitleLine,
+  type SubtitleWord
+} from '../../shared/subtitles'
 import {
   DEFAULT_GAP_THRESHOLD_SEC,
   fillGapsInSubtitleWords,
+  lineEditDisplayFromVrewWordParts,
   validateSubtitleLineWords
 } from '../../shared/wordContract'
 import type { SubtitleRow } from './components/vrewPeaksEditor/types'
@@ -49,6 +56,14 @@ type VrewRowCacheEntry = {
   idx: number
 }
 const vrewRowCache: WeakMap<SubtitleLine, VrewRowCacheEntry> = new WeakMap()
+
+function vrewLineTextEditBuffer(
+  line: SubtitleLine,
+  vrewWords: readonly { text: string; isSilence?: boolean }[]
+): string {
+  if (vrewWords.length > 0) return lineEditDisplayFromVrewWordParts(vrewWords)
+  return subtitleLineEditDisplayText({ text: line.text })
+}
 
 /** 한 줄 자막 ↔ Peaks 한 행 (단어 타임코드가 없으면 줄 전체를 한 단어로) */
 export function subtitleLinesToVrewRows(lines: SubtitleLine[], options?: SubtitleLinesToVrewOptions): SubtitleRow[] {
@@ -131,7 +146,7 @@ function buildVrewRowFromLine(
           ...(x.isSilence ? { isSilence: true as const } : {})
         }))
       })
-      return { id: rowId, words, lineText: line.text }
+      return { id: rowId, words, lineText: vrewLineTextEditBuffer(line, words) }
     }
 
     const nonSilent = visibleOnly.filter((w) => !w.isSilence)
@@ -170,7 +185,7 @@ function buildVrewRowFromLine(
         ...(w.isSilence ? ({ isSilence: true } as const) : {})
       }
     })
-    return { id: rowId, words, lineText: line.text }
+    return { id: rowId, words, lineText: vrewLineTextEditBuffer(line, words) }
   }
 
   const lineProg = toProg(line.start, line.end)
@@ -194,7 +209,7 @@ function buildVrewRowFromLine(
   return {
     id: rowId,
     words: [fallback],
-    lineText: line.text
+    lineText: vrewLineTextEditBuffer(line, [fallback])
   }
 }
 

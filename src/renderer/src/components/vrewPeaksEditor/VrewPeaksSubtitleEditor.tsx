@@ -8,16 +8,17 @@ import { wordsFromPeaksSegments } from './wordMerge'
 import type { SubtitleRow, Word } from './types'
 import { createSilentWavBlob } from './silentWav'
 import { safeFitPeaksContainerView } from '../../peaksSafeFit'
-import { lineEditDisplayFromVrewWordParts } from '../../../shared/wordContract'
+import { lineEditDisplayFromVrewWordParts, scrubTimelineNoiseFromWordPiece, shouldOmitFromSubtitleEditLineText } from '../../../shared/wordContract'
 import { wfLog } from './waveformDebugLog'
 
 function toSegmentOptions(w: Word): SegmentOptions {
+  const label = scrubTimelineNoiseFromWordPiece(w.text) || w.text
   return {
     id: String(w.id),
     startTime: w.start,
     endTime: w.end,
     editable: true,
-    labelText: w.text,
+    labelText: label,
     color: 'rgba(59, 130, 246, 0.25)',
     borderColor: 'rgba(59, 130, 246, 0.6)',
     markers: true,
@@ -44,8 +45,15 @@ function applyWordsToPeaks(peaks: PeaksInstance, list: Word[]): void {
 }
 
 function lineDisplay(row: SubtitleRow): string {
-  if (typeof row.lineText === 'string') return row.lineText
-  return lineEditDisplayFromVrewWordParts(row.words)
+  if (row.words.length > 0) return lineEditDisplayFromVrewWordParts(row.words)
+  if (typeof row.lineText === 'string' && row.lineText.length > 0) {
+    return row.lineText
+      .split(/\s+/)
+      .filter((t) => !shouldOmitFromSubtitleEditLineText(t))
+      .join(' ')
+      .trim()
+  }
+  return ''
 }
 
 /** 줄 편집 시 매 글자마다 onRowsChange → Peaks·부모 전체 리렌더 방지 — blur 시에만 반영 */

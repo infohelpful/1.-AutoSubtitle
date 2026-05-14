@@ -51,13 +51,35 @@ export function shouldOmitFromSubtitleEditLineText(word: string): boolean {
   return false
 }
 
+/**
+ * 말 조각에 붙은 `...` / `…` / `--` 등 분할·무음 흔적을 **표시용**으로만 제거한다.
+ * (`SubtitleWord.word` / Peaks 세그먼트 원문은 그대로 두고, 줄 편집·칩 라벨·보내기 join 에 사용)
+ */
+export function scrubTimelineNoiseFromWordPiece(text: string): string {
+  let t = String(text ?? '').trim()
+  if (t.length === 0 || shouldOmitFromSubtitleEditLineText(t)) return ''
+  for (let i = 0; i < 6; i++) {
+    const prev = t
+    t = t
+      .replace(/[\s\u00A0]*(?:\.{2,}|…|\u2026)+$/u, '')
+      .replace(/^(?:\.{2,}|…|\u2026)+[\s\u00A0]*/u, '')
+      .replace(/[\s\u00A0]*-{2,}$/u, '')
+      .replace(/^-{2,}[\s\u00A0]*/u, '')
+      .trim()
+    if (t === prev) break
+  }
+  if (shouldOmitFromSubtitleEditLineText(t)) return ''
+  return t
+}
+
 /** Peaks/Vrew `Word[]` → 줄 편집용 한 줄 문자열 */
 export function lineEditDisplayFromVrewWordParts(
   words: readonly { text: string; isSilence?: boolean }[]
 ): string {
   return words
-    .filter((w) => !w.isSilence && !shouldOmitFromSubtitleEditLineText(w.text))
-    .map((w) => w.text)
+    .filter((w) => !w.isSilence)
+    .map((w) => scrubTimelineNoiseFromWordPiece(w.text))
+    .filter((piece) => piece.length > 0)
     .join(' ')
     .trim()
 }

@@ -8,10 +8,20 @@ export async function connect(port = 9333) {
   const pending = new Map()
   ws.onmessage = (m) => {
     const d = JSON.parse(m.data)
-    if (d.id && pending.has(d.id)) { pending.get(d.id)(d); pending.delete(d.id) }
+    if (d.id && pending.has(d.id)) {
+      const p = pending.get(d.id); pending.delete(d.id); clearTimeout(p.timer)
+      if (d.error) p.reject(new Error(JSON.stringify(d.error))); else p.resolve(d)
+    }
   }
-  const send = (method, params = {}) => new Promise((res) => {
-    const i = ++id; pending.set(i, res); ws.send(JSON.stringify({ id: i, method, params }))
+  ws.onclose = () => {
+    for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('CDP connection closed')) }
+    pending.clear()
+  }
+  const send = (method, params = {}) => new Promise((resolve, reject) => {
+    if (ws.readyState !== WebSocket.OPEN) { reject(new Error('CDP connection is not open')); return }
+    const i = ++id
+    const timer = setTimeout(() => { pending.delete(i); reject(new Error('CDP timeout: ' + method)) }, 30000)
+    pending.set(i, { resolve, reject, timer }); ws.send(JSON.stringify({ id: i, method, params }))
   })
   const evaluate = async (expression) => {
     const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true })

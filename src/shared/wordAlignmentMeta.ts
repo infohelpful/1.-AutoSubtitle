@@ -13,6 +13,8 @@ export type AlignmentStatus = (typeof ALIGNMENT_STATUSES)[number]
 export type WordAlignmentMeta = {
   /** 인덱스와 독립적인 단어 ID(사이드카가 부여) */
   id?: string
+  /** New spoken word created when an edited phrase is split during realignment. */
+  parentWordId?: string
   segmentId?: string
   alignmentStatus?: AlignmentStatus
   /** 엔진 점수 — 정확도 확률 아님. 없으면 null */
@@ -27,6 +29,9 @@ export type WordAlignmentMeta = {
   modelRevision?: string
   /** 모델 입력 문자열(표시 문자열과 다를 수 있음) */
   alignmentText?: string
+  readingOverride?: string
+  textSpanMap?: Array<{ displayStart: number; displayEnd: number; alignmentStart: number; alignmentEnd: number }>
+  charSpans?: Array<{ char: string; start: number; end: number; score: number; alignmentStart?: number; alignmentEnd?: number }>
   reviewReasons?: string[]
   /** 사용자가 직접 고정한 경계 — 재정렬이 덮어쓰지 않는다 */
   manualStartLocked?: boolean
@@ -58,6 +63,8 @@ export function parseWordAlignmentMeta(raw: Record<string, unknown>): WordAlignm
   const out: WordAlignmentMeta = {}
   const id = nonEmptyString(raw.id)
   if (id !== undefined) out.id = id
+  const parentWordId = nonEmptyString(raw.parentWordId)
+  if (parentWordId !== undefined) out.parentWordId = parentWordId
   const segmentId = nonEmptyString(raw.segmentId)
   if (segmentId !== undefined) out.segmentId = segmentId
   if (
@@ -76,6 +83,35 @@ export function parseWordAlignmentMeta(raw: Record<string, unknown>): WordAlignm
   if (modelRevision !== undefined) out.modelRevision = modelRevision
   if (typeof raw.alignmentText === 'string' && raw.alignmentText.length <= MAX_STRING_LEN) {
     out.alignmentText = raw.alignmentText
+  }
+  const reading = nonEmptyString(raw.readingOverride)
+  if (reading !== undefined) out.readingOverride = reading
+  if (Array.isArray(raw.textSpanMap)) {
+    const spans = raw.textSpanMap.slice(0, MAX_STRING_LEN).filter(isRecord).filter(s =>
+      ['displayStart', 'displayEnd', 'alignmentStart', 'alignmentEnd'].every(k =>
+        Number.isSafeInteger(s[k]) && Number(s[k]) >= 0 && Number(s[k]) <= MAX_STRING_LEN) &&
+      Number(s.displayEnd) > Number(s.displayStart) && Number(s.alignmentEnd) > Number(s.alignmentStart))
+    if (spans.length === raw.textSpanMap.length) out.textSpanMap = spans.map(s => ({
+      displayStart: Number(s.displayStart), displayEnd: Number(s.displayEnd),
+      alignmentStart: Number(s.alignmentStart), alignmentEnd: Number(s.alignmentEnd)
+    }))
+  }
+  if (Array.isArray(raw.charSpans)) {
+    // Punctuation without an acoustic interval is deliberately omitted.
+    out.charSpans = raw.charSpans.slice(0, MAX_STRING_LEN).filter(isRecord).flatMap(s => {
+      if (typeof s.char !== 'string' || [...s.char].length !== 1 ||
+          typeof s.start !== 'number' || typeof s.end !== 'number' || typeof s.score !== 'number' ||
+          ![s.start, s.end, s.score].every(Number.isFinite) || s.start < 0 || s.end <= s.start) return []
+      const span: NonNullable<WordAlignmentMeta['charSpans']>[number] = {
+        char: s.char, start: s.start, end: s.end, score: s.score
+      }
+      if (Number.isSafeInteger(s.alignmentStart) && Number(s.alignmentStart) >= 0 &&
+          Number(s.alignmentEnd) === Number(s.alignmentStart) + 1 && Number(s.alignmentEnd) <= MAX_STRING_LEN) {
+        span.alignmentStart = Number(s.alignmentStart)
+        span.alignmentEnd = Number(s.alignmentEnd)
+      }
+      return [span]
+    })
   }
   if (Array.isArray(raw.reviewReasons)) {
     const reasons = raw.reviewReasons
@@ -119,6 +155,12 @@ export function markWordEdited<T extends EditableWord>(
   if (prev.isSilence === true) return result
 
   const textChanged = next.word !== prev.word
+  if (textChanged) {
+    delete result.charSpans
+    delete result.textSpanMap
+    delete result.alignmentText
+    delete result.readingOverride
+  }
   const startChanged = Math.abs(next.start - prev.start) > WORD_EDIT_TIME_EPS_SEC
   const endChanged = Math.abs(next.end - prev.end) > WORD_EDIT_TIME_EPS_SEC
 

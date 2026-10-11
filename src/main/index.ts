@@ -45,6 +45,8 @@ import {
 import { EXPORT_FPS, runSinglePassSubtitleBurnIn } from './ffmpeg-single-pass'
 import { buildRenderSchedule } from '../shared/exportRenderSchedule'
 import { probeMediaTiming } from './mediaTiming'
+import { validateMediaDecode } from './validateMediaDecode'
+import { fingerprintMedia, saveProjectDocument } from './projectStorage'
 import { clipPlanFromCuts, mapSourceIntervalToProgram, programDuration, validateClipPlan } from '../shared/clipPlan'
 import { randomUUID } from 'node:crypto'
 import type {
@@ -53,7 +55,9 @@ import type {
   ExportRequest,
   ExportResult,
   ExportSubtitleStyle,
-  FfmpegCapabilities
+  FfmpegCapabilities,
+  RealignRequest,
+  RealignResult
 } from '../shared/ipc'
 
 let mainWindow: BrowserWindow | null = null
@@ -61,6 +65,13 @@ let sidecar: PythonSidecar | null = null
 let depsPrepareLocked = false
 let gpuInstallLocked = false
 const activeExports = new Set<AbortController>()
+const activeAlignments = new Map<number, { requestId: string; worker: PythonSidecar }>()
+
+function alignmentPythonPath(): string | undefined {
+  if (process.env.AUTOSUBTITLE_ALIGN_PYTHON?.trim()) return process.env.AUTOSUBTITLE_ALIGN_PYTHON.trim()
+  const dev = join(__dirname, '../../.venv-alignment', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+  return !app.isPackaged && existsSync(dev) ? dev : undefined
+}
 
 function dialogParentWindow(event: Electron.IpcMainInvokeEvent): BrowserWindow | undefined {
   const fromSender = BrowserWindow.fromWebContents(event.sender)
@@ -1032,6 +1043,12 @@ app.whenReady().then(() => {
     return { canceled: false as const, filePaths }
   })
 
+  ipcMain.handle('project:fingerprint', async (_event, path: unknown) => {
+    if (typeof path !== 'string' || !path.trim()) return { ok: false, reason: '영상 경로가 없습니다.' }
+    try { return { ok: true, fingerprint: await fingerprintMedia(path) } }
+    catch (e) { return { ok: false, reason: e instanceof Error ? e.message : String(e) } }
+  })
+
   ipcMain.handle('project:open', async (event) => {
     const win = dialogParentWindow(event)
     if (!win) throw new Error('윈도우를 찾지 못했습니다.')
@@ -1053,7 +1070,7 @@ app.whenReady().then(() => {
       return { ok: false as const, reason: '저장 인수가 올바르지 않습니다.' }
     }
     try {
-      writeFileSync(p.path, p.content, 'utf8')
+      await saveProjectDocument(p.path, p.content)
       return { ok: true as const }
     } catch (e) {
       return { ok: false as const, reason: e instanceof Error ? e.message : String(e) }
@@ -1075,7 +1092,7 @@ app.whenReady().then(() => {
       filters: [{ name: 'AutoSubtitle 프로젝트', extensions: ['autosub'] }]
     })
     if (canceled || !filePath) return { canceled: true as const }
-    writeFileSync(filePath, p.content, 'utf8')
+    await saveProjectDocument(filePath, p.content)
     return { canceled: false as const, path: filePath }
   })
 
@@ -1208,7 +1225,54 @@ app.whenReady().then(() => {
     return result
   })
 
-  ipcMain.on('video-drop-path', (event, raw: unknown) => {
+  ipcMain.handle('alignment:cancel', (event, requestId: unknown) => {
+    const job = activeAlignments.get(event.sender.id)
+    if (job && job.requestId === requestId) {
+      activeAlignments.delete(event.sender.id)
+      job.worker.stop('정렬을 취소했습니다.')
+    }
+  })
+  ipcMain.handle('alignment:realign', async (event, request: RealignRequest): Promise<RealignResult> => {
+    if (!request || typeof request.requestId !== 'string' || !request.requestId ||
+        typeof request.timelineId !== 'string' || !Number.isSafeInteger(request.revision) ||
+        typeof request.path !== 'string' || !Array.isArray(request.cues)) {
+      return { ok: false, reason: '올바르지 않은 정렬 요청입니다.' }
+    }
+    activeAlignments.get(event.sender.id)?.worker.stop('새 정렬 요청으로 취소했습니다.')
+    const spec = resolveSidecarCommandAndArgs()
+    const alignmentPython = alignmentPythonPath()
+    const worker = new PythonSidecar(spec.command, spec.args, getFfmpegUserBinDir(), {
+      AUTOSUBTITLE_MODELS_DIR: join(app.getPath('appData'), 'AutoSubtitle', 'models'),
+      ...(alignmentPython ? { AUTOSUBTITLE_ALIGN_PYTHON: alignmentPython } : {})
+    })
+    const job = { requestId: request.requestId, worker }
+    activeAlignments.set(event.sender.id, job)
+    const senderId = event.sender.id
+    const cancel = () => {
+      if (activeAlignments.get(senderId) === job) activeAlignments.delete(senderId)
+      worker.stop('정렬 창이 닫혔습니다.')
+    }
+    event.sender.once('destroyed', cancel)
+    try {
+      const ffprobe = await ensureFfprobeExecutable(getUsableFfmpegExecutable())
+      if (activeAlignments.get(senderId) !== job || event.sender.isDestroyed()) throw new Error('정렬이 취소됐습니다.')
+      const media = probeMediaTiming(ffprobe, request.path)
+      const reply = await worker.call<Omit<Extract<RealignResult, { ok: true }>, 'ok'>>('realign_words', {
+        ...request, duration: media.duration, sourceOriginSec: media.sourceOriginSec,
+        ffmpeg: getUsableFfmpegExecutable()
+      }, TRANSCRIBE_TIMEOUT_MS)
+      if (activeAlignments.get(senderId) !== job) throw new Error('정렬이 취소됐습니다.')
+      return { ...reply, ok: true }
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    } finally {
+      event.sender.removeListener('destroyed', cancel)
+      worker.stop()
+      if (activeAlignments.get(senderId) === job) activeAlignments.delete(senderId)
+    }
+  })
+
+  ipcMain.on('video-drop-path', (event, raw: unknown, alignmentMode?: unknown) => {
     void (async () => {
       const win = BrowserWindow.fromWebContents(event.sender)
       if (!win || win.isDestroyed()) return
@@ -1263,6 +1327,9 @@ app.whenReady().then(() => {
           if (reason) win.webContents.send('transcribe:diag', { message: reason })
         })
         const txParams: Record<string, unknown> = { path: absPath }
+        if (alignmentMode === 'accurate' || alignmentMode === 'fast') txParams.alignment_mode = alignmentMode
+        const alignmentPython = alignmentPythonPath()
+        if (alignmentPython) txParams.alignment_python = alignmentPython
         const wfCache = await getWaveformCacheJsonPathForMedia(absPath)
         if (wfCache.ok) {
           txParams.waveform_out_json_path = wfCache.cachePath
@@ -1534,10 +1601,8 @@ app.whenReady().then(() => {
         if (Math.abs(exported.duration - overlayDurationSec) > 0.1 || exported.hasAudio !== media.hasAudio) {
           throw new Error('출력 영상의 길이 또는 오디오 검증에 실패했습니다.')
         }
-        const decoded = spawnSync(ffmpeg, ['-v', 'error', '-xerror', '-i', pendingOutput, '-t', '1', '-f', 'null', '-'], {
-          windowsHide: true, timeout: 30_000, encoding: 'utf8'
-        })
-        if (decoded.error || decoded.status !== 0) throw new Error(`출력 디코드 검증 실패: ${decoded.error?.message ?? decoded.stderr}`)
+        sendExportProgress(win, { percent: 99, label: '출력 영상 전체를 검증하는 중…', encoderName: encDisplay })
+        await validateMediaDecode(ffmpeg, pendingOutput, { signal: controller.signal })
         if (controller.signal.aborted) throw new Error('Export canceled')
         renameSync(pendingOutput, outputPath)
 
@@ -1600,6 +1665,8 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  for (const job of activeAlignments.values()) job.worker.stop()
+  activeAlignments.clear()
   for (const controller of activeExports) controller.abort()
   sidecar?.stop()
   sidecar = null

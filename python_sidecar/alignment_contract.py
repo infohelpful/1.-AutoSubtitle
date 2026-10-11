@@ -20,8 +20,12 @@ def normalized_letters(text: str) -> str:
 
 
 def apply_character_alignment(words: list[dict], chars: list[dict], dictionary: dict,
-                              duration: float, segment_id: str, model_revision: str) -> list[dict]:
-    expected = "".join(normalized_letters(str(w.get("word", ""))) for w in words)
+                              duration: float, segment_id: str, model_revision: str,
+                              alignment_inputs: list[dict] | None = None) -> list[dict]:
+    if alignment_inputs is not None and len(alignment_inputs) != len(words):
+        raise ValueError('Alignment input count must match display words')
+    inputs = alignment_inputs or [{"text": str(w.get("word", ""))} for w in words]
+    expected = "".join(normalized_letters(i["text"]) for i in inputs)
     actual_chars = [c for c in chars if not str(c.get("char", "")).isspace()]
     actual = "".join(str(c.get("char", "")) for c in actual_chars)
     matches = actual == expected
@@ -29,7 +33,8 @@ def apply_character_alignment(words: list[dict], chars: list[dict], dictionary: 
     result = []
     for index, original in enumerate(words):
         word = copy.deepcopy(original)
-        text = normalized_letters(str(word.get("word", "")))
+        input_text = inputs[index]
+        text = normalized_letters(input_text["text"])
         selected = actual_chars[cursor:cursor + len(text)] if matches else []
         cursor += len(text)
         # Punctuation has no independent acoustic boundary.
@@ -48,10 +53,14 @@ def apply_character_alignment(words: list[dict], chars: list[dict], dictionary: 
             reasons.append("reversed_character_timing")
         word.update(id=word.get("id") or f"{segment_id}:word:{index}", segmentId=segment_id,
                     rawStart=word.get("rawStart", word.get("start")), rawEnd=word.get("rawEnd", word.get("end")),
-                    alignmentText=unicodedata.normalize("NFC", str(word.get("word", ""))),
+                    alignmentText=unicodedata.normalize("NFC", input_text["text"]),
                     sourceStart=None, sourceEnd=None, alignmentScore=None,
                     engine="whisperx", modelRevision=model_revision,
-                    alignmentStatus="unaligned", reviewReasons=reasons)
+                    alignmentStatus="unaligned", reviewReasons=list(reasons) + input_text.get('reviewReasons', []))
+        word.pop('charSpans', None)
+        word.pop('textSpanMap', None)
+        if 'textSpanMap' in input_text:
+            word['textSpanMap'] = copy.deepcopy(input_text['textSpanMap'])
         if not reasons:
             start, end = speech_chars[0]["start"], speech_chars[-1]["end"]
             if word.get("manualStartLocked"):
@@ -59,10 +68,11 @@ def apply_character_alignment(words: list[dict], chars: list[dict], dictionary: 
             if word.get("manualEndLocked"):
                 end = original.get("end")
             if finite(start) and finite(end) and 0 <= start < end <= duration:
-                word.update(start=start, end=end, sourceStart=start, sourceEnd=end,
+                word.update(start=start, end=end, sourceStart=speech_chars[0]['start'], sourceEnd=speech_chars[-1]['end'],
                             alignmentScore=sum(c["score"] for c in speech_chars) / len(speech_chars),
                             alignmentStatus="manual" if word.get("manualStartLocked") or word.get("manualEndLocked") else "aligned",
-                            charSpans=copy.deepcopy(selected))
+                            charSpans=[{**copy.deepcopy(char), 'alignmentStart': pos, 'alignmentEnd': pos + 1}
+                                       for char, pos in zip(selected, [i for i, c in enumerate(input_text['text']) if not c.isspace()])])
             else:
                 word["reviewReasons"].append("manual_boundary_conflict")
         result.append(word)

@@ -5,6 +5,12 @@ const line: SubtitleLine = { start: 0, end: 2, text: '오늘 날씨', words: [
   { id: 'a', start: 0, end: 1, word: '오늘', alignmentStatus: 'aligned' },
   { id: 'b', start: 1, end: 2, word: '날씨', alignmentStatus: 'aligned' }
 ] }
+it('restores word labels after clearing and retyping a line without cutting audio', () => {
+  const next = editSubtitleText(editSubtitleText(line, ''), '새로운 문장')
+  expect(next.words?.[0]).toMatchObject({ id: 'a', start: 0, end: 1, word: '새로운 문장', alignmentStatus: 'stale' })
+  expect(next.words?.[1].word).toBe('')
+  expect(next.words?.some(w => w.isDeleted)).toBe(false)
+})
 it('updates corrected labels while preserving source bounds and other words', () => {
   const next = editSubtitleText(line, '오늘 날시')
   expect(next.words?.[0]).toBe(line.words?.[0])

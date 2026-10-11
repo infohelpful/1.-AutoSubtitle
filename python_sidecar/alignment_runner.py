@@ -6,6 +6,7 @@ worker is a subprocess. Any failure raises ``AlignmentUnavailable`` and the call
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -65,6 +66,16 @@ def run_accurate_alignment(cues: list[dict[str, Any]], media_path: str, ffmpeg_p
     if not isinstance(subtitles, list) or len(subtitles) != len(cues):
         raise AlignmentUnavailable("alignment_cue_count_mismatch")
     for original, aligned in zip(cues, subtitles):
+        if not isinstance(aligned, dict):
+            raise AlignmentUnavailable('alignment_invalid_cue')
         if len(original.get("words") or []) != len((aligned or {}).get("words") or []):
             raise AlignmentUnavailable("alignment_word_count_mismatch")
+        for old, new in zip(original.get('words') or [], aligned.get('words') or []):
+            if not isinstance(new, dict) or new.get('word') != old.get('word') or (old.get('id') and new.get('id') != old['id']):
+                raise AlignmentUnavailable('alignment_word_identity_mismatch')
+            if not all(isinstance(new.get(k), (float, int)) and not isinstance(new[k], bool) and math.isfinite(new[k]) for k in ('start', 'end')) or not 0 <= new['start'] < new['end']:
+                raise AlignmentUnavailable('alignment_invalid_word_timing')
+            for edge in ('Start', 'End'):
+                if old.get('manual' + edge + 'Locked') and new[edge.lower()] != old[edge.lower()]:
+                    raise AlignmentUnavailable('alignment_manual_boundary_changed')
     return reply

@@ -15,7 +15,9 @@ import {
   type ProjectOpenResult,
   type ProjectSaveAsResult,
   type ProjectSaveResult,
-  type WaveformPeaksCachePathResult
+  type WaveformPeaksCachePathResult,
+  type RealignRequest,
+  type RealignResult
 } from '../shared/ipc'
 
 const CH_PROGRESS = 'model:download-progress'
@@ -64,6 +66,8 @@ contextBridge.exposeInMainWorld('api', {
     >,
   getWaveformPeaksCachePath: (absoluteVideoPath: string) =>
     ipcRenderer.invoke('waveform:getPeaksCachePath', absoluteVideoPath) as Promise<WaveformPeaksCachePathResult>,
+  realignWords: (request: RealignRequest) => ipcRenderer.invoke('alignment:realign', request) as Promise<RealignResult>,
+  cancelRealignment: (requestId: string) => ipcRenderer.invoke('alignment:cancel', requestId) as Promise<void>,
   sidecarCall: (method: string, params?: Record<string, unknown>) =>
     ipcRenderer.invoke('sidecar:call', method, params) as Promise<unknown>,
   getDepsStatus: () => ipcRenderer.invoke('deps:status'),
@@ -99,8 +103,8 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on(CH_READY, listener)
     return () => ipcRenderer.removeListener(CH_READY, listener)
   },
-  sendVideoDropPath: (absolutePath: string) => {
-    ipcRenderer.send(CH_VIDEO_DROP, absolutePath)
+  sendVideoDropPath: (absolutePath: string, alignmentMode?: 'accurate' | 'fast') => {
+    ipcRenderer.send(CH_VIDEO_DROP, absolutePath, alignmentMode)
   },
   onTranscribeMode: (callback: (mode: 'cpu' | 'gpu') => void) => {
     const listener = (_event: IpcRendererEvent, mode: 'cpu' | 'gpu') => callback(mode)
@@ -130,6 +134,7 @@ contextBridge.exposeInMainWorld('api', {
   notifySubtitleRenderReady: () => {
     ipcRenderer.send(IPC_EXPORT_SUBTITLE_RENDER_READY)
   },
+  fingerprintMedia: (path: string) => ipcRenderer.invoke('project:fingerprint', path),
   openProjectFile: () => ipcRenderer.invoke('project:open') as Promise<ProjectOpenResult>,
   saveProjectFile: (path: string, content: string) =>
     ipcRenderer.invoke('project:save', { path, content }) as Promise<ProjectSaveResult>,

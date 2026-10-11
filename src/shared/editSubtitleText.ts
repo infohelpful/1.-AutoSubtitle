@@ -23,6 +23,13 @@ export function editSubtitleText(line: SubtitleLine, text: string): SubtitleLine
   })
   // Insertions in a separator belong to the following word, or the last word at EOF.
   const owner = spans.find(s => s.end > start) ?? spans.at(-1)
+  if (!owner && line.words?.length) {
+    // A previously cleared line has no labels to match. Reuse its source slots
+    // so typing into the empty line restores chips instead of text only.
+    const first = line.words.findIndex(w => !w.isDeleted && !w.isSilence)
+    return { ...line, text, words: line.words.map((word, index) =>
+      word.isDeleted || word.isSilence ? word : markWordEdited(word, { ...word, word: index === first ? text : '' })) }
+  }
   const words = line.words?.map((word, index) => {
     const span = spans.find(s => s.index === index)
     if (!span) return word

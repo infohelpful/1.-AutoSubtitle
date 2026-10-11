@@ -25,6 +25,17 @@ export type TranscribeErrorPayload = {
 
 export type TranscribeMode = 'cpu' | 'gpu'
 export type TranscribeDiagPayload = { message: string }
+export type RealignRequest = {
+  requestId: string
+  timelineId: string
+  revision: number
+  path: string
+  cues: import('./subtitles').SubtitleLine[]
+}
+export type RealignResult =
+  | { ok: false; reason: string }
+  | { ok: true; requestId: string; timelineId: string; revision: number;
+      subtitles: import('./subtitles').SubtitleLine[]; alignmentSummary: { totalWords: number; reviewWords: number } }
 export type GpuRuntimeStatus = {
   installed: boolean
   canInstall: boolean
@@ -155,6 +166,9 @@ export type WaveformPeaksCachePathResult =
   | { ok: false; reason: string }
 
 export type SidecarApi = {
+  fingerprintMedia: (path: string) => Promise<import('./projectMedia').MediaFingerprintResult>
+  realignWords: (request: RealignRequest) => Promise<RealignResult>
+  cancelRealignment: (requestId: string) => Promise<void>
   openVideoFileDialog: () => Promise<OpenVideoDialogResult>
   /** 드롭한 `File`의 디스크 절대 경로 (렌더러의 `File.path`는 비어 있는 경우가 많음) */
   getPathForFile: (file: File) => string
@@ -177,7 +191,7 @@ export type SidecarApi = {
   onModelDownloadProgress: (callback: (percent: number) => void) => () => void
   onModelReady: (callback: () => void) => () => void
   /** 절대 경로를 메인 프로세스로 넘기면 `transcribe` 파이프라인이 실행됩니다 (`ipcRenderer.send`). */
-  sendVideoDropPath: (absolutePath: string) => void
+  sendVideoDropPath: (absolutePath: string, alignmentMode?: 'accurate' | 'fast') => void
   onTranscribeMode: (callback: (mode: TranscribeMode) => void) => () => void
   onTranscribeDiag: (callback: (payload: TranscribeDiagPayload) => void) => () => void
   onTranscribeProgress: (callback: (percent: number) => void) => () => void

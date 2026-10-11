@@ -10,6 +10,8 @@ import unicodedata
 from pathlib import Path
 
 from alignment_contract import alignment_summary, apply_character_alignment
+from alignment_text import build_alignment_text
+from alignment_windows import plan_alignment_windows, merge_window_alignments
 
 KOREAN_MODEL = "kresnik/wav2vec2-large-xlsr-korean"
 
@@ -21,6 +23,8 @@ def _unaligned_cue(cue: dict, index: int, reason: str) -> dict:
     words = []
     for word_index, word in enumerate(result.get("words") or []):
         word.setdefault("id", f"{segment_id}:word:{word_index}")
+        word.pop('charSpans', None)
+        word.pop('textSpanMap', None)
         word.update(segmentId=segment_id, rawStart=word.get("rawStart", word.get("start")),
                     rawEnd=word.get("rawEnd", word.get("end")), sourceStart=None, sourceEnd=None,
                     alignmentScore=None, alignmentStatus="unaligned",
@@ -35,9 +39,8 @@ def align_korean(cues: list[dict], media_path: str, ffmpeg_path: str, cache_dir:
                  strict: bool = True) -> dict:
     """Use a pinned HF commit, absolute source times and no VAD concatenation.
 
-    Segments over 30 seconds are never aligned (chunking needs a separate text boundary
-    contract and must not silently drop words). With ``strict`` they raise; otherwise the
-    segment keeps its raw times and is reported as unaligned so the rest still gets aligned.
+    Long segments use ASR-anchored cores and context-only overlap. Words are emitted
+    exactly once; disagreement at a seam remains unaligned, with original times.
     """
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Alignment model revision must be a full 40-character commit SHA")
@@ -61,11 +64,16 @@ def align_korean(cues: list[dict], media_path: str, ffmpeg_path: str, cache_dir:
         duration = len(audio) / 16000
         output = []
         for index, cue in enumerate(cues):
-            start, end = float(cue["start"]), float(cue["end"])
-            words = cue.get("words") or []
-            if not 0 <= start < end <= duration + 0.05 or end - start > 30:
+            identified = copy.deepcopy(cue)
+            segment_id = str(cue.get('id') or f'segment:{index}')
+            words = identified.get("words") or []
+            for wi, word in enumerate(words):
+                word.setdefault('id', f'{segment_id}:word:{wi}')
+            try:
+                windows = plan_alignment_windows(identified, duration)
+            except ValueError:
                 if strict:
-                    raise ValueError(f"Segment {index} requires valid source bounds and a <=30s context")
+                    raise
                 output.append(_unaligned_cue(cue, index, "segment_bounds_unsupported"))
                 continue
             if not words:
@@ -73,21 +81,25 @@ def align_korean(cues: list[dict], media_path: str, ffmpeg_path: str, cache_dir:
                     raise ValueError(f"Segment {index} needs raw ASR words to preserve identity")
                 output.append(copy.deepcopy(cue))
                 continue
-            text = " ".join(unicodedata.normalize("NFC", str(w["word"]).strip()) for w in words)
-            try:
-                aligned = whisperx.align([{"start": start, "end": min(end, duration), "text": text}],
+            results = []
+            for window in windows:
+                window_words = words[window.first:window.last]
+                alignment_inputs = [build_alignment_text(str(w['word']).strip(), w.get('readingOverride')) for w in window_words]
+                text = ' '.join(item['text'] for item in alignment_inputs)
+                try:
+                    aligned = whisperx.align([{"start": window.start, "end": window.end, "text": text}],
                                          model, metadata, audio, device, return_char_alignments=True,
                                          print_progress=False)
-            except Exception as error:  # noqa: BLE001 - one bad segment must not discard the rest
-                if strict:
-                    raise
-                print(f"alignment failed for segment {index}: {error!r}", file=sys.stderr, flush=True)
-                output.append(_unaligned_cue(cue, index, "alignment_exception"))
-                continue
-            chars = [char for segment in aligned["segments"] for char in (segment.get("chars") or [])]
+                    chars = [char for segment in aligned["segments"] for char in (segment.get("chars") or [])]
+                    results.append(apply_character_alignment(window_words, chars, metadata["dictionary"], duration,
+                                                             segment_id, revision, alignment_inputs))
+                except Exception as error:  # noqa: BLE001 - one bad window must not discard the rest
+                    if strict:
+                        raise
+                    print(f"alignment failed for segment {index} window {window}: {error!r}", file=sys.stderr, flush=True)
+                    results.append(_unaligned_cue({'words': window_words}, index, "alignment_exception")['words'])
             next_cue = copy.deepcopy(cue)
-            next_cue["words"] = apply_character_alignment(words, chars, metadata["dictionary"], duration,
-                                                          str(cue.get("id") or f"segment:{index}"), revision)
+            next_cue["words"] = merge_window_alignments(words, windows, results)
             output.append(next_cue)
         return {"schemaVersion": 1, "subtitles": output, "raw_subtitles": copy.deepcopy(cues),
                 "alignmentSummary": alignment_summary([w for c in output for w in c["words"]]),

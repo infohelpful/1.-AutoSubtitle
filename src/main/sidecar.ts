@@ -1,4 +1,4 @@
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import { type ChildProcessWithoutNullStreams, spawn, spawnSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { delimiter } from 'node:path'
@@ -28,6 +28,7 @@ export class PythonSidecar {
   private onExportProgress: ((percent: number, phase?: string) => void) | null = null
   /** 동시에 여러 RPC가 stdin에 쓰면 파이프가 깨져 EPIPE가 난다 — 한 번에 하나만 실행 */
   private callChain: Promise<void> = Promise.resolve()
+  private generation = 0
   /** 비정상 종료 시 마지막 Python stderr (진행률 JSON 제외 전 원문 누적) */
   private stderrTailRaw = ''
 
@@ -88,18 +89,22 @@ export class PythonSidecar {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       env,
-      shell: false
+      shell: false,
+      detached: process.platform !== 'win32'
     })
+    const proc = this.proc
 
     this.proc.stdin.on('error', (err) => {
+      if (this.proc !== proc) return
       this.rejectAllPending(err instanceof Error ? err : new Error(String(err)))
     })
 
     const rl = createInterface({ input: this.proc.stdout })
-    rl.on('line', (line) => this.onLine(line))
+    rl.on('line', (line) => { if (this.proc === proc) this.onLine(line) })
 
     let stderrBuf = ''
     this.proc.stderr.on('data', (chunk: Buffer) => {
+      if (this.proc !== proc) return
       const text = chunk.toString()
       this.stderrTailRaw = (this.stderrTailRaw + text).slice(-14000)
       stderrBuf += text
@@ -135,10 +140,12 @@ export class PythonSidecar {
     })
 
     this.proc.on('error', (err) => {
+      if (this.proc !== proc) return
       this.rejectAllPending(err)
     })
 
     this.proc.on('close', (code) => {
+      if (this.proc !== proc) return
       const tail = this.stderrTailRaw.trim().replace(/\s+$/, '')
       const hint =
         tail.length > 0
@@ -158,14 +165,27 @@ export class PythonSidecar {
     this.pending.clear()
   }
 
-  stop(): void {
-    if (!this.proc) return
-    this.proc.kill()
+  stop(reason = 'Sidecar stopped'): void {
+    this.generation += 1
+    const proc = this.proc
     this.proc = null
+    this.rejectAllPending(new Error(reason))
+    if (!proc?.pid) return
+    // Stop the alignment worker and FFmpeg descendants too, before reusing the queue.
+    if (process.platform === 'win32') {
+      const result = spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { windowsHide: true, timeout: 10_000 })
+      if (result.error || result.status !== 0) proc.kill()
+    } else {
+      try { process.kill(-proc.pid, 'SIGKILL') } catch { proc.kill('SIGKILL') }
+    }
   }
 
   call<T = unknown>(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<T> {
-    const next = this.callChain.then(() => this.dispatchCall<T>(method, params, timeoutMs))
+    const generation = this.generation
+    const next = this.callChain.then(() => {
+      if (generation !== this.generation) throw new Error('Sidecar queued request canceled')
+      return this.dispatchCall<T>(method, params, timeoutMs)
+    })
     this.callChain = next.then(
       () => undefined,
       () => undefined
@@ -183,8 +203,7 @@ export class PythonSidecar {
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new Error(`Sidecar timeout: ${method}`))
+        this.stop(`Sidecar timeout: ${method}`)
       }, ms)
 
       this.pending.set(id, {

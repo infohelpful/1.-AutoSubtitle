@@ -6,6 +6,20 @@ import {
 } from './wordAlignmentMeta'
 
 describe('parseWordAlignmentMeta', () => {
+  it('preserves validated pronunciation maps and rejects malformed intervals', () => {
+    const meta = parseWordAlignmentMeta({ alignmentText: '십이초', readingOverride: '십이초',
+      textSpanMap: [{ displayStart: 0, displayEnd: 2, alignmentStart: 0, alignmentEnd: 2 }],
+      charSpans: [{ char: '십', start: 1, end: 1.2, score: .8, alignmentStart: 0, alignmentEnd: 1 },
+        { char: '이', start: 2, end: 1, score: .9 }] })
+    expect(meta.textSpanMap).toHaveLength(1)
+    expect(meta.charSpans).toHaveLength(1)
+    expect(meta.readingOverride).toBe('십이초')
+    const edited = markWordEdited({ ...meta, start: 1, end: 2, word: '12초' }, { start: 1, end: 2, word: '13초' })
+    expect(edited.charSpans).toBeUndefined()
+    expect(edited.textSpanMap).toBeUndefined()
+    expect(edited.readingOverride).toBeUndefined()
+    expect(parseWordAlignmentMeta({ textSpanMap: [{ displayStart: -1 }] }).textSpanMap).toBeUndefined()
+  })
   it('keeps valid sidecar alignment fields', () => {
     const meta = parseWordAlignmentMeta({
       id: 'seg-0:word:3',

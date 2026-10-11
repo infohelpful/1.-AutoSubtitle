@@ -693,6 +693,19 @@ def handle(method: str, params: dict[str, Any]) -> Any:
             "loaded": _whisper_model is not None,
             "device": _model_device,
         }
+    if method == 'realign_words':
+        from realign import validate_realign_cues
+        cues = validate_realign_cues(params.get('cues'), params.get('duration'))
+        media = str(params.get('path') or '')
+        if not os.path.isfile(media):
+            raise ValueError('Media file is missing')
+        ffmpeg = str(params.get('ffmpeg') or os.environ.get('AUTOSUBTITLE_FFMPEG_PATH') or '')
+        result = run_accurate_alignment(cues, media, ffmpeg,
+            cache_dir=os.environ.get('AUTOSUBTITLE_ALIGN_CACHE', '').strip() or str(MODELS_ROOT / 'hf-align-cache'),
+            source_origin_sec=float(params.get('sourceOriginSec', 0)),
+            device=str(params.get('device') or 'cpu'))
+        return {**result, 'requestId': params.get('requestId'), 'revision': params.get('revision'),
+                'timelineId': params.get('timelineId')}
     if method == "transcribe":
         if _whisper_model is None:
             raise RuntimeError("model not loaded; call prepare_model first")
@@ -758,12 +771,15 @@ def handle(method: str, params: dict[str, Any]) -> Any:
         if use_accurate:
             # Forced alignment replaces (does not stack on) the RMS heuristic when it succeeds.
             try:
+                if getattr(info, 'language', language or 'ko') != 'ko':
+                    raise AlignmentUnavailable('alignment_language_unsupported: Korean model only')
                 _emit_transcribe_progress(86.0)
                 ff_exe = ff_try or _which_ffmpeg(None)
                 cache_dir = os.environ.get("AUTOSUBTITLE_ALIGN_CACHE", "").strip() or str(MODELS_ROOT / "hf-align-cache")
                 aligned = run_accurate_alignment(
                     copy.deepcopy(subtitles), audio_path, str(ff_exe), cache_dir=cache_dir,
                     device=str(params.get("alignment_device") or "cpu"),
+                    python=params.get("alignment_python"),
                 )
                 subtitles = aligned["subtitles"]
                 summary = aligned.get("alignmentSummary") or {}

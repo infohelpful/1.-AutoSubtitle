@@ -64,6 +64,13 @@ class AlignmentRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(AlignmentUnavailable, "alignment_timeout"):
             self.run_with("import time\ntime.sleep(30)\n", timeout_sec=0.5)
 
+    def test_changed_text_or_invalid_times_are_rejected(self):
+        for mutation, reason in [("w['word'] = 'changed'", 'identity_mismatch'),
+                                 ("w['end'] = -1", 'invalid_word_timing')]:
+            source = ECHO_WORKER.replace('print("library noise', '        ' + mutation + '\nprint("library noise')
+            with self.assertRaisesRegex(AlignmentUnavailable, reason):
+                self.run_with(source)
+
 
 if __name__ == "__main__":
     unittest.main()

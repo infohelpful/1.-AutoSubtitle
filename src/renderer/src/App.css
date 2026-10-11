@@ -29,6 +29,32 @@ body {
   flex-direction: column;
 }
 
+.word-reading-editor {
+  position: fixed;
+  z-index: 50;
+  top: 15vh;
+  right: 1rem;
+  width: min(420px, calc(100vw - 3rem));
+  max-height: 70vh;
+  overflow: auto;
+  box-shadow: 0 12px 40px #0009;
+  padding: 0.65rem;
+  margin-top: 0.5rem;
+  border: 1px solid #414957;
+  border-radius: 6px;
+  background: #191e26;
+  font-size: 0.8rem;
+}
+.word-reading-editor p { margin: 0.4rem 0; color: #b7c0ce; }
+.word-reading-editor form, .word-reading-editor > div {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+}
+.word-reading-editor label { display: flex; align-items: center; gap: 0.4rem; margin: 0.3rem 0; }
+.word-reading-editor select, .word-reading-editor input {
+  min-width: 0; max-width: 100%; padding: 0.35rem; color: inherit;
+  background: #10151d; border: 1px solid #5b6575; border-radius: 4px;
+}
+
 .app-gpu-install-banner {
   flex-shrink: 0;
   display: flex;

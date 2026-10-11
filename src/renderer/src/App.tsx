@@ -15,6 +15,12 @@ import {
 } from 'react'
 import type { JsonWaveformData } from 'peaks.js'
 import { editSubtitleText } from '../../shared/editSubtitleText'
+import { prepareRealignCue, mergeRealignedCue } from '../../shared/realignWords'
+import { ensureWordIdentities } from '../../shared/wordIdentity'
+import { setWordReading } from '../../shared/wordReading'
+import { subtitleLinesMeaningfullyChanged } from '../../shared/subtitleEditHistory'
+import { WordReadingEditor } from './components/WordReadingEditor'
+import { sameMedia, type MediaFingerprint, type MediaFingerprintResult } from '../../shared/projectMedia'
 
 import type { CutRange, DepsStatus, ExportFormat, GpuRuntimeStatus, TranscribeMode } from '../../shared/ipc'
 import {
@@ -27,7 +33,7 @@ import {
 import {
   AUTOSUB_FILE_FORMAT,
   AUTOSUB_VERSION,
-  type AutosubProjectFileV1,
+  type AutosubProjectFile,
   parseAutosubProjectFile
 } from '../../shared/autosubProject'
 import type { SentenceTokenTimeline } from '../../shared/sentenceTokenTimeline'
@@ -885,27 +891,6 @@ function realignSubtitleWordBoundariesByWaveform(
   return { lines: next, changedWords }
 }
 
-function subtitleLinesMeaningfullyChanged(next: SubtitleLine[], prev: SubtitleLine[]): boolean {
-  if (next.length !== prev.length) return true
-  for (let i = 0; i < next.length; i += 1) {
-    const n = next[i]
-    const p = prev[i]
-    if (n.start !== p.start || n.end !== p.end || n.text !== p.text) return true
-    const nw = n.words ?? []
-    const pw = p.words ?? []
-    if (nw.length !== pw.length) return true
-    if (nw.length === 0) continue
-    for (let j = 0; j < nw.length; j += 1) {
-      const a = nw[j]
-      const b = pw[j]
-      if (a.start !== b.start || a.end !== b.end || a.word !== b.word) return true
-      if (Boolean(a.isSilence) !== Boolean(b.isSilence)) return true
-      if (Boolean(a.isDeleted) !== Boolean(b.isDeleted)) return true
-    }
-  }
-  return false
-}
-
 export default function App(): ReactElement {
   const savedSubtitleStyle = readSavedSubtitleStyle()
   const readRecentFonts = (): string[] => {
@@ -1523,6 +1508,13 @@ export default function App(): ReactElement {
   )
   const subtitlesRef = useRef(subtitles)
   subtitlesRef.current = subtitles
+  const alignmentMediaRef = useRef(videoPath)
+  alignmentMediaRef.current = videoPath
+  const alignmentRequestRef = useRef<string | null>(null)
+  const alignmentRevisionRef = useRef(0)
+  const [realigning, setRealigning] = useState(false)
+  const [alignmentNotice, setAlignmentNotice] = useState('')
+  const [readingLineIndex, setReadingLineIndex] = useState<number | null>(null)
   const [silenceSplitPending, setSilenceSplitPending] = useState(false)
   const silenceSplitRunKeyRef = useRef<string | null>(null)
   const autoWordRealignRunKeyRef = useRef<string | null>(null)
@@ -1549,6 +1541,11 @@ export default function App(): ReactElement {
   }, [virtualTimelineDeleted])
   /** 마지막으로 저장/연 `.autosub` 경로 — 「저장」 덮어쓰기용 */
   const projectFilePathRef = useRef<string | null>(null)
+  const projectGenerationRef = useRef(0)
+  const projectMediaRef = useRef<{ path: string | null; fingerprint: MediaFingerprint | null }>({ path: null, fingerprint: null })
+  const mediaFingerprintPromiseRef = useRef<Promise<MediaFingerprintResult> | null>(null)
+  const [projectMediaNotice, setProjectMediaNotice] = useState('')
+  const [projectIoBusy, setProjectIoBusy] = useState(false)
 
   const [isExtracting, setIsExtracting] = useState(false)
   /** IPC 100% 이후 — 리스트·가상행 레이아웃이 끝날 때까지 오버레이 유지할 때 true */
@@ -1556,7 +1553,11 @@ export default function App(): ReactElement {
   const [progress, setProgress] = useState(0)
   const [transcribeMode, setTranscribeMode] = useState<TranscribeMode | null>(null)
   const [transcribeDiagnostics, setTranscribeDiagnostics] = useState<string[]>([])
+  const [alignmentMode, setAlignmentMode] = useState<'accurate' | 'fast'>(() =>
+    window.localStorage.getItem('autosubtitle.alignmentMode') === 'fast' ? 'fast' : 'accurate')
+  useEffect(() => { window.localStorage.setItem('autosubtitle.alignmentMode', alignmentMode) }, [alignmentMode])
   const [isExporting, setIsExporting] = useState(false)
+  const [exportNotice, setExportNotice] = useState('')
   const [exportProgress, setExportProgress] = useState(0)
   const [exportProgressLabel, setExportProgressLabel] = useState('')
   const [exportEncoderLine, setExportEncoderLine] = useState('')
@@ -3121,7 +3122,7 @@ export default function App(): ReactElement {
       const recordHistory = options?.recordHistory ?? true
       setSentenceTokenTimeline((prevTl) => {
         const prev = sentenceTokenTimelineToSubtitleLines(prevTl)
-        const next = updater(prev)
+        const next = ensureWordIdentities(updater(prev))
         const nextTl = subtitleLinesToSentenceTokenTimeline(next)
         if (!recordHistory) return nextTl
         if (next === prev) return prevTl
@@ -4307,9 +4308,8 @@ export default function App(): ReactElement {
       commitEditSecToUi(0)
       setDurationSec(0)
       setIsPlaying(false)
-      setSentenceTokenTimeline((prev) => (prev.length === 0 ? prev : []))
-      setCutRanges((prev) => (prev.length === 0 ? prev : []))
-      setVirtualTimelineDeleted((prev) => (prev.length === 0 ? prev : []))
+      // Missing/mismatched project media must retain subtitle edits and cuts.
+      // Starting a new video clears these explicitly in processDroppedVideoPath.
     }
   }, [videoPath, commitEditSecToUi])
 
@@ -5052,6 +5052,70 @@ export default function App(): ReactElement {
     seekToSubtitleStartFromUserInput(startSec)
   }, [pausePlayback, seekToSubtitleStartFromUserInput])
 
+  const applyWordReading = useCallback((id: string, reading: string) => {
+    applySubtitleChange(lines => lines.map(line => {
+      if (!line.words?.some(word => word.id === id)) return line
+      return { ...line, words: line.words.map(word => word.id === id ? setWordReading(word, reading) : word) }
+    }))
+    setAlignmentNotice('발음을 반영했습니다. 해당 줄의 싱크를 재정렬해 주세요.')
+  }, [applySubtitleChange])
+
+  const cancelRealignment = useCallback(() => {
+    const id = alignmentRequestRef.current
+    alignmentRequestRef.current = null
+    setRealigning(false)
+    setAlignmentNotice('정렬을 취소했습니다.')
+    if (id) void window.api.cancelRealignment(id)
+  }, [])
+
+  useEffect(() => {
+    setRealigning(false)
+    setAlignmentNotice('')
+    return () => {
+      const id = alignmentRequestRef.current
+      alignmentRequestRef.current = null
+      if (id) void window.api.cancelRealignment(id)
+    }
+  }, [videoPath])
+
+  const realignCurrentLine = useCallback(async (targetIndex?: number) => {
+    if (!videoPath || realigning || isExtracting) return
+    const snapshot = subtitlesRef.current
+    const index = targetIndex ?? waveformLineIndex ?? activeSubtitleIndexRef.current ?? 0
+    const line = snapshot[index]
+    if (!line) return
+    pausePlayback('realign')
+    const requestId = crypto.randomUUID()
+    const revision = ++alignmentRevisionRef.current
+    alignmentRequestRef.current = requestId
+    setRealigning(true)
+    setAlignmentNotice(`${index + 1}번 줄의 음성을 다시 맞추고 있습니다…`)
+    try {
+      const cue = prepareRealignCue(line, requestId)
+      const result = await window.api.realignWords({ requestId, revision, timelineId: videoPath, path: videoPath, cues: [cue] })
+      if (alignmentRequestRef.current !== requestId) return
+      if (!result.ok) throw new Error(result.reason)
+      if (result.requestId !== requestId || result.revision !== revision || result.timelineId !== videoPath ||
+          alignmentMediaRef.current !== videoPath || subtitlesRef.current !== snapshot) {
+        setAlignmentNotice('정렬 중 자막이나 영상이 바뀌어 결과를 적용하지 않았습니다.')
+        return
+      }
+      if (result.subtitles.length !== 1) throw new Error('정렬 결과 줄 수가 다릅니다.')
+      const nextLine = mergeRealignedCue(line, cue, result.subtitles[0])
+      applySubtitleChange(prev => prev.length === snapshot.length && prev.every((item, i) => item === snapshot[i])
+        ? prev.map((item, i) => i === index ? nextLine : item) : prev)
+      const reviewWords = (nextLine.words ?? []).filter(word => !word.isDeleted && !word.isSilence && word.reviewReasons?.length).length
+      setAlignmentNotice(`정렬 완료 · 검토 필요 ${reviewWords}개. 실행 취소로 되돌릴 수 있습니다.`)
+    } catch (error) {
+      if (alignmentRequestRef.current === requestId) setAlignmentNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (alignmentRequestRef.current === requestId) {
+        alignmentRequestRef.current = null
+        setRealigning(false)
+      }
+    }
+  }, [videoPath, realigning, isExtracting, waveformLineIndex, pausePlayback, applySubtitleChange])
+
   /**
    * **재생 세션 perf 초기화 / emit** — isPlaying 만 의존하므로 mid-playback 의 viewWin /
    * sentenceTimeline 갱신으로 인한 dep 변동에서 자유롭다. 한 단어 재생 전체에 걸쳐 누적된
@@ -5659,6 +5723,12 @@ export default function App(): ReactElement {
       if (!isVideoFilePath(absPath)) {
         return
       }
+      projectGenerationRef.current += 1
+      setReadingLineIndex(null)
+      projectFilePathRef.current = null
+      projectMediaRef.current = { path: absPath, fingerprint: null }
+      mediaFingerprintPromiseRef.current = window.api.fingerprintMedia(absPath)
+      setProjectMediaNotice('')
       setVideoPath(absPath)
       setExtractAwaitListPaint(false)
       setSentenceTokenTimeline([])
@@ -5672,12 +5742,12 @@ export default function App(): ReactElement {
       if (modelReady && !busy) {
         pendingAutoTranscribeRef.current = null
         setIsExtracting(true)
-        window.api.sendVideoDropPath(absPath)
+        window.api.sendVideoDropPath(absPath, alignmentMode)
       } else {
         pendingAutoTranscribeRef.current = absPath
       }
     },
-    [busy, isExtracting, modelReady]
+    [busy, isExtracting, modelReady, alignmentMode]
   )
 
   useEffect(() => {
@@ -5687,8 +5757,8 @@ export default function App(): ReactElement {
     pendingAutoTranscribeRef.current = null
     setExtractAwaitListPaint(false)
     setIsExtracting(true)
-    window.api.sendVideoDropPath(p)
-  }, [modelReady, busy, isExtracting])
+    window.api.sendVideoDropPath(p, alignmentMode)
+  }, [modelReady, busy, isExtracting, alignmentMode])
 
   /**
    * 단어 추출 직후 카드가 잠시 붙어 보이는 현상 진단용 —
@@ -5836,7 +5906,7 @@ export default function App(): ReactElement {
         setProgress(100)
         setExtractAwaitListPaint(true)
         startTransition(() => {
-          setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(finalLines))
+          setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(ensureWordIdentities(finalLines)))
         })
         wfLog('perf', '단어 추출 완료 — setSentenceTokenTimeline 호출 끝', {
           callMs: Math.round(performance.now() - t0),
@@ -6024,6 +6094,7 @@ export default function App(): ReactElement {
     videoBurnExportRef.current = isVideoBurn
     setShowBurnEncoderUi(isVideoBurn)
     setIsExporting(true)
+    setExportNotice('')
     setExportProgress(0)
     setExportProgressLabel('내보내기 준비 중…')
     setExportEncoderLine('')
@@ -6062,9 +6133,11 @@ export default function App(): ReactElement {
           return
         }
         setExportProgress(100)
+        setExportNotice('내보내기 완료')
         void window.api.showExportResultInFolder(res.outputPath)
       } catch (e) {
         setExportProgress(0)
+        setExportNotice(formatExportFailureMessage(e))
         console.error(formatExportFailureMessage(e))
       } finally {
         videoBurnExportRef.current = false
@@ -6097,16 +6170,19 @@ export default function App(): ReactElement {
     wordHighlightEnabled
   ])
 
-  const buildAutosubProjectJson = useCallback((): string => {
+  const buildAutosubProjectJson = useCallback(async (): Promise<string> => {
+    const generation = projectGenerationRef.current
+    const binding = projectMediaRef.current
     const mergedCuts = mergeCutRanges([...cutRanges])
     const activeSnap = buildActiveBlocksSnapshotFromSubtitles(subtitles, mergedCuts)
     const mergedDeleted = mergedDeletedBlocksForProjectSave(virtualTimelineDeleted, subtitles, mergedCuts)
     const virtualTimeline = [...activeSnap, ...mergedDeleted]
-    const payload: AutosubProjectFileV1 = {
+    const payload: AutosubProjectFile = {
       format: AUTOSUB_FILE_FORMAT,
       version: AUTOSUB_VERSION,
       savedAt: new Date().toISOString(),
-      videoPath,
+      videoPath: binding.path ?? videoPath,
+      mediaFingerprint: binding.fingerprint,
       cutRanges,
       subtitleStyle: {
         fontFamily: subtitleFontFamily,
@@ -6119,22 +6195,22 @@ export default function App(): ReactElement {
         strokeColor: subtitleStrokeColor,
         strokeWidth: subtitleStrokeWidth,
         x: subtitleX,
-        y: subtitleY
+        y: subtitleY,
+        wordHighlightEnabled,
+        wordHighlightColor
       },
-      subtitles: subtitles.map((line) =>
-        line.words && line.words.length > 0
-          ? {
-              start: line.start,
-              end: line.end,
-              text: line.text,
-              words: line.words.map((w) => ({ ...w }))
-            }
-          : { start: line.start, end: line.end, text: line.text }
-      )
+      subtitles
     }
     if (virtualTimeline.length > 0) {
       payload.virtualTimeline = virtualTimeline
     }
+    if (!payload.mediaFingerprint && mediaFingerprintPromiseRef.current) {
+      const result = await mediaFingerprintPromiseRef.current
+      if (!result.ok) throw new Error(`영상 확인에 실패했습니다: ${result.reason}`)
+      payload.mediaFingerprint = result.fingerprint
+      if (generation === projectGenerationRef.current) binding.fingerprint = result.fingerprint
+    }
+    if (generation !== projectGenerationRef.current) throw new Error('프로젝트가 변경되어 저장을 취소했습니다.')
     return JSON.stringify(payload, null, 2)
   }, [
     cutRanges,
@@ -6151,52 +6227,88 @@ export default function App(): ReactElement {
     subtitleY,
     subtitles,
     videoPath,
-    virtualTimelineDeleted
+    virtualTimelineDeleted,
+    wordHighlightEnabled,
+    wordHighlightColor
   ])
 
   const saveProjectAs = useCallback(async () => {
-    const json = buildAutosubProjectJson()
     const defaultPath = projectFilePathRef.current ?? undefined
+    const generation = projectGenerationRef.current
+    setProjectIoBusy(true)
     try {
+      const json = await buildAutosubProjectJson()
       const r = await window.api.saveProjectFileAs(json, defaultPath)
-      if (!r.canceled) {
+      if (!r.canceled && generation === projectGenerationRef.current) {
         projectFilePathRef.current = r.path
         const mergedCuts = mergeCutRanges([...cutRanges])
         setVirtualTimelineDeleted(mergedDeletedBlocksForProjectSave(virtualTimelineDeleted, subtitles, mergedCuts))
       }
     } catch (e) {
       window.alert(e instanceof Error ? e.message : String(e))
-    }
+    } finally { setProjectIoBusy(false) }
   }, [buildAutosubProjectJson, cutRanges, subtitles, virtualTimelineDeleted])
 
   const saveProject = useCallback(async () => {
-    const json = buildAutosubProjectJson()
     if (!projectFilePathRef.current) {
       await saveProjectAs()
       return
     }
+    const path = projectFilePathRef.current
+    const generation = projectGenerationRef.current
+    setProjectIoBusy(true)
     try {
-      const res = await window.api.saveProjectFile(projectFilePathRef.current, json)
+      const json = await buildAutosubProjectJson()
+      const res = await window.api.saveProjectFile(path, json)
       if (!res.ok) window.alert(res.reason)
-      else {
+      else if (generation === projectGenerationRef.current) {
         const mergedCuts = mergeCutRanges([...cutRanges])
         setVirtualTimelineDeleted(mergedDeletedBlocksForProjectSave(virtualTimelineDeleted, subtitles, mergedCuts))
       }
     } catch (e) {
       window.alert(e instanceof Error ? e.message : String(e))
-    }
+    } finally { setProjectIoBusy(false) }
   }, [buildAutosubProjectJson, saveProjectAs, cutRanges, subtitles, virtualTimelineDeleted])
 
-  const applyAutosubPayload = useCallback((projectPath: string | null, parsed: unknown) => {
+  const applyAutosubPayload = useCallback(async (projectPath: string | null, parsed: unknown) => {
     const pr = parseAutosubProjectFile(parsed)
     if (!pr.ok) {
       window.alert(pr.reason)
       return false
     }
     const d = pr.data
+    setReadingLineIndex(null)
+    const generation = ++projectGenerationRef.current
+    setProjectIoBusy(true)
+    let playablePath = d.videoPath
+    let fingerprint = d.mediaFingerprint
+    let notice = ''
+    try {
+      if (d.videoPath) {
+        const result = await window.api.fingerprintMedia(d.videoPath)
+        if (!result.ok) {
+          playablePath = null
+          notice = '원본 영상을 읽을 수 없습니다. 자막은 보존했습니다. 원본 영상을 다시 연결해 주세요.'
+        } else if (fingerprint && !sameMedia(fingerprint, result.fingerprint)) {
+          playablePath = null
+          notice = '저장된 원본과 다른 영상입니다. 자막은 보존했습니다. 일치하는 원본 영상을 연결해 주세요.'
+        } else {
+          if (!fingerprint) notice = '이전 프로젝트에는 영상 식별 정보가 없습니다. 현재 경로의 영상을 연결했으며 다음 저장부터 원본 일치를 확인합니다.'
+          fingerprint = result.fingerprint
+        }
+      }
+    } catch {
+      playablePath = null
+      notice = '원본 영상 확인에 실패했습니다. 원본 영상을 다시 연결해 주세요.'
+    } finally { setProjectIoBusy(false) }
+    if (generation !== projectGenerationRef.current) return false
+    pausePlayback()
+    projectMediaRef.current = { path: d.videoPath, fingerprint }
+    mediaFingerprintPromiseRef.current = null
+    setProjectMediaNotice(notice)
     projectFilePathRef.current = projectPath
     pendingAutoTranscribeRef.current = null
-    setVideoPath(d.videoPath)
+    setVideoPath(playablePath)
     setCutRanges(mergeCutRanges(d.cutRanges))
     let tombstones = (d.virtualTimeline ?? []).filter((b) => b.isDeleted)
     if (tombstones.length === 0 && mergeCutRanges(d.cutRanges).length > 0) {
@@ -6219,10 +6331,35 @@ export default function App(): ReactElement {
     setSubtitleStrokeWidth(st.strokeWidth)
     setSubtitleX(st.x)
     setSubtitleY(clampSubtitleY(st.y))
+    setWordHighlightEnabled(st.wordHighlightEnabled ?? false)
+    setWordHighlightColor(st.wordHighlightColor ?? '#ffff00')
     commitEditSecToUi(0)
     setIsPlaying(false)
     return true
-  }, [commitEditSecToUi])
+  }, [commitEditSecToUi, pausePlayback])
+
+  const relinkProjectMedia = useCallback(async () => {
+    const generation = projectGenerationRef.current
+    setProjectIoBusy(true)
+    try {
+      const picked = await window.api.openVideoFileDialog()
+      if (picked.canceled || !picked.filePaths[0]) return
+      const path = picked.filePaths[0]
+      const result = await window.api.fingerprintMedia(path)
+      if (generation !== projectGenerationRef.current) return
+      if (!result.ok) { setProjectMediaNotice(`영상을 읽을 수 없습니다: ${result.reason}`); return }
+      const expected = projectMediaRef.current.fingerprint
+      if (expected && !sameMedia(expected, result.fingerprint)) {
+        setProjectMediaNotice('원본과 내용이 다른 영상입니다. 일치하는 원본 영상을 선택해 주세요.')
+        return
+      }
+      projectMediaRef.current = { path, fingerprint: result.fingerprint }
+      mediaFingerprintPromiseRef.current = null
+      setVideoPath(path)
+      setProjectMediaNotice('원본 영상을 다시 연결했습니다. 변경된 경로를 유지하려면 프로젝트를 저장해 주세요.')
+    } catch (e) { setProjectMediaNotice(e instanceof Error ? e.message : String(e)) }
+    finally { setProjectIoBusy(false) }
+  }, [])
 
   const openProjectFile = useCallback(async () => {
     try {
@@ -6235,7 +6372,7 @@ export default function App(): ReactElement {
         window.alert('파일이 올바른 JSON이 아닙니다.')
         return
       }
-      applyAutosubPayload(r.path, parsed)
+      await applyAutosubPayload(r.path, parsed)
     } catch (e) {
       window.alert(e instanceof Error ? e.message : String(e))
     }
@@ -6261,7 +6398,7 @@ export default function App(): ReactElement {
           window.alert('파일이 올바른 JSON이 아닙니다.')
           return
         }
-        applyAutosubPayload(pathForRef, parsed)
+        await applyAutosubPayload(pathForRef, parsed)
       } catch (e) {
         window.alert(e instanceof Error ? e.message : String(e))
       }
@@ -6506,10 +6643,14 @@ export default function App(): ReactElement {
     window.addEventListener('mouseup', onUp)
   }, [])
 
-  const projectFileUiDisabled = !modelReady || busy || isExtracting
+  const projectFileUiDisabled = !modelReady || busy || isExtracting || projectIoBusy
 
   return (
     <div className="app">
+      {projectMediaNotice ? <div className="app-gpu-install-banner" role="status" data-testid="project-media-notice">
+        <p className="app-gpu-install-banner-text">{projectMediaNotice}</p>
+        {!videoPath && projectMediaRef.current.path ? <button type="button" disabled={projectIoBusy} onClick={relinkProjectMedia}>원본 영상 연결</button> : null}
+      </div> : null}
       {gpuInstallBanner ? (
         <div className="app-gpu-install-banner" role="alert">
           <p className="app-gpu-install-banner-text">{gpuInstallBanner}</p>
@@ -6526,6 +6667,14 @@ export default function App(): ReactElement {
         <header className="app-topbar">
           <h1 className="app-title">AutoSubtitle</h1>
           <div className="app-topbar-actions">
+            <label className="preview-export-word-highlight">추출 싱크
+              <select aria-label="추출 싱크 정밀도" value={alignmentMode} disabled={isExtracting || busy}
+                onChange={event => setAlignmentMode(event.target.value as 'accurate' | 'fast')}
+                title="다음 영상 추출에 적용됩니다. 정밀 모드는 음성 모델로 단어 경계를 다시 찾으며 시간이 더 걸립니다.">
+                <option value="accurate">정밀 정렬</option>
+                <option value="fast">빠른 추정</option>
+              </select>
+            </label>
             <div className="app-topbar-project-actions">
               <button
                 type="button"
@@ -6700,6 +6849,7 @@ export default function App(): ReactElement {
               </div>
             </div>
             <div className="preview-subtitle-export-actions">
+                {exportNotice && <p role="status" className="text-xs">{exportNotice}</p>}
                 <select
                   className="preview-export-format"
                   value={exportFormat}
@@ -6955,6 +7105,15 @@ export default function App(): ReactElement {
               <header className="subtitle-panel-head">
                 <div className="subtitle-panel-head-top">
                   <h2 className="subtitle-panel-title">자막</h2>
+                  <button type="button" className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
+                    disabled={!videoPath || !subtitles.length || isExtracting || projectIoBusy} onClick={realigning ? cancelRealignment : () => void realignCurrentLine()}>
+                    {realigning ? '정렬 취소' : '현재 줄 싱크 재정렬'}
+                  </button>
+                  <button type="button" className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
+                    disabled={!subtitles.length || isExtracting || projectIoBusy}
+                    onClick={() => { pausePlayback('reading'); setReadingLineIndex(waveformLineIndex ?? activeSubtitleIndexRef.current ?? 0) }}>
+                    발음 입력
+                  </button>
                   {subtitles.length > 0 ? (
                     <div className="subtitle-panel-actions" role="group" aria-label="자막 일괄 편집">
                       <button
@@ -6982,10 +7141,16 @@ export default function App(): ReactElement {
                   ) : null}
                 </div>
                 <p className="subtitle-panel-sub">
+                  <span role="status">{alignmentNotice}</span>
                   <strong>단어 더블클릭</strong> 해당 줄 단어 아래 파동 편집 · <strong>Enter</strong> 줄바꿈 ·{' '}
                   <strong>Ctrl+Enter</strong> 자막 분할 · 빈 칸에서 <strong>Backspace</strong> 이전과 병합 ·{' '}
                   <strong>Tab</strong> / <strong>Shift+Tab</strong> 다른 줄로 이동
                 </p>
+                {readingLineIndex !== null && subtitles[readingLineIndex] ? <WordReadingEditor
+                  key={`${projectGenerationRef.current}:${readingLineIndex}`} line={subtitles[readingLineIndex]} lineIndex={readingLineIndex}
+                  onApply={applyWordReading} onClose={() => setReadingLineIndex(null)}
+                  onRealign={() => void realignCurrentLine(readingLineIndex)}
+                  realignDisabled={!videoPath || realigning || isExtracting || projectIoBusy} /> : null}
                 {timelineAxisMismatch ? (
                   <p
                     className="subtitle-panel-sub"

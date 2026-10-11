@@ -425,7 +425,7 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 }
 
 /** 프로젝트 JSON·외부 스키마(start_time/end_time 등) 호환 */
-export function parseVirtualTimeline(raw: unknown): VirtualTimelineBlock[] {
+export function parseVirtualTimeline(raw: unknown, preserveTimes = false): VirtualTimelineBlock[] {
   if (!Array.isArray(raw)) return []
   const out: VirtualTimelineBlock[] = []
   for (const item of raw) {
@@ -447,8 +447,8 @@ export function parseVirtualTimeline(raw: unknown): VirtualTimelineBlock[] {
     const isSilence = item.isSilence === true || item.is_silence === true
     const block: VirtualTimelineBlock = {
       id,
-      mediaStartSec: snapTimelineSec(start),
-      mediaEndSec: snapTimelineSec(end),
+      mediaStartSec: preserveTimes ? start : snapTimelineSec(start),
+      mediaEndSec: preserveTimes ? end : snapTimelineSec(end),
       text,
       isDeleted
     }

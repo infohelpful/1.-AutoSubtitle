@@ -1,5 +1,82 @@
 # AutoSubtitle 데스크톱 — 미해결 문제 인계서
 
+## 2026-10-12 새벽 재개 결과 (최신)
+
+HEAD `951990b`에서 이전 미커밋 변경을 보존하고 이어서 작업했다. 아래 이전 절의 미완료 목록 중 **프로젝트 v2, 발음 입력 UI, 긴 줄 분할, 수정 문장 어절 재분할**을 이번에 진행했다.
+
+### 완료·검증
+
+- **프로젝트 v2 / v1 migration**: v1 시간은 그대로 유지하고 상태 없는 단어만 estimated/legacy_project로 가져온다. 기존 v1 확장에 저장된 aligned/manual 메타는 보존한다. 열기만 해서는 재정렬·파일 덮어쓰기를 하지 않는다. 신규/중복 발화 ID를 편집 진입점에서 보완하며, 재분할 자식은 parentWordId를 보존한다.
+- 저장 왕복에서 빈 글자 슬롯, 줄/단어 tombstone, mergedByEdgeTrim, splitChain, 수동 lock, 정렬 문자·발음 map, 단어 강조 활성/색상 보존. 이전 parser가 빈 슬롯과 편집 플래그를 버리던 경로 수정. 잘못된 자막/컷/타임라인을 조용히 누락시키지 않고 열기를 거부한다.
+- **원본 전체 SHA-256**: 새 영상 선택 시 식별 계산을 시작하고 프로젝트에 저장한다. v2를 열 때 원본 내용 비교, 불일치/누락이면 자막·컷을 보존한 채 영상 재생/정렬/내보내기를 보류한다. `원본 영상 연결`에서 동일 내용의 이동된 파일을 허용한다. 기존 v1에는 비교 근거가 없음을 안내하고 현재 파일을 기준으로 삼는다. 파일을 연 뒤 외부에서 바뀌는 상황을 계속 감시하는 기능은 아니다.
+- **저장 안전성**: JSON 검증 → 같은 폴더 임시 파일 → flush → rename. 실패 시 이전 프로젝트를 보존하고 임시 파일 정리. 새 영상을 드롭할 때 이전 프로젝트 저장 경로를 해제한다.
+- 실앱 테스트에서 발견한 추가 오류: `videoPath=null`이면 자막/컷도 초기화하던 effect를 수정했다. 원본 연결 보류 상태에서도 편집 데이터가 남는다.
+- **발음 입력**: 현재 줄에서 단어를 선택하고 실제 읽기를 지정/초기화한다. 자막 표기/시간/ID는 유지하며 stale 처리. 해당 줄 정렬 버튼 연결. 작은 창에서도 입력 패널 버튼에 접근할 수 있게 위치/스크롤 조정.
+- 발음·lock·품질 등 메타데이터만 달라지면 편집을 무시하던 비교 함수를 수정했다. 정렬 결과의 시간이 같아도 품질 변경을 적용하고 Undo/Redo에 남긴다. 실패한 재정렬이 이전 charSpans를 되살리던 merge도 수정했다.
+- **수정 문장 어절 분할**: 재정렬 요청에서 공백으로 분리한 자식에 ID를 부여한다. 실제 측정 시간이 모두 확보된 경우에만 원래 슬롯을 자식들로 교체한다. 일부 미정렬/역전이면 원래 문구와 시간을 유지하고 retokenization_unaligned 사유를 남긴다. 수동 시작 lock은 첫 자식, 끝 lock은 마지막 자식에 유지. 전체 슬롯의 명시적 발음 override가 있으면 임의로 쪼개지 않는다.
+- **30초 초과 줄**: ASR 단어 시간 기준 최대 24초 core + 인접 단어 overlap, 모델 입력은 최대 30초. 단어당 core 출력 1회. overlap 추정 차이가 200ms 초과하거나 연결 순서가 뒤집히면 chunk_boundary_conflict로 원래 시간 복원. 긴 단일 슬롯/잘못된 시간 anchor는 여전히 미정렬로 남긴다. VAD 기반 장시간 파일 스트리밍은 아니다.
+- **최초 추출 정밀도 UI**: `추출 싱크`에서 정밀 정렬/빠른 추정을 선택하고 설정을 유지한다. 기본은 정밀. 개발 환경 `.venv-alignment` 자동 탐색을 최초 전사에도 연결했다. runtime 부재/한국어 외 전사는 사유를 남기고 RMS 추정으로 fallback한다. 배포용 정렬 runtime 자동 설치는 아직 없다.
+
+### 측정 결과와 재현
+
+- 전체 Vitest **43 files / 287 tests**, Python **31 tests**, web/node 타입 검사 0 errors, production build, diff 공백 검사 통과.
+- `project-roundtrip.mjs 2`: v1 열기 → 글자 전체 삭제 → v2 저장/재열기 → 재입력, ID/시간/강조 설정 보존. 다른 영상 차단 → 잘못된 재연결 거부 → 동일 원본 복사본 연결, 누락 원본 재연결 통과. 데이터 손실 effect를 찾은 뒤 재실행했다.
+- `reading-and-retokenize.mjs`: 실제 영상 마지막 줄의 `3배`에 테스트 읽기 `세배` 입력 → 메타만 변경된 Undo/Redo → 실제 WhisperX 정렬 → 표시 3배 유지 확인. 이어 문장 전체 삭제/재입력 → 실제 측정 어절 분할 → 저장 JSON 기준 전체 Undo/Redo 동일성 통과. 사람 청취 정답으로 발음을 확정한 테스트는 아니다.
+- `validate-long-alignment.py`: 기존 raw 128단어를 63.86초 한 줄로 합쳐 3개 window로 분석. 단어 ID/문자/개수 보존. **121 aligned / 7 unaligned**, 그중 `스넥크래프트입니다.` 1개는 chunk_boundary_conflict. 정렬된 비율은 정확도 수치가 아니다.
+- 최초 추출 E2E: 정렬 관련 환경변수를 비운 일반 Electron에 실제 영상을 drag/drop. UI 기본 accurate → requested/applied 모두 whisperx, CPU **40,083ms**, **122/128 aligned, 6 unaligned, reviewWords 8**. 원본 영상은 변경하지 않았다.
+- 결과(모두 git 제외): `tools/sync-validation-output/project-v2-e2e-2.autosub`, `reading-result-2.autosub`, `real-video-long-alignment.json`, `real-video-accurate-ui-default.json`, `resume-final-vitest.log`, `resume-final-build.log`.
+- 프로젝트 E2E launcher: `AUTOSUBTITLE_E2E_SAVE_PROJECT`는 새 `.autosub` 출력, `AUTOSUBTITLE_E2E_OPEN_QUEUE`는 대화상자 선택 경로 JSON 배열. project-roundtrip 순서: legacy fixture, saved project, project-mismatch.autosub, project-wrong.mp4, project-copy.mp4, project-missing.autosub, project-copy.mp4. 모두 `tools/sync-validation-output` 내부다. `reading-and-retokenize.mjs`는 `3배`가 있는 마지막 줄만 넣은 `reading-fixture.autosub`와 새로운 저장 출력이 필요하다. 기존 출력 덮어쓰기를 막으므로 재실행 시 새 파일명을 쓴다.
+
+### 다음 작업 (미완료)
+
+1. 모델 사전 미지원 `캡`/`둡` 해결 및 한국어 모델 후보 비교. 발음 UI는 존재하지만 유사 음절로 임의 대체하는 해결은 하지 않았다. 사람 정답 기준 median/p95·CER/WER, 20 clips/30분/1,000 boundaries 합격 기준 미달.
+2. 최초 전사·RMS·waveform·WebAudio의 **nonzero A/V PTS 공통 원점**. 현재 부분 정렬/내보내기는 probe 원점을 쓰지만 나머지는 디코더 기준이 달라질 수 있다. 사용자 테스트 영상의 원점은 0이므로 이 문제 검증을 대신하지 않는다.
+3. 긴 파일 오디오 스트리밍/취소 부하, 긴 단일 편집 슬롯과 잘못된 ASR anchor 처리, 임의 word-ID 선택 정렬. 현재는 줄 단위 UI이며 전체 오디오를 한 번 decode한다.
+4. 설치본 alignment runtime/model 다운로드·의존성·GPU/오프라인 새 설치 검증. 개발 `.venv-alignment` 자동 탐색은 배포 완료가 아니다.
+5. 4K/SAR/회전/DPI/멀티라인·컷을 포함한 실제 UI export 픽셀/음성 비교, 실제 Windows 한글 IME·장문 성능, 전체 ID 수명/저장/undo의 모든 편집 조합. 이번 테스트는 구체적 저장·재분할 경로까지 검증한 것이다.
+
+작업은 로컬 미커밋 상태이며 배포하지 않았다. 기존 pyc 변경은 그대로 보존했다. 사용량 잔여가 낮아 새 범위를 시작하지 않고 현 작업 검증·기록을 마무리했다. reset credit은 사용하지 않았다.
+
+---
+
+## 2026-10-11 저녁 재개 결과 (최신)
+
+이번 재개 기준 HEAD는 `951990b`이다. 아래 이전 인계의 일부 미완료 항목을 다음과 같이 진행했다.
+
+### 완료·검증
+
+- **부분 재정렬 IPC/UI**: `realign_words`, `alignment:realign/cancel`, preload 타입, `현재 줄 싱크 재정렬`/`정렬 취소` 버튼 연결. 펼친 파형 줄 또는 재생 헤드의 현재 줄을 대상으로 한다. ASR 모델을 재전사하지 않는 별도 sidecar/worker를 사용한다.
+- 요청 ID·영상 ID·revision·자막 snapshot을 검증한다. 응답 대기 중 수정/영상 전환 시 적용하지 않는다. 한 번의 undo transaction으로 적용하며 수동 경계·기존 단어 ID·무음/삭제 슬롯을 보존한다. worker의 단어 수/문자/ID/유효 시간/수동 경계도 검증한다.
+- **취소/timeout**: PythonSidecar가 Promise만 종료하던 경로를 수정. Windows `taskkill /PID <앱이 생성한 PID> /T /F`, POSIX process group 종료로 자식 정렬/FFmpeg까지 종료한다. 대기열 취소와 이전 프로세스의 늦은 close 이벤트 차단. 실제 child PID 종료 테스트 통과.
+- **숫자 발음 대응**: `alignment_text.py`에서 표시 문자열↔발음 문자열 범위 매핑. `1초만에→일초만에`, `5종을→오종을`을 실제 모델로 확인했다. 숫자 카운터·날짜·식별자·`3배`처럼 모호한 읽기는 추정하지 않는다. 읽기 override는 RPC 데이터 계약만 지원하며 별도 입력 UI는 아직 없다.
+- 정렬 문자 구간/표기 매핑을 TypeScript parser와 단어 메타에 보존. 글자 수정 시 이전 charSpans/map/발음은 무효화한다. 수동 경계와 모델 source 추정치를 분리하도록 Python 보완.
+- **내보내기**: 처음 1초 검사 → 전체 A/V decode 검사로 변경. 비동기·취소·timeout 지원. 처음 1초는 정상인데 뒤가 손상된 파일로 회귀 검증. 완료/실패 메시지를 앱 화면에 표시한다.
+- **추가 편집 오류**: 문장 전체 삭제→재입력 시 칩이 되살아나지 않던 경우 수정. 기존 source 슬롯/오디오 시간을 보존한다.
+
+### 실제 영상 검증
+
+- 기존 raw 전사문으로 오프라인 WhisperX 재검사: **128개 중 122개 aligned, 6개 unaligned, coverage 95.3125%**. 이전 120/128에서 숫자 2개 개선. 숫자 정규화 2개는 사유를 남겨 reviewWords는 8개다. 사람 정답 기준 정확도는 여전히 미측정이다.
+- 미정렬 사전 원인: `캡쳐…`는 **‘캡’이 모델 사전에 없음**(‘쳐’는 있음), `모아둡니다`는 ‘둡’ 미지원. 비슷한 음절로 임의 대체하지 않았다. `3배`는 읽기 모호성+숫자 미지원.
+- `realign-and-export.mjs`: 취소 → 정렬 중 텍스트 편집 → 오래된 응답 폐기 → 텍스트 Undo → 정상 재정렬 → 단어 강조 영상 내보내기 모두 통과. `realign-undo.mjs`로 정렬 전체 Undo/Redo도 통과.
+- 파일 선택 대화상자 결과만 테스트 fixture/output으로 고정했다. 실제 renderer 버튼·preload·main·Python worker·offscreen 렌더·FFmpeg 경로를 사용했다. 원본 영상은 수정하지 않았다.
+- 출력 `tools/sync-validation-output/real-ui-export-2_AutoSubtitle.mp4`: H264 1920×1080, AAC 48kHz, **64.266667초**, 전체 decode 통과. 첫 출력의 0.5초 캡처에서 ‘자료를’ 노란 강조를 육안 확인 (`real-ui-frame.png`). 전 구간 자막 정확도 수동 검증은 아니다.
+- 결과 JSON `real-video-normalized.json`, E2E 로그 `realign-export-e2e-final.log`, 전체 검사 `continue-*-final.log` (모두 tools/sync-validation-output, git 제외).
+- 최종 자동 검사: Vitest 39 files/273 tests, Python 25 tests, web/node 타입 및 build 통과.
+- E2E 재현: build 후 `AUTOSUBTITLE_E2E_PROJECT`를 fixture `.autosub` 절대경로, `AUTOSUBTITLE_E2E_OUTPUT`을 존재하지 않는 output `.mp4` 절대경로로 설정한다. 둘 다 `tools/sync-validation-output` 내부여야 한다. Electron 진입점을 `scripts/e2e-cdp/launch-test-app.cjs`로, 포트를 9333으로, user-data-dir을 별도 테스트 폴더로 실행한 뒤 `node scripts/e2e-cdp/realign-and-export.mjs`, 이어서 `node scripts/e2e-cdp/realign-undo.mjs`를 실행한다. 결과 이름에는 앱이 `_AutoSubtitle`을 덧붙인다. 기존 출력은 덮어쓰지 않는 새 이름을 사용한다.
+
+### 남은 우선 작업
+
+1. 사전 미지원 한국어 음절·모호한 숫자를 처리할 모델/읽기 입력 UI, 사람이 표기한 경계로 median/p95·CER/WER 측정.
+2. 현재는 **줄 단위·기존 단어 슬롯 재정렬**이다. 새 문장 어절 재분할, 임의 word-ID 선택, 30초 초과 chunk/overlap 미완료.
+3. 프로젝트 v2·v1 migration·미디어 fingerprint, 전체 ID 수명/저장/undo 검증. char/map은 기존 v1 필드 확장으로 보존하지만 v2 구현은 아니다.
+4. 최초 전사 경로의 nonzero A/V PTS·RMS·waveform 공통 원점 처리. 이번 부분 재정렬에는 probe의 sourceOriginSec을 전달했다.
+5. 설치본 정렬 runtime 배포/의존성/모델 다운로드 UI·GPU·오프라인 새 설치. 개발 중에는 환경변수 또는 `.venv-alignment`를 사용한다.
+6. 4K/SAR/회전/DPI/멀티라인·컷 포함 실앱 export 픽셀/음성 비교, 실제 Windows 한글 IME·긴 문장 성능. 기존 36조합 재생 회귀 검증 기록은 이전 절 참조.
+
+변경은 로컬 저장이며 이번 재개 변경은 아직 커밋/배포하지 않았다. 기존 pyc 변경을 보존했고 reset credit은 사용하지 않았다.
+
+---
+
 ## 2026-10-11 Codex 재점검 갱신 (아래 최초 인계보다 우선)
 
 - P0-1/2 수정: 클릭 시 정지→이동을 한 경로로 처리. 캐럿 포커스를 다음 프레임까지 미루어 즉시 Space가 이전 단어로 전달되던 문제 수정. 오래된 decode/resume/seek 완료와 pause 이벤트가 새 재생을 덮어쓰지 않게 요청 세대 검사 추가.

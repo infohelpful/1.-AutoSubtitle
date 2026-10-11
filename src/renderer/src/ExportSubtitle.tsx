@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { Fragment, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { flushSync } from 'react-dom'
 
 import type { ExportSubtitleUpdatePayload } from '../../shared/ipc'
@@ -180,7 +180,14 @@ function mergeUpdate(prev: ExportSubtitleUpdatePayload, raw: Partial<ExportSubti
 
     x: raw.x ?? prev.x,
 
-    y: raw.y ?? prev.y
+    y: raw.y ?? prev.y,
+
+    // 단어 강조 상태는 프레임마다 완전히 교체한다 — 이전 프레임의 강조가 남지 않게 prev 를 쓰지 않는다.
+    words: raw.words,
+
+    activeIndex: raw.activeIndex ?? -1,
+
+    wordHighlightColor: raw.wordHighlightColor ?? prev.wordHighlightColor
 
   }
 
@@ -418,6 +425,12 @@ export default function ExportSubtitle(): JSX.Element {
 
   }, [])
 
+  // 줄 텍스트와 단어 조각이 어긋나면 강조 위치를 보장할 수 없으므로 일반 렌더로 돌아간다.
+  const highlightWords =
+    data.wordHighlightColor && data.words && data.words.length > 0 && data.words.join(' ') === data.text
+      ? data.words
+      : null
+
   return (
 
     <div className="export-subtitle-root">
@@ -430,7 +443,25 @@ export default function ExportSubtitle(): JSX.Element {
 
             <p className="export-subtitle-plain" style={previewSubtitleTextStyle}>
 
-              {data.text}
+              {highlightWords ? (
+
+                highlightWords.map((piece, i) => (
+
+                  <Fragment key={i}>
+
+                    {i > 0 ? ' ' : null}
+
+                    <span style={i === data.activeIndex ? { color: data.wordHighlightColor } : undefined}>{piece}</span>
+
+                  </Fragment>
+
+                ))
+
+              ) : (
+
+                data.text
+
+              )}
 
             </p>
 

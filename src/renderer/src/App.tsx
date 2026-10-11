@@ -1559,6 +1559,9 @@ export default function App(): ReactElement {
   const [showBurnEncoderUi, setShowBurnEncoderUi] = useState(false)
   const videoBurnExportRef = useRef(false)
   const [exportFormat, setExportFormat] = useState<ExportFormat>('video')
+  /** 영상 번인에서 현재 발화 단어를 강조 — 줄 단위 자막은 그대로 유지(기본 꺼짐) */
+  const [wordHighlightEnabled, setWordHighlightEnabled] = useState(false)
+  const [wordHighlightColor, setWordHighlightColor] = useState('#ffd54a')
   /** false면 subtitleLinesToVrewRows 가 단어 간 gap-fill(무음 더미)을 넣지 않음 — 편집 후 타임라인 덮어쓰기 방지 */
   const [gapFillWhenBuildingVrew, setGapFillWhenBuildingVrew] = useState(false)
   const [masterAudioSrcUrl, setMasterAudioSrcUrl] = useState<string | undefined>(undefined)
@@ -5997,7 +6000,9 @@ export default function App(): ReactElement {
         const res = await window.api.exportByFormat({
           inputPath: videoPath,
           format: exportFormat,
-          subtitles: buildExportCueLines(subtitles),
+          subtitles: buildExportCueLines(subtitles, {
+            includeWords: exportFormat === 'video' && wordHighlightEnabled
+          }),
           cutRanges,
           subtitleStyle: {
             fontFamily: subtitleFontFamily,
@@ -6012,7 +6017,10 @@ export default function App(): ReactElement {
             x: subtitleX,
             y: subtitleY,
             videoWidth: videoNaturalSize.width,
-            videoHeight: videoNaturalSize.height
+            videoHeight: videoNaturalSize.height,
+            ...(exportFormat === 'video' && wordHighlightEnabled
+              ? { wordHighlightColor }
+              : {})
           }
         })
         if (res.canceled) {
@@ -6052,7 +6060,9 @@ export default function App(): ReactElement {
     subtitles,
     videoNaturalSize.height,
     videoNaturalSize.width,
-    videoPath
+    videoPath,
+    wordHighlightColor,
+    wordHighlightEnabled
   ])
 
   const buildAutosubProjectJson = useCallback((): string => {
@@ -6671,6 +6681,27 @@ export default function App(): ReactElement {
                     </option>
                   ))}
                 </select>
+                {exportFormat === 'video' ? (
+                  <label
+                    className="preview-export-word-highlight"
+                    title="영상에 자막을 입힐 때 지금 말하는 단어를 선택한 색으로 강조합니다. 말하지 않는 구간에서는 강조가 꺼집니다."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={wordHighlightEnabled}
+                      onChange={(e) => setWordHighlightEnabled(e.target.checked)}
+                      disabled={isExporting || isExtracting}
+                    />
+                    <span>단어 강조</span>
+                    <input
+                      type="color"
+                      value={wordHighlightColor}
+                      onChange={(e) => setWordHighlightColor(e.target.value)}
+                      disabled={!wordHighlightEnabled || isExporting || isExtracting}
+                      aria-label="단어 강조 색"
+                    />
+                  </label>
+                ) : null}
                 <button
                   type="button"
                   className="app-topbar-gpu-btn preview-export-btn"

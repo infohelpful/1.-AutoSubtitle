@@ -30,6 +30,24 @@ export function getBundledFfmpegPath(): string {
   return join(getFfmpegUserBinDir(), name)
 }
 
+/** Older installs downloaded only ffmpeg. Upgrade lazily when a precise probe is needed. */
+export async function ensureFfprobeExecutable(ffmpegPath: string): Promise<string> {
+  const name = process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe'
+  const sibling = join(ffmpegPath, '..', name)
+  const cached = join(getFfmpegUserBinDir(), name)
+  for (const candidate of [sibling, cached, name]) {
+    const probe = spawnSync(candidate, ['-version'], { windowsHide: true, timeout: 10_000 })
+    if (!probe.error && probe.status === 0) return candidate
+  }
+  mkdirSync(getFfmpegUserBinDir(), { recursive: true })
+  await new Promise<void>((resolve, reject) => {
+    ffbinaries.downloadBinaries(['ffprobe'], { destination: getFfmpegUserBinDir(), quiet: true }, (err) => err ? reject(err) : resolve())
+  })
+  const probe = spawnSync(cached, ['-version'], { windowsHide: true, timeout: 10_000 })
+  if (probe.error || probe.status !== 0) throw new Error('ffprobe 준비에 실패했습니다.')
+  return cached
+}
+
 export function systemFfmpegWorks(): boolean {
   try {
     const cmd = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'

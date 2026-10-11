@@ -44,8 +44,16 @@ export type CutRange = {
 
 export type ExportVideoRequest = {
   inputPath: string
-  subtitles: Array<{ start: number; end: number; text: string }>
+  subtitles: Array<{
+    start: number
+    end: number
+    text: string
+    /** 단어 강조 버닝용 발화 구간(원본 시간) — `ExportSubtitleStyle.wordHighlightColor` 가 있을 때만 쓴다 */
+    words?: Array<{ start: number; end: number; text: string }>
+  }>
   cutRanges: CutRange[]
+  /** Optional explicit source clip order; when present it replaces cutRanges. */
+  clipPlan?: import('./clipPlan').ProgramClip[]
 }
 
 export type ExportSubtitleStyle = {
@@ -63,6 +71,8 @@ export type ExportSubtitleStyle = {
   y: number
   videoWidth?: number
   videoHeight?: number
+  /** 지정하면 영상 버닝에서 현재 발화 단어를 이 색으로 강조한다(미지정이면 줄 단위 자막만). */
+  wordHighlightColor?: string
 }
 
 /** 오프스크린 자막 창 → 메인: 폰트·레이아웃 반영 후에만 `capturePage` 하도록 동기화 */
@@ -73,6 +83,10 @@ export type ExportSubtitleUpdatePayload = {
   text: string
   width: number
   height: number
+  /** 단어 강조 렌더 — `words.join(' ') === text`. 없으면 `text` 를 그대로 그린다. */
+  words?: string[]
+  /** `words` 안의 활성 인덱스, 없으면 -1 */
+  activeIndex?: number
 } & Omit<ExportSubtitleStyle, 'videoWidth' | 'videoHeight'>
 
 /** PNG 시퀀스 캡처 후 Python 등으로 넘길 때 사용하는 정리된 형태 */

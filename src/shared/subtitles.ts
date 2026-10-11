@@ -5,9 +5,12 @@ import {
   shouldOmitFromSubtitleEditLineText,
   SILENCE_PLACEHOLDER_TEXT
 } from './wordContract'
+import { parseWordAlignmentMeta, type WordAlignmentMeta } from './wordAlignmentMeta'
 
 /** Python 사이드카(Faster-Whisper) 및 UI 공통 자막 줄 형식 */
-export type SubtitleWord = {
+export type SubtitleWord = SubtitleWordCore & WordAlignmentMeta
+
+type SubtitleWordCore = {
   /**
    * 원본 미디어 파일 기준 절대 시각(초). EDL 정책: 삭제·리플로 절대 바뀌지 않음.
    * 편집(프로그램) 축 시간이 필요한 곳(Peaks 줌·세그먼트)은 `mapMediaToEditSec` 같은
@@ -88,6 +91,25 @@ export function displayTextFromSubtitleWords(
     .filter((piece) => piece.length > 0 && !shouldOmitFromSubtitleEditLineText(piece))
     .join(' ')
     .trim()
+}
+
+/**
+ * 내보내기 단어 강조용 — `displayTextFromSubtitleWords` 가 줄 문자열에 쓰는 것과 **같은 조각**을 시간과 함께 돌려준다.
+ * (`pieces.map(p => p.text).join(' ')` 가 `displayTextFromSubtitleWords(words)` 와 같다.)
+ */
+export type SubtitleWordPiece = { start: number; end: number; text: string }
+
+export function subtitleWordPiecesForExport(
+  words: readonly SubtitleWord[] | undefined
+): SubtitleWordPiece[] {
+  if (!words || words.length === 0) return []
+  const out: SubtitleWordPiece[] = []
+  for (const w of visibleSubtitleWords(words)) {
+    const text = scrubTimelineNoiseFromWordPiece(w.word)
+    if (text.length === 0 || shouldOmitFromSubtitleEditLineText(text)) continue
+    out.push({ start: w.start, end: w.end, text })
+  }
+  return out
 }
 
 function normSubtitleLineEdit(s: string): string {
@@ -369,6 +391,8 @@ export function parseSubtitleLines(raw: unknown): SubtitleLine[] {
       }
       if (isSilence) entry.isSilence = true
       if (isDeleted) entry.isDeleted = true
+      // 무음 더미는 정렬 상태를 갖지 않는다.
+      if (!isSilence) Object.assign(entry, parseWordAlignmentMeta(w))
       words.push(entry)
     }
     if (!Number.isFinite(start) || !Number.isFinite(end)) continue

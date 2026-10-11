@@ -33,6 +33,7 @@ import {
 import type { SubtitleRow } from './components/vrewPeaksEditor/types'
 import { computeLineZoomWindowFromCardBounds, type LineZoomWindowResult } from './lineZoomWindow'
 import type { PeaksZoomViewRange } from './SubtitleWaveformPeaks'
+import { isTimeInWordSpan, resolveActiveWordIndex } from '../../shared/activeWordResolver'
 import { scrubTimelineNoiseFromWordPiece } from '../../shared/wordContract'
 import { useSubtitleData } from './subtitleDataContext'
 import { peaksJsonRawDataLength } from './wordCanvas/peaksSentenceSlice'
@@ -852,7 +853,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       const s = parseFloat(el.dataset.wordStart ?? el.getAttribute('data-word-start') ?? 'NaN')
       const e = parseFloat(el.dataset.wordEnd ?? el.getAttribute('data-word-end') ?? 'NaN')
       if (!Number.isFinite(s) || !Number.isFinite(e)) return
-      el.classList.toggle('subtitle-word-chip--active', playing && t >= s && t < e)
+      el.classList.toggle('subtitle-word-chip--active', playing && isTimeInWordSpan(t, s, e))
     })
   }, [wordRail, index, playheadSecRef])
 
@@ -861,7 +862,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     const id = window.setInterval(() => {
       const playheadSec = playheadSecRef.current
       const words = wordRail
-      const wi = words.findIndex((w) => playheadSec >= w.start && playheadSec < w.end)
+      const wi = resolveActiveWordIndex(words, playheadSec, { skipDeleted: false, skipSilence: false })
 
       const root = articleRef.current
       const focused = document.activeElement as HTMLElement | null
@@ -1114,7 +1115,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     for (let i = 0; i < subs.length; i++) {
       const w = subs[i]!
       if (w.isDeleted === true) continue
-      if (playheadSec >= w.start && playheadSec < w.end) return i
+      if (isTimeInWordSpan(playheadSec, w.start, w.end)) return i
     }
     // 그 외 — playhead 앞에 처음 오는 보이는 단어
     for (let i = 0; i < subs.length; i++) {
@@ -1149,7 +1150,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     for (let i = 0; i < subs.length; i++) {
       const w = subs[i]!
       if (w.isDeleted === true) continue
-      if (playheadSec >= w.start && playheadSec < w.end) {
+      if (isTimeInWordSpan(playheadSec, w.start, w.end)) {
         snap = i
         break
       }

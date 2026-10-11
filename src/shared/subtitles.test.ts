@@ -5,6 +5,7 @@ import {
   mergeConsecutiveSilenceWords,
   mergeConsecutiveSilenceWordsInLine,
   normalizeSilenceWordsForLineWords,
+  parseSubtitleLines,
   subtitleLineEditDisplayText,
   subtitleCueLinesForExport
 } from './subtitles'
@@ -246,5 +247,62 @@ describe('subtitleCueLinesForExport', () => {
   it('passes through lines without words using line text', () => {
     const cues = subtitleCueLinesForExport([{ start: 1, end: 3, text: 'plain', words: undefined }])
     expect(cues).toEqual([{ start: 1, end: 3, text: 'plain' }])
+  })
+})
+
+describe('parseSubtitleLines alignment metadata', () => {
+  const payload = [
+    {
+      start: 0,
+      end: 2,
+      text: '안녕 하세요',
+      words: [
+        {
+          start: 0,
+          end: 1,
+          word: '안녕',
+          id: 'seg-0:word:0',
+          alignmentStatus: 'aligned',
+          alignmentScore: 0.8,
+          sourceStart: 0,
+          sourceEnd: 1,
+          rawStart: 0.1,
+          rawEnd: 1.1,
+          engine: 'whisperx',
+          modelRevision: 'rev'
+        },
+        { start: 1, end: 2, word: '하세요', alignmentStatus: 'unaligned', sourceStart: null, sourceEnd: null }
+      ]
+    }
+  ]
+
+  it('preserves ids, status and engine estimates', () => {
+    const [line] = parseSubtitleLines(payload)
+    expect(line!.words![0]).toMatchObject({
+      id: 'seg-0:word:0',
+      alignmentStatus: 'aligned',
+      sourceStart: 0,
+      rawStart: 0.1,
+      engine: 'whisperx'
+    })
+    expect(line!.words![1]).toMatchObject({ alignmentStatus: 'unaligned', sourceStart: null })
+  })
+
+  it('round-trips through JSON without losing metadata', () => {
+    const once = parseSubtitleLines(payload)
+    const twice = parseSubtitleLines(JSON.parse(JSON.stringify(once)))
+    expect(twice).toEqual(once)
+  })
+
+  it('leaves legacy words without a status', () => {
+    const [line] = parseSubtitleLines([{ start: 0, end: 1, text: 'a', words: [{ start: 0, end: 1, word: 'a' }] }])
+    expect(line!.words![0]!.alignmentStatus).toBeUndefined()
+  })
+
+  it('does not attach alignment state to silence placeholders', () => {
+    const [line] = parseSubtitleLines([
+      { start: 0, end: 1, text: '', words: [{ start: 0, end: 1, word: '--', isSilence: true, alignmentStatus: 'aligned' }] }
+    ])
+    expect(line!.words![0]!.alignmentStatus).toBeUndefined()
   })
 })

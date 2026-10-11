@@ -49,3 +49,49 @@ describe('mergeVrewRowsIntoSubtitleLines', () => {
     expect(merged[0]!.words?.some((w) => w.isDeleted)).not.toBe(true)
   })
 })
+
+describe('alignment metadata through Peaks edits', () => {
+  const aligned = {
+    start: 1,
+    end: 2,
+    word: '안녕',
+    id: 'seg-0:word:0',
+    alignmentStatus: 'aligned' as const,
+    alignmentScore: 0.9,
+    sourceStart: 1,
+    sourceEnd: 2
+  }
+  const prev = [{ start: 1, end: 3, text: '안녕 하세요', words: [aligned, { start: 2, end: 3, word: '하세요' }] }]
+
+  it('keeps ids and aligned status when rows come back unchanged', () => {
+    const rows = subtitleLinesToVrewRows(prev, { gapFill: false })
+    const merged = mergeVrewRowsIntoSubtitleLines(prev, rows)
+    expect(merged[0]!.words![0]).toMatchObject({ id: 'seg-0:word:0', alignmentStatus: 'aligned', sourceEnd: 2 })
+    expect(merged[0]!.words![0]!.manualStartLocked).toBeUndefined()
+  })
+
+  it('locks a dragged edge as manual and keeps the engine estimate', () => {
+    const rows = subtitleLinesToVrewRows(prev, { gapFill: false })
+    const edited = rows.map((r) => ({
+      ...r,
+      words: r.words.map((w, i) => (i === 0 ? { ...w, end: 2.25 } : w))
+    }))
+    const merged = mergeVrewRowsIntoSubtitleLines(prev, edited)
+    expect(merged[0]!.words![0]).toMatchObject({
+      alignmentStatus: 'manual',
+      manualEndLocked: true,
+      end: 2.25,
+      sourceEnd: 2
+    })
+  })
+
+  it('marks an aligned word stale when its text changes', () => {
+    const rows = subtitleLinesToVrewRows(prev, { gapFill: false })
+    const edited = rows.map((r) => ({
+      ...r,
+      words: r.words.map((w, i) => (i === 0 ? { ...w, text: '안녕하' } : w))
+    }))
+    const merged = mergeVrewRowsIntoSubtitleLines(prev, edited)
+    expect(merged[0]!.words![0]).toMatchObject({ alignmentStatus: 'stale', word: '안녕하', start: 1, end: 2 })
+  })
+})

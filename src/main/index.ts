@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   unlinkSync,
   writeFileSync
@@ -15,7 +16,7 @@ import {
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { PythonSidecar } from './sidecar'
-import { ffmpegReadyForUse, getBundledFfmpegPath, getFfmpegUserBinDir, systemFfmpegWorks } from './ffmpeg-deps'
+import { ensureFfprobeExecutable, ffmpegReadyForUse, getBundledFfmpegPath, getFfmpegUserBinDir, systemFfmpegWorks } from './ffmpeg-deps'
 import {
   logMain,
   getMainLogFilePath,
@@ -34,8 +35,18 @@ import { getGpuRuntimeDir, installGpuRuntime, isGpuRuntimeInstalled } from './gp
 import { prepareAllEngines } from './deps-prepare'
 import { resolveBundledSidecarExecutable, resolvePythonInterpreter } from './python-resolve'
 import { ensureSidecarPipDeps } from './pip-sidecar-deps'
-import { captureSubtitlePngSequence, getExportRendererLoadMaxSecondsForUi, getSubtitleRenderDimensions } from './exportLogic'
-import { runSinglePassSubtitleBurnIn } from './ffmpeg-single-pass'
+import {
+  captureSubtitlePngSequence,
+  getExportRendererLoadMaxSecondsForUi,
+  getSubtitleRenderDimensions,
+  openSubtitleCapturePool,
+  type SubtitleCapturePool
+} from './exportLogic'
+import { EXPORT_FPS, runSinglePassSubtitleBurnIn } from './ffmpeg-single-pass'
+import { buildRenderSchedule } from '../shared/exportRenderSchedule'
+import { probeMediaTiming } from './mediaTiming'
+import { clipPlanFromCuts, mapSourceIntervalToProgram, programDuration, validateClipPlan } from '../shared/clipPlan'
+import { randomUUID } from 'node:crypto'
 import type {
   CutRange,
   ExportFormat,
@@ -49,6 +60,7 @@ let mainWindow: BrowserWindow | null = null
 let sidecar: PythonSidecar | null = null
 let depsPrepareLocked = false
 let gpuInstallLocked = false
+const activeExports = new Set<AbortController>()
 
 function dialogParentWindow(event: Electron.IpcMainInvokeEvent): BrowserWindow | undefined {
   const fromSender = BrowserWindow.fromWebContents(event.sender)
@@ -517,6 +529,13 @@ function escapeXmlText(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;')
+}
+
+/** 사용자 입력 색은 `#rgb`/`#rrggbb`/`#rrggbbaa` 만 허용한다. */
+function sanitizeHexColor(value: unknown): string | undefined {
+  return typeof value === 'string' && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value)
+    ? value
+    : undefined
 }
 
 type MappedSubtitle = { start: number; end: number; text: string }
@@ -1000,6 +1019,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('dialog:openVideo', async (event) => {
     const win = dialogParentWindow(event)
+    if (!win) throw new Error('윈도우를 찾지 못했습니다.')
     prepareDialogParent(win)
     const { canceled, filePaths } = await dialog.showOpenDialog(win ?? undefined, {
       title: '편집할 영상 선택',
@@ -1014,6 +1034,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('project:open', async (event) => {
     const win = dialogParentWindow(event)
+    if (!win) throw new Error('윈도우를 찾지 못했습니다.')
     prepareDialogParent(win)
     const { canceled, filePaths } = await dialog.showOpenDialog(win ?? undefined, {
       title: '프로젝트 열기',
@@ -1041,6 +1062,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('project:saveAs', async (event, payload: unknown) => {
     const win = dialogParentWindow(event)
+    if (!win) throw new Error('윈도우를 찾지 못했습니다.')
     prepareDialogParent(win)
     const p = payload as { content?: string; defaultPath?: string }
     if (typeof p?.content !== 'string') return { canceled: true as const }
@@ -1328,7 +1350,11 @@ app.whenReady().then(() => {
     const outputName = selected.name.endsWith('_AutoSubtitle') ? selected.name : `${selected.name}_AutoSubtitle`
     const outputPath = join(selected.dir, `${outputName}${selected.ext || ext}`)
     const cuts = normalizeCutRanges(Array.isArray(req.cutRanges) ? req.cutRanges : [])
-    const mappedSubtitles = normalizeMappedSubtitles(buildMappedSubtitles(req.subtitles, cuts))
+    const explicitPlan = req.clipPlan ? validateClipPlan(req.clipPlan, Math.max(...req.clipPlan.map((clip) => clip.sourceEnd))) : null
+    if (explicitPlan && (format === 'mp3' || format === 'wav')) throw new Error('순서 변경·반복 클립의 오디오 단독 내보내기는 아직 지원하지 않습니다.')
+    const mappedSubtitles = explicitPlan
+      ? req.subtitles.flatMap((cue) => mapSourceIntervalToProgram(cue.start, cue.end, explicitPlan).map((time) => ({ ...time, text: cue.text }))).sort((a, b) => a.start - b.start)
+      : normalizeMappedSubtitles(buildMappedSubtitles(req.subtitles, cuts))
     if (mappedSubtitles.length === 0) throw new Error('내보낼 유효 자막이 없습니다.')
 
     if (format === 'srt') {
@@ -1352,7 +1378,14 @@ app.whenReady().then(() => {
       return { canceled: false as const, outputPath, format }
     }
     if (format === 'video') {
+      if (normalize(outputPath).toLowerCase() === normalize(inputPath).toLowerCase()) throw new Error('원본 영상과 다른 저장 경로를 선택하세요.')
       const tempDir = mkdtempSync(join(tmpdir(), 'autosub-export-'))
+      const pendingOutput = `${outputPath}.${randomUUID()}.partial${extname(outputPath)}`
+      const controller = new AbortController()
+      let capturePool: SubtitleCapturePool | undefined
+      activeExports.add(controller)
+      const cancelExport = (): void => controller.abort()
+      win.once('closed', cancelExport)
       clearSubtitlePngsInDir(tempDir)
       try {
         sendExportProgress(win, { percent: 0, label: '준비 중…' })
@@ -1361,11 +1394,21 @@ app.whenReady().then(() => {
         const encDisplay = formatEncoderDisplayName(h264Encoder)
         sendExportProgress(win, { percent: 2, label: 'FFmpeg·인코더 확인 중…', encoderName: encDisplay })
         sendExportProgress(win, { percent: 4, label: '영상 길이 분석 중…', encoderName: encDisplay })
-        const inputDur = probeVideoDurationSec(inputPath, ffmpeg)
+        const ffprobe = await ensureFfprobeExecutable(ffmpeg)
+        const media = probeMediaTiming(ffprobe, inputPath)
+        const clips = validateClipPlan(req.clipPlan ?? clipPlanFromCuts(media.duration, cuts), media.duration)
+        // 줄 표시 구간과 단어 발화 구간을 같은 clip plan 으로 프레임 상태에 매핑한다(컷·순서·반복 포함).
+        const highlightColor = sanitizeHexColor(req.subtitleStyle?.wordHighlightColor)
+        const schedule = buildRenderSchedule({
+          cues: req.subtitles,
+          clips,
+          fps: EXPORT_FPS,
+          highlightWords: highlightColor !== undefined
+        })
+        if (schedule.length === 0) throw new Error('내보낼 유효 자막이 없습니다.')
         sendExportProgress(win, { percent: 6, label: '해상도 확인 중…', encoderName: encDisplay })
-        const detectedResolution = detectVideoResolution(inputPath, ffmpeg)
-        const fullW = detectedResolution?.width ?? req.subtitleStyle?.videoWidth ?? 1920
-        const fullH = detectedResolution?.height ?? req.subtitleStyle?.videoHeight ?? 1080
+        const fullW = media.width
+        const fullH = media.height
         const subDim = getSubtitleRenderDimensions(fullW, fullH)
         sendExportProgress(win, { percent: 8, label: '자막 렌더 창을 여는 중…', encoderName: encDisplay })
         const exportSubtitleStyle: ExportSubtitleStyle = {
@@ -1381,16 +1424,16 @@ app.whenReady().then(() => {
           x: req.subtitleStyle?.x ?? 50,
           y: req.subtitleStyle?.y ?? 10,
           videoWidth: subDim.width,
-          videoHeight: subDim.height
+          videoHeight: subDim.height,
+          wordHighlightColor: highlightColor
         }
 
-        const mappedEndMax = mappedSubtitles.reduce((m, s) => Math.max(m, s.end), 0)
-        const overlayDurationSec = estimateOverlayDurationSec(inputDur, cuts, mappedEndMax)
+        const overlayDurationSec = programDuration(clips)
 
-        const capture = await captureSubtitlePngSequence({
-          mappedSubtitles,
+        capturePool = await openSubtitleCapturePool({
           subtitleStyle: exportSubtitleStyle,
-          outputDir: tempDir,
+          stateCount: schedule.length,
+          signal: controller.signal,
           onPoolProgress: (ev) => {
             if (ev.total <= 0) return
             if (ev.kind === 'loading') {
@@ -1406,47 +1449,64 @@ app.whenReady().then(() => {
                 encoderName: encDisplay
               })
             }
-          },
-          onProgress: (done, total) => {
-            sendExportProgress(win, {
-              percent: Math.min(32, 12 + Math.round((done / Math.max(1, total)) * 20)),
-              label: '자막 비트맵 캡처 중…',
-              encoderName: encDisplay
-            })
           }
         })
+        const pool = capturePool
 
-        sendExportProgress(win, { percent: 32, label: '원본과 합성·인코딩 중… (단일 패스)', encoderName: encDisplay })
+        sendExportProgress(win, { percent: 12, label: '자막 렌더·합성·인코딩 중… (단일 패스)', encoderName: encDisplay })
 
-        await Promise.race([
-          runSinglePassSubtitleBurnIn({
+        const encode = (encoder: string): Promise<void> => runSinglePassSubtitleBurnIn({
             ffmpegPath: ffmpeg,
             inputVideoPath: inputPath,
-            outputPath,
+            outputPath: pendingOutput,
             fullVideoWidth: fullW,
             fullVideoHeight: fullH,
             renderWidth: subDim.width,
             renderHeight: subDim.height,
             overlayDurationSec,
-            rawBgraBuffers: capture.rawBgraBuffersOrdered,
-            timing: capture.pythonPayload.timing.map(({ start, end }) => ({ start, end })),
-            h264Encoder,
+            // 캡처는 인코더가 소비하는 속도에 맞춰 진행된다(메모리 제한). 재시도 시 같은 스케줄을 다시 캡처한다.
+            overlayStates: () => pool.stream(schedule),
+            h264Encoder: encoder,
+            clipPlan: clips,
+            sourceDurationSec: media.duration,
+            sourceOriginSec: media.sourceOriginSec,
+            hasAudio: media.hasAudio,
+            signal: controller.signal,
+            timeoutMs: EXPORT_VIDEO_TIMEOUT_MS,
             onProgress: (pct) => {
               sendExportProgress(win, {
-                percent: Math.min(99, 32 + Math.round((pct / 100) * 67)),
-                label: '원본과 합성·인코딩 중…',
+                percent: Math.min(99, 12 + Math.round((pct / 100) * 87)),
+                label: '자막 렌더·합성·인코딩 중…',
                 encoderName: encDisplay
               })
             }
-          }),
-          new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error('내보내기 인코딩 시간이 한도를 초과했습니다.')), EXPORT_VIDEO_TIMEOUT_MS)
           })
-        ])
+        try {
+          await encode(h264Encoder)
+        } catch (error) {
+          if (controller.signal.aborted || h264Encoder === 'libx264' ||
+              (error instanceof Error && error.message.includes('timed out'))) throw error
+          sendExportProgress(win, { percent: 12, label: 'CPU 인코더로 다시 시도 중…', encoderName: 'CPU (libx264)' })
+          await encode('libx264')
+        }
+        const exported = probeMediaTiming(ffprobe, pendingOutput)
+        if (Math.abs(exported.duration - overlayDurationSec) > 0.1 || exported.hasAudio !== media.hasAudio) {
+          throw new Error('출력 영상의 길이 또는 오디오 검증에 실패했습니다.')
+        }
+        const decoded = spawnSync(ffmpeg, ['-v', 'error', '-xerror', '-i', pendingOutput, '-t', '1', '-f', 'null', '-'], {
+          windowsHide: true, timeout: 30_000, encoding: 'utf8'
+        })
+        if (decoded.error || decoded.status !== 0) throw new Error(`출력 디코드 검증 실패: ${decoded.error?.message ?? decoded.stderr}`)
+        if (controller.signal.aborted) throw new Error('Export canceled')
+        renameSync(pendingOutput, outputPath)
 
         sendExportProgress(win, { percent: 100, label: '완료', encoderName: encDisplay })
         return { canceled: false as const, outputPath, format }
       } finally {
+        activeExports.delete(controller)
+        win.removeListener('closed', cancelExport)
+        capturePool?.close()
+        rmSync(pendingOutput, { force: true })
         try {
           rmSync(tempDir, { recursive: true, force: true })
         } catch {
@@ -1499,6 +1559,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  for (const controller of activeExports) controller.abort()
   sidecar?.stop()
   sidecar = null
 })

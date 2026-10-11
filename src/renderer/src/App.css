@@ -1783,3 +1783,18 @@ button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+.preview-export-word-highlight {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.preview-export-word-highlight input[type='color'] {
+  width: 24px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+}

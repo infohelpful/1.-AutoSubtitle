@@ -5,6 +5,7 @@ import {
   type SubtitleLine,
   type SubtitleWord
 } from '../../shared/subtitles'
+import { markWordEdited } from '../../shared/wordAlignmentMeta'
 import {
   DEFAULT_GAP_THRESHOLD_SEC,
   fillGapsInSubtitleWords,
@@ -267,12 +268,12 @@ export function mergeVrewRowsIntoSubtitleLines(
           continue
         }
         const m = toMedia(peak.start, peak.end)
-        const sw: SubtitleWord = {
-          ...w,
+        // 시간·글자 편집은 정렬 상태(manual lock / stale)에 반영하고 ID·엔진 추정치는 보존한다.
+        const sw: SubtitleWord = markWordEdited(w, {
           start: m.start,
           end: m.end,
           word: peak.text ?? w.word
-        }
+        })
         if (peak.isSilence) sw.isSilence = true
         else delete sw.isSilence
         nextWords.push(sw)

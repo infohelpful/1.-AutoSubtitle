@@ -8,6 +8,8 @@ import type {
   SubtitlePngSequencePythonPayload
 } from '../shared/ipc'
 import { IPC_EXPORT_SUBTITLE_RENDER_READY } from '../shared/ipc'
+import type { RenderState } from '../shared/exportRenderSchedule'
+import type { OverlayFrameState } from './ffmpeg-single-pass'
 
 const UPDATE_CHANNEL = 'update-subtitle' as const
 
@@ -134,7 +136,8 @@ function defaultExportStyle(style: ExportSubtitleStyle | undefined): ExportSubti
     x: style?.x ?? 50,
     y: style?.y ?? 10,
     videoWidth: style?.videoWidth,
-    videoHeight: style?.videoHeight
+    videoHeight: style?.videoHeight,
+    wordHighlightColor: style?.wordHighlightColor
   }
 }
 
@@ -142,13 +145,18 @@ function toUpdatePayload(
   text: string,
   width: number,
   height: number,
-  style: ExportSubtitleStyle
+  style: ExportSubtitleStyle,
+  highlight?: { words: string[]; activeIndex: number }
 ): ExportSubtitleUpdatePayload {
   const s = defaultExportStyle(style)
   return {
     text,
     width,
     height,
+    // 항상 두 필드를 보내 이전 프레임의 강조가 남지 않게 한다.
+    words: highlight?.words,
+    activeIndex: highlight?.activeIndex ?? -1,
+    wordHighlightColor: s.wordHighlightColor,
     fontFamily: s.fontFamily,
     fontSize: s.fontSize,
     textColor: s.textColor,
@@ -176,10 +184,10 @@ export function createRenderWindow(videoWidth: number, videoHeight: number): Bro
     /** width/height 를 클라이언트(웹뷰) 픽셀 크기로 해석 — DPI와 창 프레임 혼동 방지 */
     useContentSize: true,
     show: false,
-    offscreen: true,
     transparent: true,
     backgroundColor: '#00000000',
     webPreferences: {
+      offscreen: true,
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
       contextIsolation: true,
@@ -419,4 +427,144 @@ export async function captureSubtitlePngSequence(
       if (!w.isDestroyed()) w.destroy()
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// 프레임 상태 스트리밍 캡처 — 단어 강조처럼 상태가 많아져도 메모리를 제한한다.
+// ---------------------------------------------------------------------------
+
+export type SubtitleCapturePool = {
+  /**
+   * `states` 를 시작 프레임 순서대로 캡처해 내보낸다. 소비 속도보다 앞서 캡처하는 양은 제한된다.
+   * 같은 풀에서 동시에 두 스트림을 열 수 없다(재시도는 이전 스트림이 끝난 뒤 새로 호출).
+   */
+  stream(states: readonly RenderState[], onProgress?: (done: number, total: number) => void): AsyncGenerator<OverlayFrameState>
+  close(): void
+}
+
+export type OpenSubtitleCapturePoolOptions = {
+  subtitleStyle: ExportSubtitleStyle
+  /** 풀 크기를 정하기 위한 예상 상태 수 */
+  stateCount: number
+  signal?: AbortSignal
+  onPoolProgress?: (event: PoolProgressEvent) => void
+}
+
+export async function openSubtitleCapturePool(
+  options: OpenSubtitleCapturePoolOptions
+): Promise<SubtitleCapturePool> {
+  const style = defaultExportStyle(options.subtitleStyle)
+  const width = Math.max(320, Math.round(style.videoWidth ?? 1920))
+  const height = Math.max(240, Math.round(style.videoHeight ?? 1080))
+  const maxByResolution = width * height > MAX_FULLHD_PIXELS ? 2 : PARALLEL_CAPTURE_WINDOWS
+  const maxWindows = isViteDevRenderer && !hasBundledExportSubtitlePage() ? 1 : maxByResolution
+  const poolSize = Math.max(1, Math.min(maxWindows, options.stateCount))
+  const loadTimeoutMs = exportLoadTimeoutMs()
+
+  const windows: BrowserWindow[] = []
+  const closeAll = (): void => {
+    for (const w of windows) {
+      if (!w.isDestroyed()) w.destroy()
+    }
+    windows.length = 0
+  }
+  try {
+    for (let i = 0; i < poolSize; i += 1) {
+      if (options.signal?.aborted) throw new Error('Export canceled')
+      options.onPoolProgress?.({ kind: 'loading', index: i + 1, total: poolSize })
+      windows.push(await prepareCaptureWindowWithTimeout(width, height, loadTimeoutMs))
+      options.onPoolProgress?.({ kind: 'done', completed: i + 1, total: poolSize })
+    }
+  } catch (error) {
+    closeAll()
+    throw error
+  }
+
+  /** 소비자보다 앞서 캡처해 둘 수 있는 최대 프레임 수 — 1080p BGRA 한 장 약 8MB */
+  const maxAhead = windows.length * 2 + 2
+
+  async function* stream(
+    states: readonly RenderState[],
+    onProgress?: (done: number, total: number) => void
+  ): AsyncGenerator<OverlayFrameState> {
+    const total = states.length
+    const ready = new Map<number, OverlayFrameState>()
+    const waiters: Array<() => void> = []
+    const wake = (): void => {
+      for (const resolve of waiters.splice(0)) resolve()
+    }
+    const changed = (): Promise<void> => new Promise((resolve) => waiters.push(resolve))
+    let nextIndex = 0
+    let consumed = 0
+    let captured = 0
+    let failure: Error | null = null
+    const fail = (error: Error): void => {
+      failure ??= error
+      wake()
+    }
+    const onAbort = (): void => fail(new Error('Export canceled'))
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    if (options.signal?.aborted) onAbort()
+
+    const worker = async (win: BrowserWindow): Promise<void> => {
+      while (failure === null) {
+        if (nextIndex >= total) return
+        if (nextIndex - consumed >= maxAhead) {
+          await changed()
+          continue
+        }
+        const index = nextIndex
+        nextIndex += 1
+        try {
+          const state = states[index]!
+          const payload = toUpdatePayload(
+            state.text,
+            width,
+            height,
+            style,
+            state.words ? { words: state.words, activeIndex: state.activeIndex } : undefined
+          )
+          const readyP = waitForSubtitleRenderReady(win.webContents, RENDER_READY_TIMEOUT_MS)
+          win.webContents.send(UPDATE_CHANNEL, payload)
+          await readyP
+          await delay(POST_READY_SETTLE_MS)
+          const image = await win.webContents.capturePage()
+          ready.set(index, {
+            startFrame: state.startFrame,
+            endFrame: state.endFrame,
+            buf: bgraFromCapture(image, width, height)
+          })
+          captured += 1
+          onProgress?.(captured, total)
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error(String(error)))
+          return
+        }
+        wake()
+      }
+    }
+
+    const workers = windows.map((win) => worker(win))
+    try {
+      for (let i = 0; i < total; i += 1) {
+        while (!ready.has(i)) {
+          if (failure !== null) throw failure
+          await changed()
+        }
+        const item = ready.get(i)!
+        ready.delete(i)
+        consumed = i + 1
+        wake()
+        yield item
+      }
+    } finally {
+      // 소비자가 중간에 닫은 경우에도 작업자를 멈추고 대기 중인 캡처가 끝나길 기다린다.
+      fail(new Error('Capture stream closed'))
+      options.signal?.removeEventListener('abort', onAbort)
+      await Promise.allSettled(workers)
+      ready.clear()
+    }
+  }
+
+  return { stream, close: closeAll }
 }

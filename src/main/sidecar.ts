@@ -104,7 +104,7 @@ export class PythonSidecar {
         stderrBuf = stderrBuf.slice(idx + 1)
         if (!line) continue
         try {
-          const j = JSON.parse(line) as { type?: string; value?: number }
+          const j = JSON.parse(line) as { type?: string; value?: number; phase?: string }
           if (j?.type === 'download_progress' && typeof j.value === 'number') {
             this.onDownloadProgress?.(j.value)
             continue

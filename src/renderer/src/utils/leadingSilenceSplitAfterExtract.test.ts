@@ -224,4 +224,26 @@ describe('splitLeadingSilenceInSubtitleLines', () => {
     expect(hi).toBeDefined()
     expect(hi!.start).toBeGreaterThan(t5 + 1e-4)
   })
+
+  it('keeps a forced-aligned word that already starts at the voice onset, with its alignment metadata', () => {
+    const dur = (6 * 1000) / 48000
+    const onset = (2 / 6) * dur
+    const wf: JsonWaveformData = {
+      sample_rate: 48000,
+      samples_per_pixel: 1000,
+      data: [0, 0, 0, 0, 80, 80, 80, 80, 80, 80, 80, 80]
+    }
+    const aligned = {
+      start: onset,
+      end: dur,
+      word: 'Hello',
+      id: 'segment:0:word:0',
+      alignmentStatus: 'aligned' as const,
+      sourceStart: onset,
+      sourceEnd: dur
+    }
+    const lines: SubtitleLine[] = [{ start: 0, end: dur, text: 'Hello', words: [aligned] }]
+    const out = splitLeadingSilenceInSubtitleLines(lines, wf, dur, { dbfsGate: -40, minLeadingSilenceSec: 0.05 })
+    expect(out[0]!.words).toEqual([aligned])
+  })
 })

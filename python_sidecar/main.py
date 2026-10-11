@@ -29,6 +29,7 @@ from typing import Any
 
 from processor import _subprocess_creationflags, _which_ffmpeg, export_video_png_overlay
 from rms_vad_word_align import apply_rms_vad_word_align
+from alignment_runner import AlignmentUnavailable, run_accurate_alignment
 
 # ---------------------------------------------------------------------------
 # Paths & model configuration
@@ -745,12 +746,38 @@ def handle(method: str, params: dict[str, Any]) -> Any:
                 pct = min(85.0, float(i + 1) * 3.0)
             _emit_transcribe_progress(pct)
         raw_subtitles = copy.deepcopy(subtitles)
-        alignment_summary = {"requestedEngine": "rms" if bool(params.get("rms_vad_align", True)) else "off",
+        use_rms = bool(params.get("rms_vad_align", True))
+        requested_mode = str(params.get("alignment_mode") or os.environ.get("AUTOSUBTITLE_ALIGNMENT", "")).strip().lower()
+        use_accurate = requested_mode == "accurate"
+        alignment_summary = {"requestedEngine": "whisperx" if use_accurate else ("rms" if use_rms else "off"),
                              "appliedEngine": "whisper", "status": "estimated", "reviewReasons": []}
-        if bool(params.get("rms_vad_align", True)):
+        env_ff = os.environ.get("AUTOSUBTITLE_FFMPEG_PATH", "").strip()
+        ff_try = env_ff if (env_ff and os.path.isfile(env_ff)) else None
+        accurate_applied = False
+        if use_accurate:
+            # Forced alignment replaces (does not stack on) the RMS heuristic when it succeeds.
             try:
-                env_ff = os.environ.get("AUTOSUBTITLE_FFMPEG_PATH", "").strip()
-                ff_try = env_ff if (env_ff and os.path.isfile(env_ff)) else None
+                _emit_transcribe_progress(86.0)
+                ff_exe = ff_try or _which_ffmpeg(None)
+                cache_dir = os.environ.get("AUTOSUBTITLE_ALIGN_CACHE", "").strip() or str(MODELS_ROOT / "hf-align-cache")
+                aligned = run_accurate_alignment(
+                    copy.deepcopy(subtitles), audio_path, str(ff_exe), cache_dir=cache_dir,
+                    device=str(params.get("alignment_device") or "cpu"),
+                )
+                subtitles = aligned["subtitles"]
+                summary = aligned.get("alignmentSummary") or {}
+                alignment_summary.update(appliedEngine="whisperx", modelId=aligned.get("modelId"),
+                                         modelRevision=aligned.get("modelRevision"),
+                                         device=aligned.get("device"), totalWords=summary.get("totalWords"),
+                                         counts=summary.get("counts"), reviewWords=summary.get("reviewWords"),
+                                         alignedCoverage=summary.get("alignedCoverage"))
+                alignment_summary["status"] = "aligned" if summary.get("counts", {}).get("aligned") else "estimated"
+                accurate_applied = True
+            except (AlignmentUnavailable, FileNotFoundError, OSError) as error:
+                alignment_summary["reviewReasons"].append(str(error))
+                print(json.dumps({"type": "alignment_warning", "message": str(error)}, ensure_ascii=False), file=sys.stderr, flush=True)
+        if use_rms and not accurate_applied:
+            try:
                 subtitles = apply_rms_vad_word_align(
                     copy.deepcopy(subtitles), audio_path, ff_try, total_duration=total_dur
                 )

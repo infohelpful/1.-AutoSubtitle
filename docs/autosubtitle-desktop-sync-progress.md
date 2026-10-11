@@ -50,6 +50,36 @@
 - 오디오 단독 export와 SRT/VTT/ASS는 단어 강조를 지원하지 않는다(줄 단위 그대로).
 - `.autosub` 버전은 1 그대로다(필드가 추가된 v1). v2 migration은 미구현.
 
+## 3차 작업 — 정렬 실측과 accurate 모드 연결
+
+### 합성 한국어 음성 실측 (첫 정확도 신호)
+
+`scripts/alignment-tts-bench.ps1`(Windows SAPI Heami로 8문장·66단어 생성)와 `scripts/alignment-tts-bench.py`로 같은 음성에 세 방식을 비교했다. 전사(ASR) 텍스트는 66/66 일치했다.
+
+| 방식 | 문장 첫 단어 시작 − 실제 소리 시작(에너지 5%) | 전체 단어 시작 − SAPI 이벤트 |
+|---|---|---|
+| Whisper 원본 | 중앙값 −120ms (−105~−150) | 중앙값 −60ms, p95 140ms |
+| 현재 RMS 보정 | 중앙값 −120ms (Whisper와 동일) | 중앙값 −60ms, p95 140ms |
+| WhisperX 강제 정렬 | **중앙값 +8ms (−29~+36)** | 중앙값 +61ms, p95 110ms |
+
+해석과 한계:
+
+- **SAPI 이벤트는 실제 소리 시작보다 15~80ms 빨라 기준 자체가 편향**되어 있다. 그래서 단어별 오차는 신뢰 구간이 넓고, 독립 기준(에너지 onset)은 문장 첫 단어 8개뿐이다. 따라서 "전체 단어 평균 몇 ms"라고 단정하지 않는다.
+- 이 음성에서 현재 RMS 보정은 Whisper 원본을 거의 바꾸지 못했다(선행 무음 0.1초대). 첫 단어를 무음 구간 안에서 시작시키는 Whisper의 편향이 그대로 남는다.
+- **합성 음성은 사람 목소리·잡음·음악·겹말·빠른 구어를 대표하지 않는다.** 실제 영상·사람이 표기한 경계로 20클립/1,000경계 평가가 여전히 필요하다.
+- `.venv-alignment`의 PyAV가 faster-whisper 로더와 맞지 않아 벤치는 FFmpeg로 오디오를 직접 디코드한다(앱 런타임의 문제가 아니라 PoC venv의 문제).
+
+### accurate 모드 (기본 꺼짐)
+
+- `python_sidecar/align_worker.py`: 정렬 전용 인터프리터에서 실행되는 워커(stdout은 JSON 전용, 로그는 stderr).
+- `python_sidecar/alignment_runner.py`: 워커를 서브프로세스로 호출하고 응답을 검증(단어 수 불일치·타임아웃·잘못된 응답은 `AlignmentUnavailable`). ASR 런타임에 torch/whisperx를 들이지 않는다.
+- `forced_align.align_korean(strict=False)`: 30초 초과 등 정렬 불가 줄만 `unaligned`로 남기고 나머지는 계속 정렬한다.
+- `main.py` `transcribe`: `alignment_mode="accurate"` 또는 환경변수 `AUTOSUBTITLE_ALIGNMENT=accurate`일 때 정렬을 시도하고, 성공하면 **RMS 보정을 덮어쓰지 않는다**. 실패하면 사유를 `alignmentSummary.reviewReasons`에 남기고 기존 RMS 경로로 돌아간다.
+- 사용하려면 환경변수 `AUTOSUBTITLE_ALIGNMENT=accurate`, `AUTOSUBTITLE_ALIGN_PYTHON=<정렬 venv의 python.exe>`가 필요하다. 모델은 `AUTOSUBTITLE_ALIGN_CACHE`(기본 `<models>/hf-align-cache`)에 받는다. **설치본에는 정렬 런타임이 포함되어 있지 않으므로 UI 옵션은 아직 만들지 않았다.**
+- Electron main이 `[진단] 단어 정렬: whisperx · 정렬됨 N/M · 검토 필요 K` 줄을 내보낸다.
+- 실제 `transcribe` RPC를 두 모드로 돌려 확인: accurate 첫 단어 +8ms(−29~+36), 단어 수 일치 8/8, 폴백 사유 없음.
+- 알려진 한계: 오디오 시작 PTS가 0이 아닌 파일은 Whisper 시간축과 정렬 시간축이 어긋날 수 있다(`source_origin_sec`를 사이드카가 아직 모른다). 렌더러의 추출 후 처리(`splitLeadingSilenceInSubtitleLines`)는 이미 소리 시작에 있는 정렬 단어를 바꾸지 않는 것을 단위 테스트로 확인했지만 실앱에서는 확인하지 않았다.
+
 ## 이번에 수정한 동작 (1차)
 
 - `clipPlan.ts`: 원본 시간 보존, 컷 범위 제한·중복 처리, 순서·반복 occurrence와 자막 구간 변환.

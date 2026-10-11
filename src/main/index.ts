@@ -1258,6 +1258,14 @@ app.whenReady().then(() => {
           device_before?: string | null
           fallback_to_cpu?: boolean
           transcribe_ms?: number
+          alignmentSummary?: {
+            requestedEngine?: string
+            appliedEngine?: string
+            reviewReasons?: string[]
+            totalWords?: number
+            reviewWords?: number
+            counts?: { aligned?: number }
+          }
         }
         if (!win.isDestroyed()) win.webContents.send('transcribe:mode', mapDeviceToMode(result?.device))
         if (!win.isDestroyed()) {
@@ -1274,6 +1282,23 @@ app.whenReady().then(() => {
           win.webContents.send('transcribe:diag', {
             message: `[진단] 장치: ${modeLabelFromDevice(result?.device)} · 추출 ${txMs ?? '-'}ms · 전체 ${totalMs}ms`
           })
+          const align = result?.alignmentSummary
+          if (align) {
+            const reasons = (align.reviewReasons ?? []).join(', ')
+            const counted =
+              align.appliedEngine === 'whisperx' && typeof align.totalWords === 'number'
+                ? ` · 정렬됨 ${align.counts?.aligned ?? 0}/${align.totalWords} · 검토 필요 ${align.reviewWords ?? 0}`
+                : ''
+            win.webContents.send('transcribe:diag', {
+              message:
+                `[진단] 단어 정렬: ${align.appliedEngine ?? '-'}` +
+                (align.requestedEngine && align.requestedEngine !== align.appliedEngine
+                  ? ` (요청: ${align.requestedEngine})`
+                  : '') +
+                counted +
+                (reasons ? ` · 사유: ${reasons}` : '')
+            })
+          }
         }
         if (!win.isDestroyed()) win.webContents.send('transcribe:complete', result)
       } catch (e) {

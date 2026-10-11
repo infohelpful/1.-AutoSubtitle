@@ -34,7 +34,8 @@ import type { SubtitleRow } from './components/vrewPeaksEditor/types'
 import { computeLineZoomWindowFromCardBounds, type LineZoomWindowResult } from './lineZoomWindow'
 import type { PeaksZoomViewRange } from './SubtitleWaveformPeaks'
 import { isTimeInWordSpan, resolveActiveWordIndex } from '../../shared/activeWordResolver'
-import { scrubTimelineNoiseFromWordPiece } from '../../shared/wordContract'
+import { displayTextFromSubtitleWords } from '../../shared/subtitles'
+import { SILENCE_PLACEHOLDER_TEXT, scrubTimelineNoiseFromWordPiece } from '../../shared/wordContract'
 import { useSubtitleData } from './subtitleDataContext'
 import { peaksJsonRawDataLength } from './wordCanvas/peaksSentenceSlice'
 import { SentenceLineWaveformCanvas } from './waveform/SentenceLineWaveformCanvas'
@@ -1033,9 +1034,10 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     if (e.key === 'ArrowDown') {
       e.preventDefault()
       e.stopPropagation()
-      const to = Math.min(index + 1, subtitles.length - 1)
+      // 문장 사이의 무음(`--`) 카드는 건너뛰고 다음 자막 줄의 첫 칩으로 간다.
+      const next = adjacentLiveLineIndex(1, true)
       showKeyboardCaret()
-      requestFocusCaret(to, 0)
+      if (next >= 0) requestFocusCaret(next, 0)
       return
     }
 
@@ -1178,6 +1180,82 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
   }, [activeSubtitleIndexRef, index, isPlaying, row.words, playheadSecRef])
 
   /**
+   * 삭제(tombstone)된 줄을 건너뛴 이웃 줄 인덱스. 없으면 -1.
+   * `skipSilenceOnly`: 무음(`--`)뿐인 줄도 건너뛴다 — 위/아래 이동에서 문장 사이 무음 카드를 거치지 않기 위함.
+   */
+  const adjacentLiveLineIndex = (dir: 1 | -1, skipSilenceOnly = false): number => {
+    const isSilenceOnly = (line: (typeof subtitles)[number] | undefined): boolean => {
+      const alive = (line?.words ?? []).filter((w) => w.isDeleted !== true)
+      return (
+        alive.length > 0 &&
+        alive.every((w) => w.isSilence === true || String(w.word ?? '').trim() === SILENCE_PLACEHOLDER_TEXT)
+      )
+    }
+    for (let j = index + dir; j >= 0 && j < subtitles.length; j += dir) {
+      const line = subtitles[j]
+      if (line?.isDeleted === true) continue
+      if (skipSilenceOnly && isSilenceOnly(line)) continue
+      return j
+    }
+    return -1
+  }
+
+  /**
+   * 위/아래 캐럿 이동 — Vrew 처럼 **화면에서 바로 아래/위 줄**의 가로 위치가 가장 가까운 캐럿으로 간다.
+   * - 칩이 여러 줄로 줄바꿈된 카드는 같은 카드의 다음 줄부터 이동한 뒤 이웃 카드로 넘어간다.
+   * - 무음(`--`)만 있는 카드는 건너뛴다. 이웃 카드가 DOM 에 없으면 카드 안 순서 비율로 근사한다.
+   * 이동했으면 true (맨 위/아래라 이동할 곳이 없으면 false).
+   */
+  const moveCaretToAdjacentLine = (dir: 1 | -1, renderableCi: number): boolean => {
+    const targetLine = adjacentLiveLineIndex(dir, true)
+    const from = document.getElementById(`subtitle-caret-${index}-${renderableCi}`)
+    const collect = (line: number) =>
+      Array.from(document.querySelectorAll<HTMLElement>(`button[id^="subtitle-caret-${line}-"]`))
+        .map((el) => ({
+          line,
+          rc: Number(el.id.slice(`subtitle-caret-${line}-`.length)),
+          rect: el.getBoundingClientRect()
+        }))
+        .filter((c) => Number.isFinite(c.rc))
+
+    if (from) {
+      const fr = from.getBoundingClientRect()
+      const cx = fr.left + fr.width / 2
+      const cy = fr.top + fr.height / 2
+      const margin = Math.max(fr.height, 8) / 2
+      const pool = [...collect(index), ...(targetLine >= 0 ? collect(targetLine) : [])].filter((c) => {
+        const y = c.rect.top + c.rect.height / 2
+        return dir > 0 ? y > cy + margin : y < cy - margin
+      })
+      if (pool.length > 0) {
+        const dyOf = (c: (typeof pool)[number]): number => Math.abs(c.rect.top + c.rect.height / 2 - cy)
+        const minDy = Math.min(...pool.map(dyOf))
+        const nearestRow = pool.filter((c) => dyOf(c) <= minDy + 6)
+        let best = nearestRow[0]!
+        let bestDist = Infinity
+        for (const c of nearestRow) {
+          const dist = Math.abs(c.rect.left + c.rect.width / 2 - cx)
+          if (dist < bestDist) {
+            bestDist = dist
+            best = c
+          }
+        }
+        const words = subtitles[best.line]?.words ?? []
+        requestFocusCaret(best.line, renderableCaretToStorageCaret(words, best.rc))
+        return true
+      }
+    }
+
+    if (targetLine < 0) return false
+    const targetWords = subtitles[targetLine]?.words ?? []
+    const targetVisN = visibleWordStorageIndices(targetWords).length
+    const ratio = wordRail.length > 0 ? renderableCi / wordRail.length : 0
+    const rc = Math.max(0, Math.min(targetVisN, Math.round(ratio * targetVisN)))
+    requestFocusCaret(targetLine, renderableCaretToStorageCaret(targetWords, rc))
+    return true
+  }
+
+  /**
    * `renderableCi`: 캐럿 버튼이 위치한 visible 슬롯 인덱스 (0..visible.length).
    * 상태로 저장하는 caret 은 storage 축이며, 이동은 visible 단어 경계를 따른다.
    */
@@ -1211,6 +1289,23 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       onTogglePlayback()
       return
     }
+    /**
+     * 칩 사이에서 글자(또는 한글 IME 조합)를 치면 그 위치에서 바로 수정한다(Vrew 처럼).
+     * keydown 에서 텍스트 입력창으로 포커스만 옮기고 기본 동작은 막지 않는다 — 같은 입력이 입력창에 들어간다.
+     */
+    const typesCharacter = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey
+    const startsComposition = e.key === 'Process' || e.keyCode === 229
+    if (typesCharacter || startsComposition) {
+      const ta = document.getElementById(`subtitle-v-${index}`) as HTMLTextAreaElement | null
+      if (ta) {
+        const before = displayTextFromSubtitleWords(subs.slice(0, ci))
+        const offset = Math.min(ta.value.length, before.length > 0 ? before.length + 1 : 0)
+        clearSelection()
+        ta.focus({ preventScroll: true })
+        ta.setSelectionRange(offset, offset)
+      }
+      return
+    }
     if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
       setHoveredCaretIndex(null)
       if (isPlaying) {
@@ -1235,24 +1330,21 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       seekAtCaret(0)
       return
     }
-    if (e.key === 'ArrowDown') {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault()
       clearSelection()
       showKeyboardCaret()
+      // 줄 사이를 곧바로 오간다(텍스트 입력창을 거치지 않음). 맨 위/아래 줄이면 제자리.
+      moveCaretToAdjacentLine(e.key === 'ArrowDown' ? 1 : -1, renderableCi)
+      return
+    }
+    if (e.key === 'F2') {
+      // 줄 텍스트를 한 번에 고치고 싶을 때만 텍스트 입력창으로 들어간다.
+      e.preventDefault()
+      clearSelection()
       setCaretVisible(false)
       setCaretBlink(false)
       requestFocusRow(index, 0)
-      return
-    }
-    if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      clearSelection()
-      showKeyboardCaret()
-      if (index > 0) {
-        setCaretVisible(false)
-        setCaretBlink(false)
-        requestFocusRow(index - 1, 0)
-      }
       return
     }
     if (e.key === 'ArrowRight') {
@@ -1267,9 +1359,8 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
           activateCaretAt(snapStorage, true)
           seekAtCaret(0)
         } else {
-          setCaretVisible(false)
-          setCaretBlink(false)
-          requestFocusRow(index, 0)
+          const nextLine = adjacentLiveLineIndex(1)
+          if (nextLine >= 0) requestFocusCaret(nextLine, 0)
         }
         return
       }
@@ -1283,9 +1374,11 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
         activateCaretAt(nextStorage, true)
         seekAtCaret(0)
       } else {
-        setCaretVisible(false)
-        setCaretBlink(false)
-        requestFocusRow(index, 0)
+        // 줄 끝에서 →: 이전 줄로 가는 ←와 대칭으로 다음 줄 첫 칩 앞으로 이동한다.
+        const nextLine = adjacentLiveLineIndex(1)
+        if (nextLine >= 0) {
+          requestFocusCaret(nextLine, 0)
+        }
       }
       return
     }
@@ -1462,9 +1555,8 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
         const snapStorage = caretIndexBeforePlayheadWord()
         const snapRc = storageCaretToRenderableCaret(subs, snapStorage)
         if (visN === 0 || snapRc >= visN) {
-          setCaretVisible(false)
-          setCaretBlink(false)
-          requestFocusRow(index, 0)
+          const nextLine = adjacentLiveLineIndex(1)
+          if (nextLine >= 0) requestFocusCaret(nextLine, 0)
         } else {
           setCaretIndex(snapStorage)
           setFocusedCaretIndex(snapRc)
@@ -1476,9 +1568,8 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       }
       const curRc = storageCaretToRenderableCaret(subs, caretIndex)
       if (visN === 0 || curRc >= visN) {
-        setCaretVisible(false)
-        setCaretBlink(false)
-        requestFocusRow(index, 0)
+        const nextLine = adjacentLiveLineIndex(1)
+        if (nextLine >= 0) requestFocusCaret(nextLine, 0)
       } else {
         const nextStorage = stepStorageCaretByRenderable(subs, caretIndex, 1)
         setCaretIndex(nextStorage)
@@ -1537,20 +1628,20 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       seekAtCaret(0)
       return
     }
-    if (e.key === 'ArrowDown') {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      const subs = row.words ?? []
+      moveCaretToAdjacentLine(
+        e.key === 'ArrowDown' ? 1 : -1,
+        Math.min(storageCaretToRenderableCaret(subs, caretIndex), wordRail.length)
+      )
+      return
+    }
+    if (e.key === 'F2') {
       e.preventDefault()
       setCaretVisible(false)
       setCaretBlink(false)
       requestFocusRow(index, 0)
-      return
-    }
-    if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      if (index > 0) {
-        setCaretVisible(false)
-        setCaretBlink(false)
-        requestFocusRow(index - 1, 0)
-      }
     }
   }
 

@@ -1198,6 +1198,8 @@ app.whenReady().then(() => {
     }
     const result = await sc.call(method, mergedParams, timeoutMs)
     if (method === 'prepare_model') {
+      const load = (result as { load?: { device?: string | null; reason?: string; cuda_error?: string } } | null)?.load
+      logMain('transcribe', `모델 준비 장치=${load?.device ?? '-'}`, load?.reason ?? '', load?.cuda_error ?? '')
       const w = mainWindow
       if (w && !w.isDestroyed()) {
         w.webContents.send('model:ready')
@@ -1230,8 +1232,15 @@ app.whenReady().then(() => {
         const status = (await sc.call('get_model_status')) as { loaded?: boolean; device?: string | null }
         if (!status.loaded) {
           const prep = (await sc.call('prepare_model', {}, PREPARE_MODEL_TIMEOUT_MS)) as {
-            load?: { device?: string | null }
+            load?: { device?: string | null; reason?: string; cuda_error?: string }
           }
+          // CPU 로 떨어진 사유(드라이버·CUDA DLL·VRAM 등)를 남겨 두어야 원인을 추적할 수 있다.
+          logMain(
+            'transcribe',
+            `모델 로드 장치=${prep?.load?.device ?? '-'}`,
+            prep?.load?.reason ?? '',
+            prep?.load?.cuda_error ?? ''
+          )
           if (!win.isDestroyed()) win.webContents.send('model:ready')
           if (!win.isDestroyed()) win.webContents.send('transcribe:mode', mapDeviceToMode(prep?.load?.device))
           if (!win.isDestroyed()) {
@@ -1275,6 +1284,7 @@ app.whenReady().then(() => {
               ? Math.max(0, Math.round(result.transcribe_ms))
               : null
           if (result?.fallback_to_cpu) {
+            logMain('transcribe', 'GPU 전사 중 오류로 CPU 로 전환됨', `device=${result?.device ?? '-'}`)
             win.webContents.send('transcribe:diag', {
               message: '[진단] GPU 오류로 CPU 모드로 자동 전환됨'
             })

@@ -15,6 +15,8 @@ stdout는 RPC 전용이므로 진행률은 print(..., file=sys.stderr)로 출력
 from __future__ import annotations
 
 import io
+import copy
+import math
 import json
 import os
 import re
@@ -524,20 +526,13 @@ def _silence_gap_cue(start: float, end: float) -> dict[str, Any]:
 
 
 def _extend_last_cue_end(out: list[dict[str, Any]], new_end: float) -> None:
-    """미세 간격(< GAP_THRESHOLD): 직전 cue의 종료를 new_end까지 연장(마지막 word.end 동기화)."""
+    """Extend display lifetime only; never change a measured speech boundary."""
     if not out:
         return
     ne = float(new_end)
     last = out[-1]
     last["end"] = ne
-    words = last.get("words")
-    if isinstance(words, list) and len(words) > 0:
-        lw = words[-1]
-        if isinstance(lw, dict):
-            try:
-                lw["end"] = ne
-            except (TypeError, ValueError):
-                pass
+    last["displayEnd"] = ne
 
 
 def _normalize_cue_words_and_empty_text(c: dict[str, Any]) -> dict[str, Any] | None:
@@ -546,7 +541,7 @@ def _normalize_cue_words_and_empty_text(c: dict[str, Any]) -> dict[str, Any] | N
         e = float(c.get("end", 0))
     except (TypeError, ValueError):
         return None
-    if not (e > s):
+    if not (math.isfinite(s) and math.isfinite(e) and e > s):
         return None
     text = str(c.get("text") or "").strip()
     words_out: list[dict[str, Any]] = []
@@ -563,11 +558,13 @@ def _normalize_cue_words_and_empty_text(c: dict[str, Any]) -> dict[str, Any] | N
             ww = str(w.get("word", "")).strip()
             if not ww:
                 continue
-            words_out.append({"start": ws, "end": we, "word": ww})
+            if not (math.isfinite(ws) and math.isfinite(we) and we > ws):
+                continue
+            words_out.append({**copy.deepcopy(w), "start": ws, "end": we, "word": ww})
     if not text and not words_out:
         text = _UNKNOWN_WORD_LABEL
         words_out = [{"start": s, "end": e, "word": _UNKNOWN_WORD_LABEL}]
-    return {"start": s, "end": e, "text": text, "words": words_out}
+    return {**copy.deepcopy(c), "start": s, "end": e, "text": text, "words": words_out}
 
 
 def _fill_unvoiced_gaps(raw_cues: list[dict[str, Any]], total_dur: float) -> list[dict[str, Any]]:
@@ -604,12 +601,6 @@ def _fill_unvoiced_gaps(raw_cues: list[dict[str, Any]], total_dur: float) -> lis
             continue
         s = max(0.0, s)
 
-        # 이미 배치된 타임라인과 겹치면 시작만 당김
-        if s < prev_end:
-            s = prev_end
-        if e <= s:
-            continue
-
         gap = s - prev_end
         if gap > 1e-9:
             if gap >= _GAP_THRESHOLD_SEC:
@@ -619,13 +610,14 @@ def _fill_unvoiced_gaps(raw_cues: list[dict[str, Any]], total_dur: float) -> lis
 
         out.append(
             {
+                **c,
                 "start": s,
                 "end": e,
                 "text": c["text"],
                 "words": c["words"],
             }
         )
-        prev_end = e
+        prev_end = max(prev_end, e)
 
     if td > 0:
         gap_tail = td - prev_end
@@ -709,6 +701,9 @@ def handle(method: str, params: dict[str, Any]) -> Any:
                 language=language,
                 vad_filter=vad_filter,
                 word_timestamps=True,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
             )
         except Exception as e:
             if _is_cuda_runtime_missing_error(e) and _model_device == "cuda":
@@ -720,6 +715,9 @@ def handle(method: str, params: dict[str, Any]) -> Any:
                     language=language,
                     vad_filter=vad_filter,
                     word_timestamps=True,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.6,
                 )
             else:
                 raise
@@ -742,21 +740,26 @@ def handle(method: str, params: dict[str, Any]) -> Any:
                 }
             )
             if total_dur > 0:
-                pct = 100.0 * min(float(seg.end), total_dur) / total_dur
+                pct = 85.0 * min(float(seg.end), total_dur) / total_dur
             else:
-                pct = min(99.0, float(i + 1) * 3.0)
+                pct = min(85.0, float(i + 1) * 3.0)
             _emit_transcribe_progress(pct)
+        raw_subtitles = copy.deepcopy(subtitles)
+        alignment_summary = {"requestedEngine": "rms" if bool(params.get("rms_vad_align", True)) else "off",
+                             "appliedEngine": "whisper", "status": "estimated", "reviewReasons": []}
         if bool(params.get("rms_vad_align", True)):
             try:
                 env_ff = os.environ.get("AUTOSUBTITLE_FFMPEG_PATH", "").strip()
                 ff_try = env_ff if (env_ff and os.path.isfile(env_ff)) else None
                 subtitles = apply_rms_vad_word_align(
-                    subtitles, audio_path, ff_try, total_duration=total_dur
+                    copy.deepcopy(subtitles), audio_path, ff_try, total_duration=total_dur
                 )
-            except Exception:
-                pass
+                alignment_summary["appliedEngine"] = "rms"
+            except Exception as error:
+                alignment_summary["reviewReasons"].append(f"rms_failed: {error}")
+                print(json.dumps({"type": "alignment_warning", "message": str(error)}, ensure_ascii=False), file=sys.stderr, flush=True)
+        _emit_transcribe_progress(92.0)
         subtitles = _fill_unvoiced_gaps(subtitles, total_dur)
-        _emit_transcribe_progress(100.0)
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         waveform_peaks: dict[str, Any]
         try:
@@ -777,8 +780,11 @@ def handle(method: str, params: dict[str, Any]) -> Any:
                 )
         except Exception as e:  # noqa: BLE001
             waveform_peaks = {"ok": False, "path": None, "reason": str(e)}
+        _emit_transcribe_progress(100.0)
         return {
             "subtitles": subtitles,
+            "raw_subtitles": raw_subtitles,
+            "alignmentSummary": alignment_summary,
             "language": getattr(info, "language", None),
             "duration": getattr(info, "duration", None),
             "device": _model_device,

@@ -2726,7 +2726,17 @@ export default function App(): ReactElement {
         const t = schedule[0]!.startMediaSec
         const now = performance.now()
         const prevSeek = lastSeekIssuedRef.current
-        if (prevSeek && Math.abs(prevSeek.mediaSec - t) < 0.002 && now - prevSeek.at < 420) {
+        /**
+         * 중복 요청(seekAndPlay·playRange 연타)만 막는다. 칩 클릭(시크)만 한 직후 같은 위치에서
+         * Space 로 재생을 요청하는 것은 정상 입력이므로 `kind === 'seek'` 는 디듑 대상이 아니다.
+         * (`playEditRange` 의 하드 디듑과 같은 정책)
+         */
+        if (
+          prevSeek &&
+          prevSeek.kind !== 'seek' &&
+          Math.abs(prevSeek.mediaSec - t) < 0.002 &&
+          now - prevSeek.at < 420
+        ) {
           timelineEditLog('playback', 'seekAndPlayTo 하드 디듑', {
             requestedStartEditSec: startSec,
             inputTimeBasis,

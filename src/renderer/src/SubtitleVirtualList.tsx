@@ -27,7 +27,9 @@ import {
   nearestValidStorageCaret,
   renderableCaretToStorageCaret,
   stepStorageCaretByRenderable,
+  storageCaretForTextOffset,
   storageCaretToRenderableCaret,
+  textOffsetForStorageCaret,
   visibleWordStorageIndices
 } from '../../shared/subtitleWordCaretMap'
 import type { SubtitleRow } from './components/vrewPeaksEditor/types'
@@ -174,6 +176,17 @@ export type SubtitleListRowProps = {
 
 const shouldDeleteAudioForWords = (words: Array<{ isSilence?: boolean }> | undefined): boolean =>
   Boolean(words && words.length > 0 && words.every((w) => Boolean(w.isSilence)))
+
+/**
+ * 사용자가 칩/줄을 직접 눌러서 재생을 멈춘 직후에는 '멈춘 재생 위치의 캐럿으로 포커스 복귀' 동기화를 건너뛴다.
+ * 행마다 ref 가 따로라서(재생 중이던 줄 ≠ 클릭한 줄) 모듈 전역 시각으로 공유한다.
+ * 이게 없으면 클릭한 칩의 포커스·Space 의도를 재생 중이던 줄의 캐럿이 되가져가 엉뚱한 곳에서 재생된다.
+ */
+let suppressPauseCaretSyncUntilMs = 0
+const USER_CLICK_PAUSE_SUPPRESS_MS = 1200
+function markUserClickPause(): void {
+  suppressPauseCaretSyncUntilMs = performance.now() + USER_CLICK_PAUSE_SUPPRESS_MS
+}
 
 function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) {
   const {
@@ -1034,10 +1047,16 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     if (e.key === 'ArrowDown') {
       e.preventDefault()
       e.stopPropagation()
-      // 문장 사이의 무음(`--`) 카드는 건너뛰고 다음 자막 줄의 첫 칩으로 간다.
+      // 문장 사이의 무음(`--`) 카드는 건너뛰고, 다음 자막 줄 칩 중 글자 위치 비율이 비슷한 곳으로 간다.
       const next = adjacentLiveLineIndex(1, true)
       showKeyboardCaret()
-      if (next >= 0) requestFocusCaret(next, 0)
+      if (next >= 0) {
+        const ta = e.currentTarget
+        const ratio = ta.value.length > 0 ? ta.selectionStart / ta.value.length : 0
+        const nextWords = subtitles[next]?.words ?? []
+        const nextLen = textOffsetForStorageCaret(nextWords, nextWords.length)
+        requestFocusCaret(next, storageCaretForTextOffset(nextWords, Math.round(ratio * nextLen)))
+      }
       return
     }
 
@@ -1045,7 +1064,9 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       e.preventDefault()
       e.stopPropagation()
       showKeyboardCaret()
-      requestFocusCaret(index, 0)
+      // 이 카드의 칩 줄로 올라간다 — 커서가 있던 글자 위치에 해당하는 칩 사이.
+      const words = row.words ?? []
+      requestFocusCaret(index, storageCaretForTextOffset(words, e.currentTarget.selectionStart))
       return
     }
 
@@ -1133,6 +1154,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     const justPaused = prevIsPlayingRef.current && !isPlaying
     prevIsPlayingRef.current = isPlaying
     if (!justPaused) return
+    if (performance.now() < suppressPauseCaretSyncUntilMs) return
     if (activeSubtitleIndexRef.current !== index) return
     if (skipPlayheadCaretSyncOnPauseRef.current) {
       skipPlayheadCaretSyncOnPauseRef.current = false
@@ -1201,57 +1223,26 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
   }
 
   /**
-   * 위/아래 캐럿 이동 — Vrew 처럼 **화면에서 바로 아래/위 줄**의 가로 위치가 가장 가까운 캐럿으로 간다.
-   * - 칩이 여러 줄로 줄바꿈된 카드는 같은 카드의 다음 줄부터 이동한 뒤 이웃 카드로 넘어간다.
-   * - 무음(`--`)만 있는 카드는 건너뛴다. 이웃 카드가 DOM 에 없으면 카드 안 순서 비율로 근사한다.
-   * 이동했으면 true (맨 위/아래라 이동할 곳이 없으면 false).
+   * 위/아래 캐럿 이동 — 칩 줄 → (같은 카드의) 편집창 → 다음 카드 칩 순서로 단계 단위로 움직인다.
+   * - ↓: 칩이 줄바꿈되어 여러 줄이어도 곧바로 이 카드의 텍스트 편집창으로 내려간다
+   *   (캐럿 위치에 해당하는 글자 앞에 커서가 놓인다).
+   * - ↑: 앞쪽 자막 줄의 편집창으로 올라간다(무음뿐인 카드는 건너뜀). 맨 위 줄이면 제자리.
+   * 이동했으면 true.
    */
-  const moveCaretToAdjacentLine = (dir: 1 | -1, renderableCi: number): boolean => {
-    const targetLine = adjacentLiveLineIndex(dir, true)
-    const from = document.getElementById(`subtitle-caret-${index}-${renderableCi}`)
-    const collect = (line: number) =>
-      Array.from(document.querySelectorAll<HTMLElement>(`button[id^="subtitle-caret-${line}-"]`))
-        .map((el) => ({
-          line,
-          rc: Number(el.id.slice(`subtitle-caret-${line}-`.length)),
-          rect: el.getBoundingClientRect()
-        }))
-        .filter((c) => Number.isFinite(c.rc))
-
-    if (from) {
-      const fr = from.getBoundingClientRect()
-      const cx = fr.left + fr.width / 2
-      const cy = fr.top + fr.height / 2
-      const margin = Math.max(fr.height, 8) / 2
-      const pool = [...collect(index), ...(targetLine >= 0 ? collect(targetLine) : [])].filter((c) => {
-        const y = c.rect.top + c.rect.height / 2
-        return dir > 0 ? y > cy + margin : y < cy - margin
-      })
-      if (pool.length > 0) {
-        const dyOf = (c: (typeof pool)[number]): number => Math.abs(c.rect.top + c.rect.height / 2 - cy)
-        const minDy = Math.min(...pool.map(dyOf))
-        const nearestRow = pool.filter((c) => dyOf(c) <= minDy + 6)
-        let best = nearestRow[0]!
-        let bestDist = Infinity
-        for (const c of nearestRow) {
-          const dist = Math.abs(c.rect.left + c.rect.width / 2 - cx)
-          if (dist < bestDist) {
-            bestDist = dist
-            best = c
-          }
-        }
-        const words = subtitles[best.line]?.words ?? []
-        requestFocusCaret(best.line, renderableCaretToStorageCaret(words, best.rc))
-        return true
-      }
+  const moveCaretVertically = (dir: 1 | -1, renderableCi: number): boolean => {
+    const words = row.words ?? []
+    const storage = renderableCaretToStorageCaret(words, renderableCi)
+    if (dir > 0) {
+      requestFocusRow(index, textOffsetForStorageCaret(words, storage))
+      return true
     }
-
-    if (targetLine < 0) return false
-    const targetWords = subtitles[targetLine]?.words ?? []
-    const targetVisN = visibleWordStorageIndices(targetWords).length
-    const ratio = wordRail.length > 0 ? renderableCi / wordRail.length : 0
-    const rc = Math.max(0, Math.min(targetVisN, Math.round(ratio * targetVisN)))
-    requestFocusCaret(targetLine, renderableCaretToStorageCaret(targetWords, rc))
+    const prev = adjacentLiveLineIndex(-1, true)
+    if (prev < 0) return false
+    const fullLen = textOffsetForStorageCaret(words, words.length)
+    const ratio = fullLen > 0 ? textOffsetForStorageCaret(words, storage) / fullLen : 0
+    const prevWords = subtitles[prev]?.words ?? []
+    const prevLen = textOffsetForStorageCaret(prevWords, prevWords.length)
+    requestFocusRow(prev, Math.round(ratio * Math.max(0, prevLen - 1)))
     return true
   }
 
@@ -1334,17 +1325,17 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       e.preventDefault()
       clearSelection()
       showKeyboardCaret()
-      // 줄 사이를 곧바로 오간다(텍스트 입력창을 거치지 않음). 맨 위/아래 줄이면 제자리.
-      moveCaretToAdjacentLine(e.key === 'ArrowDown' ? 1 : -1, renderableCi)
+      // 칩 줄 → 이 카드의 편집창 → 다음 카드 칩 순서로 한 단계씩 이동한다(↓ 는 곧바로 편집창).
+      moveCaretVertically(e.key === 'ArrowDown' ? 1 : -1, renderableCi)
       return
     }
     if (e.key === 'F2') {
-      // 줄 텍스트를 한 번에 고치고 싶을 때만 텍스트 입력창으로 들어간다.
+      // 캐럿 위치에서 바로 편집창으로 들어간다(↓ 와 같은 동작).
       e.preventDefault()
       clearSelection()
       setCaretVisible(false)
       setCaretBlink(false)
-      requestFocusRow(index, 0)
+      requestFocusRow(index, textOffsetForStorageCaret(subs, ci))
       return
     }
     if (e.key === 'ArrowRight') {
@@ -1631,7 +1622,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault()
       const subs = row.words ?? []
-      moveCaretToAdjacentLine(
+      moveCaretVertically(
         e.key === 'ArrowDown' ? 1 : -1,
         Math.min(storageCaretToRenderableCaret(subs, caretIndex), wordRail.length)
       )
@@ -1661,7 +1652,10 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
           const tryActivateFirstCaret = (): boolean => {
             if (wordRail.length === 0) return false
             e.preventDefault()
-            if (isPlaying) onRequestPausePlayback('row-mousedown-caret-activate')
+            if (isPlaying) {
+              markUserClickPause()
+              onRequestPausePlayback('row-mousedown-caret-activate')
+            }
             clearSelection()
             activateCaretAt(0, true)
             return true
@@ -1843,6 +1837,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                           }
 
                           if (isPlaying) {
+                            markUserClickPause()
                             onRequestPausePlayback('word-chip-click-wave-active')
                           }
                           clearSelection()
@@ -1851,6 +1846,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                         }
                         onWordBlockClick(rw.start)
                         if (isPlaying) {
+                          markUserClickPause()
                           onRequestPausePlayback('word-chip-click')
                         }
                         clearSelection()

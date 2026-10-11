@@ -1,3 +1,4 @@
+import type { JSX } from 'react'
 import { useState } from 'react'
 import { VrewPeaksSubtitleEditor } from './VrewPeaksSubtitleEditor'
 import type { SubtitleRow } from './types'

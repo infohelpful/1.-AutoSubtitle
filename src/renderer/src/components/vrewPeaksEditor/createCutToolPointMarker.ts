@@ -23,7 +23,8 @@ class CutToolPointMarker implements PointMarker {
     this.opts = options
   }
 
-  init(group: Konva.Group): void {
+  init(rawGroup: object): void {
+    const group = rawGroup as Konva.Group
     const layer = this.opts.layer as LayerWithFormat
     const h = Math.max(8, layer.getHeight())
     this.hitStrip = new Konva.Rect({

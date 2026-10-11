@@ -39,10 +39,10 @@ export async function connect(port = 9333) {
     await sleep(120)
   }
   const typeText = async (text) => { await send('Input.insertText', { text }); await sleep(120) }
-  const click = async (x, y) => {
+  const click = async (x, y, settleMs = 150) => {
     await send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 })
     await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 })
-    await sleep(150)
+    if (settleMs > 0) await sleep(settleMs)
   }
   return { send, evaluate, press, typeText, click, sleep, close: () => ws.close() }
 }

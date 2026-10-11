@@ -22,6 +22,7 @@ import {
   type SubtitleWord
 } from './subtitles'
 import type { SentenceTokenTimeline, TimelineSentence, TimelineToken } from './sentenceTokenTimeline'
+import { parseWordAlignmentMeta } from './wordAlignmentMeta'
 
 function sentenceIdForLineIndex(li: number): string {
   return `sub-${li}`
@@ -44,6 +45,8 @@ function buildSentenceFromLine(line: SubtitleLine, li: number): TimelineSentence
         start_original: w.start,
         end_original: w.end
       }
+      t.wordMeta = parseWordAlignmentMeta(w)
+      if (w.mergedByEdgeTrim === true) t.mergedByEdgeTrim = true
       if (w.isDeleted === true) t.is_deleted = true
       if (w.isSilence === true) t.isSilence = true
       if (w.splitChain) t.splitChain = w.splitChain
@@ -75,11 +78,13 @@ function buildLineFromSentence(sentence: TimelineSentence): SubtitleLine | null 
 
   const wordsRaw: SubtitleWord[] = raw.map((t) => {
     const w: SubtitleWord = {
+      ...parseWordAlignmentMeta(t.wordMeta ?? {}),
       start: t.start_original,
       end: t.end_original,
       word: t.text
     }
     if (t.is_deleted === true) w.isDeleted = true
+    if (t.mergedByEdgeTrim === true) w.mergedByEdgeTrim = true
     if (t.isSilence === true) w.isSilence = true
     if (t.splitChain) w.splitChain = t.splitChain
     return w

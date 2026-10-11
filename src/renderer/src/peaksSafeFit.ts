@@ -10,7 +10,7 @@ export function safeFitPeaksContainerView(
   which: 'zoomview' | 'overview',
   container: HTMLDivElement | null
 ): void {
-  const v = peaks.views.getView(which)
+  const v = which === 'overview' ? peaks.views.getView('overview') : peaks.views.getView('zoomview')
   if (!v) return
   const w = container?.clientWidth ?? 0
   const h = container?.clientHeight ?? 0

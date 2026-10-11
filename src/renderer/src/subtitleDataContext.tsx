@@ -1,3 +1,4 @@
+import type { JSX } from 'react'
 import { createContext, useContext, type ReactNode } from 'react'
 
 import type { SubtitleLine } from '../../shared/subtitles'

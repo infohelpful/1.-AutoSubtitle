@@ -82,6 +82,29 @@ def _emit_transcribe_progress(value: float) -> None:
     print(line, file=sys.stderr, flush=True)
 
 
+def _collect_transcription(audio_path: str, **options):
+    """CUDA errors may occur on lazy segment iteration, not just transcribe()."""
+    fallback = False
+    for attempt in range(2):
+        try:
+            segments, info = _whisper_model.transcribe(audio_path, **options)
+            duration = float(getattr(info, "duration", 0) or 0)
+            collected = []
+            for segment in segments:
+                collected.append(segment)
+                if duration > 0:
+                    _emit_transcribe_progress(85.0 * min(float(segment.end), duration) / duration)
+            return collected, info, fallback
+        except Exception as error:
+            if attempt != 0 or _model_device != "cuda" or not _is_cuda_runtime_missing_error(error):
+                raise
+            print(json.dumps({"type": "transcribe_device", "device": "cpu",
+                              "reason": "GPU 런타임 오류로 CPU에서 다시 추출합니다."}, ensure_ascii=False),
+                  file=sys.stderr, flush=True)
+            _force_reload_model_cpu()
+            fallback = True
+
+
 def _emit_download_progress(value: float) -> None:
     """0~100% JSON을 stderr로 보냄. 값은 항상 이전보다 작아지지 않음."""
     global _prepare_progress_max
@@ -695,33 +718,11 @@ def handle(method: str, params: dict[str, Any]) -> Any:
         t0 = time.perf_counter()
 
         _emit_transcribe_progress(0.0)
-        try:
-            segments, info = _whisper_model.transcribe(
-                audio_path,
-                beam_size=beam_size,
-                language=language,
-                vad_filter=vad_filter,
-                word_timestamps=True,
-                temperature=0.0,
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-            )
-        except Exception as e:
-            if _is_cuda_runtime_missing_error(e) and _model_device == "cuda":
-                _force_reload_model_cpu()
-                did_fallback_to_cpu = True
-                segments, info = _whisper_model.transcribe(
-                    audio_path,
-                    beam_size=beam_size,
-                    language=language,
-                    vad_filter=vad_filter,
-                    word_timestamps=True,
-                    temperature=0.0,
-                    condition_on_previous_text=False,
-                    no_speech_threshold=0.6,
-                )
-            else:
-                raise
+        segments, info, did_fallback_to_cpu = _collect_transcription(
+            audio_path, beam_size=beam_size, language=language, vad_filter=vad_filter,
+            word_timestamps=True, temperature=0.0, condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+        )
         total_dur = float(getattr(info, "duration", 0) or 0)
         subtitles: list[dict[str, Any]] = []
         for i, seg in enumerate(segments):

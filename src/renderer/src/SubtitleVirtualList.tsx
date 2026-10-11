@@ -17,6 +17,7 @@ import type { RowComponentProps } from 'react-window'
 import type { MouseEvent } from 'react'
 
 import { subtitleLineEditDisplayText, type SubtitleLine } from '../../shared/subtitles'
+import { deleteTextGrapheme } from './utils/deleteTextGrapheme'
 import {
   DISPLAY_CROSS_CARD_GAP_ABSORB_MS,
   DISPLAY_GAP_ABSORB_MS,
@@ -264,19 +265,21 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
   const skipPlayheadCaretSyncOnPauseRef = useRef(false)
   /** 재생 중 방향키로 일시정지하며 캐럿 편집 UI를 잠깐 허용할 때 true */
   const [keyboardPauseCaret, setKeyboardPauseCaret] = useState(false)
-  /** 부모 subtitles 갱신 없이 타이핑 — blur 시에만 commit (전체 vrewRows·리스트 재계산 방지) */
+  /** Local composition draft; committed text also updates word labels. */
   const subtitleTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const [subtitleTextDraft, setSubtitleTextDraft] = useState<string | null>(null)
+  const textComposingRef = useRef(false)
   const lineEditDisplay = useMemo(() => subtitleLineEditDisplayText(row), [row.text, row.words])
   const subtitleTextDisplay = subtitleTextDraft ?? lineEditDisplay
 
   useEffect(() => {
+    if (textComposingRef.current) return
     if (subtitleTextareaRef.current === document.activeElement) {
-      setSubtitleTextDraft(lineEditDisplay)
+      setSubtitleTextDraft(row.text)
       return
     }
     setSubtitleTextDraft(null)
-  }, [lineEditDisplay, row.start, row.end, index])
+  }, [lineEditDisplay, row.text, row.start, row.end, index])
 
   /**
    * 렌더링 단위 레일 — **tombstone(`isDeleted`) 제외**, 각 칩은 원본 `row.words` 의 `storageIndex` 보존.
@@ -947,11 +950,13 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     setRowHasFocus(true)
     setFocusedCaretIndex(rc)
     setHoveredCaretIndex(null)
-    window.requestAnimationFrame(() => {
+    // Existing caret buttons can receive focus synchronously. Waiting one frame
+    // sends an immediate Space to the previously focused word instead.
+    {
       const el = document.getElementById(`subtitle-caret-${index}-${rc}`) as HTMLButtonElement | null
       const active = document.activeElement as HTMLElement | null
       if (el && active?.id !== el.id) el.focus({ preventScroll: true })
-    })
+    }
   }
   /** caret 버튼이 직접 포커스되면 → visible 슬롯(`renderableCaret`)로부터 storage caret 동기화 */
   const syncCaretFromFocus = (renderableCaret: number) => {
@@ -1265,6 +1270,19 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     }
     const subs = row.words ?? []
     const ci = renderableCaretToStorageCaret(subs, renderableCi)
+    if ((e.key === 'Backspace' || e.key === 'Delete') && !hasSelection) {
+      const adjacent = e.key === 'Backspace' ? visibleWordStorageIndices(subs).filter(i => i < ci).at(-1)
+        : visibleWordStorageIndices(subs).find(i => i >= ci)
+      // Silence blocks remain timeline edits; spoken text uses a character caret.
+      if (adjacent != null && !subs[adjacent]?.isSilence) {
+        e.preventDefault()
+        const result = deleteTextGrapheme(lineEditDisplay, textOffsetForStorageCaret(subs, ci), e.key)
+        setSubtitleTextDraft(result.text)
+        updateSubtitleAt(index, result.text)
+        requestFocusRow(index, result.caret)
+        return
+      }
+    }
     if (e.key === ' ' || e.code === 'Space') {
       e.preventDefault()
       if (isPlaying) {
@@ -1838,8 +1856,8 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
 
                           if (isPlaying) {
                             markUserClickPause()
-                            onRequestPausePlayback('word-chip-click-wave-active')
                           }
+                          onWordBlockClick(rw.start)
                           clearSelection()
                           activateCaretAt(storageWi, true)
                           return
@@ -1847,7 +1865,6 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                         onWordBlockClick(rw.start)
                         if (isPlaying) {
                           markUserClickPause()
-                          onRequestPausePlayback('word-chip-click')
                         }
                         clearSelection()
                         activateCaretAt(storageWi, true)
@@ -1984,9 +2001,16 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
           value={subtitleTextDisplay}
           onChange={(e) => {
             setSubtitleTextDraft(e.target.value)
+            if (!textComposingRef.current) updateSubtitleAt(index, e.target.value)
+          }}
+          onCompositionStart={() => { textComposingRef.current = true }}
+          onCompositionEnd={(e) => {
+            textComposingRef.current = false
+            setSubtitleTextDraft(e.currentTarget.value)
+            updateSubtitleAt(index, e.currentTarget.value)
           }}
           onFocus={() => {
-            setSubtitleTextDraft(lineEditDisplay)
+            setSubtitleTextDraft(row.text)
             setCaretVisible(false)
             setCaretBlink(false)
           }}
@@ -2058,6 +2082,10 @@ const subtitleVirtualRowAreEqual = (
 }
 
 const SubtitleVirtualRow = memo(SubtitleVirtualRowImpl, subtitleVirtualRowAreEqual)
+
+function VirtualRowRenderer(props: RowComponentProps<SubtitleListRowProps>) {
+  return <SubtitleVirtualRow {...props} />
+}
 
 export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
   const { subtitles: subtitlesFromContext } = useSubtitleData()
@@ -2309,7 +2337,7 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
           style={{ height: size.h, width: size.w }}
           rowCount={subtitles.length}
           rowHeight={dynamicRowHeight}
-          rowComponent={SubtitleVirtualRow}
+          rowComponent={VirtualRowRenderer}
           rowProps={rowProps}
           /** 160 은 스크롤 밖까지 수백 행을 마운트해 타이핑 시 전체가 버벅였음 — 파형 줄도 소량 overscan 으로 충분 */
           overscanCount={waveExpanded ? 10 : 6}

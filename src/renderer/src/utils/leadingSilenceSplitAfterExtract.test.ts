@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { JsonWaveformData } from '../../shared/waveformJson'
-import type { SubtitleLine } from '../../shared/subtitles'
+import type { JsonWaveformData } from '../../../shared/waveformJson'
+import type { SubtitleLine } from '../../../shared/subtitles'
 import { splitLeadingSilenceInSubtitleLines } from './leadingSilenceSplitAfterExtract'
 
 /** 6픽셀: 앞 5칸 무음, 마지막 칸만 큰 진폭 — implied duration = 6*1000/48000 */

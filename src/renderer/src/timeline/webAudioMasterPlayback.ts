@@ -22,6 +22,8 @@ export class WebAudioMasterPlayback {
   private timeline: WebAudioSchedulePiece[] = []
   private playingFlag = false
   private scheduleSeq = 0
+  private playbackRequest = 0
+  private loadRequest = 0
   /**
    * 현재 스케줄(scheduleFromEdl 호출)의 모든 BufferSource 가 자연 종료될 때 한 번만 호출되는 콜백.
    * 외부(예: oneShotSession 정리)는 이 콜백으로 자연 종료를 통지받아야 한다 — `isPlaying()=false` 만으로는
@@ -72,12 +74,14 @@ export class WebAudioMasterPlayback {
 
   async loadFromUrl(url: string): Promise<void> {
     if (this.loadedFromUrl === url && this.buffer) return
+    const request = ++this.loadRequest
     this.stopPlayback()
     const ctx = this.ensureContext()
     const res = await fetch(url)
     if (!res.ok) throw new Error(`WebAudio load failed: ${res.status}`)
     const arr = await res.arrayBuffer()
     const buf = await ctx.decodeAudioData(arr.slice(0))
+    if (request !== this.loadRequest || ctx !== this.ctx) return
     this.buffer = buf
     this.loadedFromUrl = url
   }
@@ -93,8 +97,11 @@ export class WebAudioMasterPlayback {
     endMediaSec: number | null
   ): Promise<void> {
     const ctx = this.ensureContext()
-    await ctx.resume().catch(() => undefined)
     this.stopPlayback()
+    const request = this.playbackRequest
+    await ctx.resume()
+    if (request !== this.playbackRequest || ctx !== this.ctx) return
+    if (ctx.state !== 'running') throw new Error('Audio context is not running')
     const buf = this.buffer
     if (!buf || segments.length === 0) return
 
@@ -168,6 +175,7 @@ export class WebAudioMasterPlayback {
   }
 
   stopPlayback(): void {
+    this.playbackRequest += 1
     const hadActive = this.activeSources.length > 0
     const stoppedScheduleId = this.scheduleSeq
     for (const n of this.activeSources) {
@@ -193,6 +201,7 @@ export class WebAudioMasterPlayback {
   }
 
   dispose(): void {
+    this.loadRequest += 1
     this.stopPlayback()
     try {
       this.ctx?.close()

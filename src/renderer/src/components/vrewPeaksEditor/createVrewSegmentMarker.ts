@@ -23,7 +23,8 @@ class VrewSegmentMarker implements SegmentMarker {
     this.markersUi = this.opts.segment?.markers === true
   }
 
-  init(group: Konva.Group): void {
+  init(rawGroup: object): void {
+    const group = rawGroup as Konva.Group
     this.group = group
     const blue = '#3b82f6'
     const stroke = '#1d4ed8'

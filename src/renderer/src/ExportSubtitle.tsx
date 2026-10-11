@@ -1,3 +1,4 @@
+import type { JSX } from 'react'
 import { Fragment, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { flushSync } from 'react-dom'
 

@@ -1,5 +1,5 @@
 import type { Segment } from 'peaks.js'
-import { lineEditDisplayFromVrewWordParts } from '../../../shared/wordContract'
+import { lineEditDisplayFromVrewWordParts } from '../../../../shared/wordContract'
 import type { SubtitleRow, Word } from './types'
 
 function randomBlockSuffix(): string {

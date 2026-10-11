@@ -1,5 +1,26 @@
 # AutoSubtitle 싱크 개발 진행 기록
 
+## 2026-10-11 재개 작업 결과 (최신)
+
+사용자가 Claude 수정 이후 재점검을 요청했고, 글자 단위 삭제를 선택했으며 실제 한국어 영상을 제공했다. 아래 이전 기록은 당시 결과이며 최신 상태는 이 절과 `open-issues-handoff.md` 상단을 따른다.
+
+| 범위 | 이번 완료 | 남은 일 |
+|---|---|---|
+| 재생·싱크 UI | 칩 클릭 정지/이동 원자화, 즉시 Space 포커스 수정, 비동기 재생 취소 세대, WebAudio 중복/무음 방지 | 장시간·장치 전환·Bluetooth 검증 |
+| 편집 | 글자 단위 Backspace/Delete, IME draft 처리, 칩 실시간 갱신, 텍스트 수정 stale·원본 시간 보존 | 정확한 새 단어 분할/재정렬, 실제 한글 IME·Undo/Redo·장문 성능 |
+| 타입·데이터 | renderer 기존 오류 28개 제거, token 변환의 정렬 메타/edge-merge 보존 | 프로젝트 v2·전체 ID 수명 검증 |
+| 전사 장치 | 준비/CPU/GPU 상태·진단 표시, lazy CUDA 오류도 CPU 재시도 | 사용자 설치 GPU DLL·패키징 |
+| 정밀 정렬 | 제공 영상 64.266초의 앱 accurate 경로 성공, 128개 중 120개 aligned/8개 unaligned | 미지원 문자·숫자, 사람 기준 경계 오차, 충분한 검증 세트 |
+| 내보내기·런타임 | 기존 FFmpeg 회귀 검사 포함 전체 테스트 통과 | UI부터 단어 강조 export, 전체 decode, DPI/4K/SAR/회전, 취소 worker |
+
+검증: **Vitest 36 files/264 tests**, **Python 17 tests**, web/node 타입 검사, production build, git diff --check 통과. 실앱 재생 조합은 합성 음성·실영상 기본 정렬·실영상 accurate 각각 **36/36**. 실제 출력 WebAudio 소스 수와 clock 차이 검사. 실영상 문자 삭제·포커스·blur 이전 칩 갱신도 통과. accurate의 무음 칩 옆 Backspace는 미디어 삭제이므로 문자 테스트는 인접 발화 칩을 골라 검증했다.
+
+실영상 accurate: CPU fallback 포함 **67.721초**, coverage **93.75%**. 미정렬 8개는 unsupported_character(`캡쳐…`, `모아둡니다`, 숫자 혼용어). coverage를 경계 정확도로 해석하면 안 된다. 수동 경계가 없어 median/p95와 CER/WER는 아직 미측정이다. `tools/sync-validation-output/real-video-accurate.json`에 raw/정렬 결과를 보관했다.
+
+전체 계획 완료는 아니다. 남은 항목의 우선순위·재현 정보는 `open-issues-handoff.md`의 최신 절에 기록했다. 변경은 로컬 저장, 커밋/배포하지 않았다. 기존 pyc 변경 보존, 사용량 초기화 크레딧 미사용.
+
+---
+
 작성: 2026-10-11. 기준 계획: `autosubtitle-desktop-sync-development-plan.md`.
 이번 작업은 전체 완료가 아니다. 사용량 잔여 약 1%에 접근하면 진행 중 변경을 정리하고 종료한다는 사용자 요청에 따른 중간 인계다. 사용량 초기화 크레딧은 사용하지 않았다.
 

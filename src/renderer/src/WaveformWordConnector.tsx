@@ -317,28 +317,16 @@ export function WaveformWordConnector({
         refresh()
       })
     }
-    /** segments.update 는 연속 다발 — 커넥터만 trailing 48ms 묶음(dragged/zoom 는 기존 rAF 합류) */
-    let updateThrottle: ReturnType<typeof setTimeout> | null = null
-    const onSegUpdateThrottled = (): void => {
-      if (updateThrottle !== null) return
-      updateThrottle = window.setTimeout(() => {
-        updateThrottle = null
-        refresh()
-      }, 48)
-    }
     peaks.on('zoomview.update', onZ)
     peaks.on('segments.dragend', onZ)
     peaks.on('segments.dragged', onZ)
     peaks.on('segments.dragstart', onZ)
-    peaks.on('segments.update', onSegUpdateThrottled)
     return () => {
       if (rafPending) cancelAnimationFrame(rafPending)
-      if (updateThrottle !== null) window.clearTimeout(updateThrottle)
       peaks.off('zoomview.update', onZ)
       peaks.off('segments.dragend', onZ)
       peaks.off('segments.dragged', onZ)
       peaks.off('segments.dragstart', onZ)
-      peaks.off('segments.update', onSegUpdateThrottled)
     }
   }, [peaksReady, refresh, peaksRef])
 

@@ -1,5 +1,35 @@
 # AutoSubtitle 데스크톱 — 미해결 문제 인계서
 
+## 2026-10-11 Codex 재점검 갱신 (아래 최초 인계보다 우선)
+
+- P0-1/2 수정: 클릭 시 정지→이동을 한 경로로 처리. 캐럿 포커스를 다음 프레임까지 미루어 즉시 Space가 이전 단어로 전달되던 문제 수정. 오래된 decode/resume/seek 완료와 pause 이벤트가 새 재생을 덮어쓰지 않게 요청 세대 검사 추가.
+- 합성 음성과 사용자 영상 각각 정지/재생 중 × 화면 버튼/Space × 0/50/150ms × 3단어, **36/36 통과**. 실제 WebAudio 활성 소스 1개 및 video/audio 차이 <250ms 검사. 정확한 단어 경계 품질 측정과는 구분한다.
+- P1-1: 사용자 영상을 실제 CDP drag/drop으로 성공시켰다. 기존 사용자 인스턴스의 관리자 권한/UIPI 차이는 미확인.
+- P1-2 수정: 준비 중 CPU로 단정하는 문구 제거, 장치·진단 표시, GPU→CPU 전환을 처리 도중 IPC로 전달. lazy segment iteration CUDA 오류도 부분 결과를 폐기하고 CPU 재시도. 실제 격리 프로필에서 GPU runtime 실패→CPU 안내 확인. 기본 프로필 GPU DLL 검증은 남음.
+- U1: 사용자가 **글자 단위 삭제** 선택. 발화 칩 경계의 Backspace/Delete는 한 grapheme 삭제 후 textarea 문자 커서로 전환. 선택한 단어 범위/무음 블록 삭제는 기존 미디어 편집 유지.
+- U2 수정: textarea 변경을 칩에 즉시 반영. IME 조합 중 draft, compositionend에 반영. 시간/ID 보존, aligned 텍스트 수정은 stale 처리. 새 문구의 정확한 단어별 시간은 재정렬 전까지 보장하지 않음.
+- 추가 수정: SentenceTokenTimeline 참조 캐시를 통하지 않는 변환에서 정렬 메타데이터·edge-merge 플래그 손실. 명시적 보존과 JSON clone round-trip 테스트 추가.
+- 기존 renderer TypeScript 오류 28개 → **0개**. shared 경로, React 19 JSX/이벤트/행 컴포넌트, 브라우저 타이머, nullable waveform, Peaks 이벤트/타입 정리.
+- 최종 검증: Vitest **36 files /264 tests**, Python **17 tests**, web/node 타입 검사·production build 통과. 기존 pyc 변경 보존. 커밋/배포하지 않음.
+
+### 실영상 정렬 결과
+
+- 제공받은 `Rec 0001.mp4`: 1920×1080, AAC 48kHz, 64.266초, video/audio start PTS=0.
+- 격리 앱에서 accurate 환경변수 + `.venv-alignment/Scripts/python.exe`로 전사→WhisperX→편집 화면 완료. CPU fallback 포함 67.721초.
+- 128단어 중 aligned 120, unaligned 8 (**coverage 93.75%**). 정확도가 93.75%라는 의미가 아니다.
+- 미정렬: `캡쳐를` 2회, `캡쳐된`, `모아둡니다`, `캡쳐들은`, `1초만에`, `5종을`, `3배` — unsupported_character. 표기·숫자 정규화와 원문 대응 보완 필요. 임의로 aligned 처리하지 않았다.
+- 사람 정답 경계가 없어 median/p95 오차, CER/WER는 미측정. 20 clips/30분/1,000 boundaries 합격 기준 미달.
+- 결과: `tools/sync-validation-output/real-video-accurate.json`, `real-video-accurate-drop.log`, `real-click-play.log`, `click-play-after2.log` (git 제외).
+
+### 다음 작업 (미완료)
+
+1. 실영상 미지원 음절/숫자 정규화, 재정렬 RPC, 새 텍스트의 단어 분할과 정확한 경계. 지금은 기존 구간에 수정 라벨을 보존한다.
+2. 실제 한글 IME·Undo/Redo 반복·장문 성능 검증. 기존 U3/U4/U6의 의도한 동작 여부 검토.
+3. 프로젝트 v2, worker 취소·오래된 IPC 응답 차단, 30초 초과 정렬 chunk, nonzero source PTS 전달.
+4. 실제 UI 편집→단어 강조 export, 전체 decode, 4K/SAR/회전/DPI/줄바꿈 비교, Windows 설치본·GPU 검증.
+
+---
+
 작성: 2026-10-11. 다음 개발자(GPT 등)가 바로 이어받을 수 있게 **재현 방법·측정값·의심 위치·검증 방법**을 함께 적었다.
 확인되지 않은 것은 "미확인"으로 표시했다. 추측을 사실처럼 적지 않았다.
 

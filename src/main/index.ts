@@ -1257,6 +1257,11 @@ app.whenReady().then(() => {
         sc.setTranscribeProgressHandler((pct) => {
           if (!win.isDestroyed()) win.webContents.send('transcribe:progress', pct)
         })
+        sc.setTranscribeDeviceHandler((device, reason) => {
+          if (win.isDestroyed()) return
+          win.webContents.send('transcribe:mode', mapDeviceToMode(device))
+          if (reason) win.webContents.send('transcribe:diag', { message: reason })
+        })
         const txParams: Record<string, unknown> = { path: absPath }
         const wfCache = await getWaveformCacheJsonPathForMedia(absPath)
         if (wfCache.ok) {
@@ -1317,6 +1322,7 @@ app.whenReady().then(() => {
         if (!win.isDestroyed()) win.webContents.send('transcribe:error', { message })
       } finally {
         sc?.setTranscribeProgressHandler(null)
+        sc?.setTranscribeDeviceHandler(null)
       }
     })()
   })

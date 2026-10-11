@@ -17,7 +17,7 @@ export class VideoSeekUiController {
   private video: HTMLVideoElement
   private opts: VideoSeekUiControllerOptions
   private throttleMs: number
-  private throttleTimer: ReturnType<typeof setTimeout> | null = null
+  private throttleTimer: number | null = null
   private pendingRealSec: number | null = null
   private optimisticVirtualMs: number | null = null
 

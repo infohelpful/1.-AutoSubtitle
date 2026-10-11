@@ -24,6 +24,7 @@ export class PythonSidecar {
   >()
   private onDownloadProgress: ((percent: number) => void) | null = null
   private onTranscribeProgress: ((percent: number) => void) | null = null
+  private onTranscribeDevice: ((device: string, reason?: string) => void) | null = null
   private onExportProgress: ((percent: number, phase?: string) => void) | null = null
   /** 동시에 여러 RPC가 stdin에 쓰면 파이프가 깨져 EPIPE가 난다 — 한 번에 하나만 실행 */
   private callChain: Promise<void> = Promise.resolve()
@@ -52,6 +53,10 @@ export class PythonSidecar {
   /** Python stderr의 `{"type":"progress","value":…}` (transcribe) — stdout RPC와 분리. */
   setTranscribeProgressHandler(handler: ((percent: number) => void) | null): void {
     this.onTranscribeProgress = handler
+  }
+
+  setTranscribeDeviceHandler(handler: ((device: string, reason?: string) => void) | null): void {
+    this.onTranscribeDevice = handler
   }
 
   /** Python `processor` ffmpeg 오버레이 구간의 stderr `export_progress` JSON. */
@@ -104,7 +109,11 @@ export class PythonSidecar {
         stderrBuf = stderrBuf.slice(idx + 1)
         if (!line) continue
         try {
-          const j = JSON.parse(line) as { type?: string; value?: number; phase?: string }
+          const j = JSON.parse(line) as { type?: string; value?: number; phase?: string; device?: string; reason?: string }
+          if (j?.type === 'transcribe_device' && typeof j.device === 'string') {
+            this.onTranscribeDevice?.(j.device, j.reason)
+            continue
+          }
           if (j?.type === 'download_progress' && typeof j.value === 'number') {
             this.onDownloadProgress?.(j.value)
             continue

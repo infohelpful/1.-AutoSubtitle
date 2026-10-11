@@ -8,5 +8,5 @@ export type JsonWaveformData = {
   bits?: number
   length?: number
   data?: number[]
-  channels?: Array<{ data?: number[] }>
+  channels?: number | Array<{ data?: number[] }>
 }

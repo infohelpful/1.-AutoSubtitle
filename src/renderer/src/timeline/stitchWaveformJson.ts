@@ -1,4 +1,5 @@
 import type { JsonWaveformData } from 'peaks.js'
+import type { JsonWaveformData as WaveformInput } from '../../../shared/waveformJson'
 import type { CutRange } from '../../../shared/ipc'
 import { mergeCutRanges } from '../../../shared/timelineCollapse'
 
@@ -11,7 +12,7 @@ export function cutRangesSignature(cuts: readonly CutRange[]): string {
     .join('|')
 }
 
-function getPeaksDataArray(json: JsonWaveformData): number[] | null {
+function getPeaksDataArray(json: WaveformInput): number[] | null {
   const raw = json as unknown as { data?: number[]; channels?: Array<{ data?: number[] }> }
   if (Array.isArray(raw.data) && raw.data.length > 0) return raw.data
   const ch0 = raw.channels?.[0]?.data
@@ -26,7 +27,7 @@ function getPeaksDataArray(json: JsonWaveformData): number[] | null {
  * `samples_per_pixel` 이 없으면 `mediaDurationHintSec`(예: 컨테이너 duration)으로 역산한 뒤 길이를 구한다.
  */
 export function exactTimelineDurationSecFromWaveformJson(
-  json: JsonWaveformData,
+  json: WaveformInput,
   mediaDurationHintSec?: number
 ): number | null {
   const data = getPeaksDataArray(json)

@@ -8,7 +8,7 @@ import { wordsFromPeaksSegments } from './wordMerge'
 import type { SubtitleRow, Word } from './types'
 import { createSilentWavBlob } from './silentWav'
 import { safeFitPeaksContainerView } from '../../peaksSafeFit'
-import { lineEditDisplayFromVrewWordParts, scrubTimelineNoiseFromWordPiece, shouldOmitFromSubtitleEditLineText } from '../../../shared/wordContract'
+import { lineEditDisplayFromVrewWordParts, scrubTimelineNoiseFromWordPiece, shouldOmitFromSubtitleEditLineText } from '../../../../shared/wordContract'
 import { wfLog } from './waveformDebugLog'
 
 function toSegmentOptions(w: Word): SegmentOptions {

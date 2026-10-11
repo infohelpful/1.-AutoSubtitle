@@ -202,7 +202,7 @@ export const VrewRowWaveformCanvas = forwardRef<VrewRowWaveformCanvasHandle, Vre
         const m = metrics
         const target = dragTargetRef.current
         const base = wordsAtDragStartRef.current
-        if (!outer || !vw || !m || !target || !base.length) return
+        if (!outer || !vw || !m || !target || !base?.length) return
         const rect = outer.getBoundingClientRect()
         const newT = clientXToSec(clientX, rect, vw.start, vw.end)
         const sorted = sortWordsByStart(base)

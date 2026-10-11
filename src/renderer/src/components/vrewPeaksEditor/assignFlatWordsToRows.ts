@@ -1,4 +1,4 @@
-import { lineEditDisplayFromVrewWordParts } from '../../../shared/wordContract'
+import { lineEditDisplayFromVrewWordParts } from '../../../../shared/wordContract'
 import type { SubtitleRow, Word } from './types'
 
 /**

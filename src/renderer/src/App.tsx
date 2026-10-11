@@ -8,11 +8,13 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type FormEvent,
   type MouseEvent,
   type CSSProperties,
   type ReactElement
 } from 'react'
 import type { JsonWaveformData } from 'peaks.js'
+import { editSubtitleText } from '../../shared/editSubtitleText'
 
 import type { CutRange, DepsStatus, ExportFormat, GpuRuntimeStatus, TranscribeMode } from '../../shared/ipc'
 import {
@@ -984,6 +986,7 @@ export default function App(): ReactElement {
   const clearOneShotSessionRef = useRef<((reason: string) => void) | null>(null)
   const masterAudioRef = useRef<HTMLAudioElement | null>(null)
   const webAudioMasterPlaybackRef = useRef<WebAudioMasterPlayback | null>(null)
+  const playbackStartRequestRef = useRef(0)
   const deleteOpSeqRef = useRef(0)
   const lastDeleteOpIdRef = useRef<number | null>(null)
   const deleteProbeTimersRef = useRef<number[]>([])
@@ -1483,6 +1486,7 @@ export default function App(): ReactElement {
   }, [])
 
   const clearPlaybackSession = useCallback(() => {
+    playbackStartRequestRef.current += 1
     playbackCommandRouterRef.current.cancelSession(playbackSessionIdRef.current)
     playbackSessionIdRef.current = 0
   }, [])
@@ -1550,7 +1554,8 @@ export default function App(): ReactElement {
   /** IPC 100% 이후 — 리스트·가상행 레이아웃이 끝날 때까지 오버레이 유지할 때 true */
   const [extractAwaitListPaint, setExtractAwaitListPaint] = useState(false)
   const [progress, setProgress] = useState(0)
-  const [transcribeMode, setTranscribeMode] = useState<TranscribeMode>('cpu')
+  const [transcribeMode, setTranscribeMode] = useState<TranscribeMode | null>(null)
+  const [transcribeDiagnostics, setTranscribeDiagnostics] = useState<string[]>([])
   const [isExporting, setIsExporting] = useState(false)
   const [exportProgress, setExportProgress] = useState(0)
   const [exportProgressLabel, setExportProgressLabel] = useState('')
@@ -2171,6 +2176,8 @@ export default function App(): ReactElement {
           : undefined
       clearPlaybackStartupVerifyTimer()
 
+      const request = ++playbackStartRequestRef.current
+      const isCurrent = () => request === playbackStartRequestRef.current && videoRef.current === el
       void (async () => {
         const engine = webAudioMasterPlaybackRef.current
         try {
@@ -2206,10 +2213,12 @@ export default function App(): ReactElement {
               decodeUrl
             })
             await engine.loadFromUrl(decodeUrl)
+            if (!isCurrent()) return
             wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio loadFromUrl 완료')
           }
           engine.stopPlayback()
           await seekVideoElementTo(el, targetMediaSec)
+          if (!isCurrent()) return
           wfLog('peaks', 'startSyncedPlayback [diag-6] WebAudio scheduleFromEdl 호출', {
             targetMediaSec,
             segCount: scheduleInfo.segments.length,
@@ -2220,6 +2229,7 @@ export default function App(): ReactElement {
               ? (previewEndMediaSecRef.current ?? scheduleInfo.segments[scheduleInfo.segments.length - 1]!.endMediaSec)
               : null
           await engine.scheduleFromEdl(scheduleInfo.segments, targetMediaSec, endClamp)
+          if (!isCurrent()) return
           if (!engine.isPlaying()) {
             timelineEditLog('playback', `${source} WebAudio 스케줄 결과 활성 소스 없음 — HTML 폴백`, {
               targetMediaSec,
@@ -2244,6 +2254,7 @@ export default function App(): ReactElement {
           const waProbeStart = engine.getCurrentMediaSec()
           playbackStartupProbeRef.current = { startedAt: performance.now(), waStart: waProbeStart }
           playbackStartupVerifyTimerRef.current = window.setTimeout(() => {
+            if (!isCurrent()) return
             playbackStartupVerifyTimerRef.current = null
             const curEngine = webAudioMasterPlaybackRef.current
             const curAudio = masterAudioRef.current
@@ -2283,6 +2294,7 @@ export default function App(): ReactElement {
           }, 180)
           void el.play().catch(() => undefined)
         } catch (err: unknown) {
+          if (!isCurrent()) return
           timelineEditLog('playback', `${source} WebAudio 스케줄 실패 — HTML 폴백`, {
             message: err instanceof Error ? err.message : String(err)
           })
@@ -3973,7 +3985,7 @@ export default function App(): ReactElement {
   }, [waveformLineIndex, waveformWordId])
 
   const updateSubtitleAt = useCallback((index: number, text: string) => {
-    applySubtitleChange((prev) => prev.map((s, j) => (j === index ? { ...s, text } : s)))
+    applySubtitleChange((prev) => prev.map((s, j) => (j === index ? editSubtitleText(s, text) : s)))
   }, [applySubtitleChange])
 
   const updateSubtitleRangeAt = useCallback((index: number, nextStart: number, nextEnd: number) => {
@@ -4756,6 +4768,8 @@ export default function App(): ReactElement {
    * `onPause` → isPlaying=false 로 RAF 가 끊겨 복귀 seek 이 안 됨 — pause 직후 구간 밖이면 즉시 재생.
    */
   const handleVideoPause = useCallback(() => {
+    // A queued pause event can arrive after a newer user play command.
+    if (isEdlSessionActive() && !userPauseRequestedRef.current) return
     freezeUiPlayheadRaf()
     timelineEditLog('playback', 'pause-event video.onPause entry(handleVideoPause)', {
       enginePlaybackDesired: isEdlSessionActive(),
@@ -5032,6 +5046,11 @@ export default function App(): ReactElement {
     clearOneShotSession('pausePlayback')
     finalizePlaybackStop('pausePlayback', { markUserPause: true })
   }, [clearOneShotSession, finalizePlaybackStop, isBuffering])
+
+  const navigateToWord = useCallback((startSec: number) => {
+    pausePlayback('word-chip-click')
+    seekToSubtitleStartFromUserInput(startSec)
+  }, [pausePlayback, seekToSubtitleStartFromUserInput])
 
   /**
    * **재생 세션 perf 초기화 / emit** — isPlaying 만 의존하므로 mid-playback 의 viewWin /
@@ -5575,8 +5594,8 @@ export default function App(): ReactElement {
 
   /** 드래그 중(input) — scrubToVirtualMs (낙관적 UI + 비디오 currentTime 스로틀) */
   const onSeekSliderInput = useCallback(
-    (e: ChangeEvent<HTMLInputElement>) => {
-      const editV = Number(e.target.value)
+    (e: FormEvent<HTMLInputElement>) => {
+      const editV = Number(e.currentTarget.value)
       if (!Number.isFinite(editV)) return
       const editClamped = clampProgramEditSec(editV)
       scrubToVirtualMs(Math.round(editClamped * 1000))
@@ -5648,7 +5667,8 @@ export default function App(): ReactElement {
       undoStackRef.current = []
       redoStackRef.current = []
       setProgress(0)
-      setTranscribeMode('cpu')
+      setTranscribeMode(null)
+      setTranscribeDiagnostics([])
       if (modelReady && !busy) {
         pendingAutoTranscribeRef.current = null
         setIsExtracting(true)
@@ -5725,12 +5745,13 @@ export default function App(): ReactElement {
     const offM = window.api.onTranscribeMode((mode) => {
       setTranscribeMode(mode)
     })
-    const offD = window.api.onTranscribeDiag(() => {})
+    const offD = window.api.onTranscribeDiag(({ message }) => {
+      setTranscribeDiagnostics(prev => [...prev.slice(-7), message])
+    })
     const offP = window.api.onTranscribeProgress((pct) => {
       setProgress((prev) => Math.max(prev, Math.min(100, pct)))
     })
     const offC = window.api.onTranscribeComplete((raw) => {
-      setTranscribeMode('cpu')
       const rawLines = parseSubtitleLines((raw as { subtitles?: unknown })?.subtitles)
       /**
        * `end > start` 가 깨진 단어는 카드 레이아웃·캐럿 측정에서 NaN/음수 폭을 만들어
@@ -5831,7 +5852,8 @@ export default function App(): ReactElement {
       setExtractAwaitListPaint(false)
       setIsExtracting(false)
       setProgress(0)
-      setTranscribeMode('cpu')
+      setTranscribeMode(null)
+      setTranscribeDiagnostics([])
     })
     return () => {
       offM()
@@ -6911,6 +6933,12 @@ export default function App(): ReactElement {
                 </div>
               </div>
             )}
+            {transcribeDiagnostics.length > 0 && (
+              <details className="text-xs p-2" aria-label="자막 추출 진단">
+                <summary>자막 추출 정보</summary>
+                {transcribeDiagnostics.map((message, i) => <p key={i}>{message}</p>)}
+              </details>
+            )}
           </section>
 
           <div
@@ -6996,7 +7024,7 @@ export default function App(): ReactElement {
                           onSubtitleCardClick={onSubtitleCardClick}
                           onCardNavigate={seekToSubtitleStartFromNavigate}
                           onRequestPausePlayback={pausePlayback}
-                          onWordBlockClick={seekToSubtitleStartFromUserInput}
+                          onWordBlockClick={navigateToWord}
                           onWaveformSeekAndPlay={seekAndPlayFromSubtitleList}
                           splitSubtitleAtWord={splitSubtitleAtWord}
                           backspaceWordAt={backspaceWordAt}
@@ -7025,7 +7053,7 @@ export default function App(): ReactElement {
                         />
                       </SubtitleDataProvider>
                     </div>
-                    {modelReady &&
+                    {modelReady && (stitchedWaveformJsonComputed ?? waveformPeaksJsonData) &&
                     (READ_SUBTITLES_FROM_VIRTUAL_TIMELINE ? subtitlesForList.length > 0 : subtitles.length > 0) ? (
                       <SubtitleWaveformPeaks
                         ref={waveformPeaksRef}
@@ -7033,7 +7061,7 @@ export default function App(): ReactElement {
                         onRowsChange={onVrewRowsChange}
                         audioUrl={masterAudioSrcUrl ?? waveformMediaUrl}
                         localMediaPath={videoPath}
-                        precomputedWaveformJson={stitchedWaveformJsonComputed ?? waveformPeaksJsonData}
+                        precomputedWaveformJson={(stitchedWaveformJsonComputed ?? waveformPeaksJsonData)!}
                         precomputedWaveformIsEditAxis={stitchedWaveformJsonComputed != null}
                         playheadProgramToPeaksSec={waveformPlayheadProgramToPeaksSec}
                         precomputedPeaksJsonFileUrl={null}
@@ -7101,6 +7129,7 @@ export default function App(): ReactElement {
             <h2 id="extract-modal-title" className="extract-modal-title">
               {extractAwaitListPaint
                 ? '자막 화면을 불러오는 중…'
+                : transcribeMode == null ? '자막 추출을 준비하고 있습니다…'
                 : transcribeMode === 'gpu'
                   ? 'GPU모드로 자막을 추출하고 있습니다...'
                   : 'CPU모드로 자막을 추출하고 있습니다...'}
@@ -7115,6 +7144,7 @@ export default function App(): ReactElement {
               <div className="extract-progress-fill" style={{ width: `${Math.min(100, progress)}%` }} />
             </div>
             <p className="extract-modal-pct">{Math.round(progress)}%</p>
+            <p className="text-xs" role="status">{transcribeDiagnostics.at(-1)}</p>
           </div>
         </div>
       ) : null}

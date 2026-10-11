@@ -7,6 +7,9 @@
 
 /** 단일 단어 토큰 — 원본 미디어 절대 시간(초) */
 export interface TimelineToken {
+  /** Source identity and alignment state, separate from the timeline slot ID. */
+  wordMeta?: import('./wordAlignmentMeta').WordAlignmentMeta
+  mergedByEdgeTrim?: boolean
   id: string
   text: string
   start_original: number

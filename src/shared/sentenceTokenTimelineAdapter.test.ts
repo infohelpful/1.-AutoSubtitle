@@ -5,6 +5,15 @@ import {
 } from './sentenceTokenTimelineAdapter'
 
 describe('sentenceTokenTimelineAdapter', () => {
+  it('preserves alignment identity and edge-merge state without the reference cache', () => {
+    const meta = { id: 'source-word', alignmentStatus: 'stale' as const, rawStart: 0.1,
+      rawEnd: 0.9, sourceStart: 0.2, sourceEnd: 0.8, manualEndLocked: true,
+      reviewReasons: ['text_edited'], mergedByEdgeTrim: true }
+    const timeline = subtitleLinesToSentenceTokenTimeline([{ start: 0, end: 1, text: '말',
+      words: [{ ...meta, start: 0, end: 1, word: '말' }] }])
+    const result = sentenceTokenTimelineToSubtitleLines(JSON.parse(JSON.stringify(timeline)))
+    expect(result[0].words?.[0]).toMatchObject(meta)
+  })
   it('round-trips simple two-line subtitles', () => {
     const lines = [
       {

@@ -61,3 +61,39 @@ it('removes old character timing when a later attempt cannot align the word', ()
   const returned = {...request, words: [{id: 'x', start: 0, end: 1, word: '말', alignmentStatus: 'unaligned' as const}]}
   expect(mergeRealignedCue(cue, request, returned).words![0].charSpans).toBeUndefined()
 })
+
+it('uses full sentence context but applies only selected stable IDs', () => {
+  const line = {start:0,end:3,text:'하나 둘 셋',words:[
+    {id:'a',word:'하나',start:0,end:.9,alignmentStatus:'estimated' as const},
+    {id:'b',word:'둘',start:1,end:1.9}, {id:'c',word:'셋',start:2,end:3}
+  ]}
+  const request = prepareRealignCue(line,'r')
+  const returned = {...request,words:request.words!.map(w=>({...w,start:w.start+.1,end:w.end-.1,alignmentStatus:'aligned' as const}))}
+  const next = mergeRealignedCue(line,request,returned,new Set(['b']))
+  expect(next.words![0]).toBe(line.words[0])
+  expect(next.words![2]).toBe(line.words[2])
+  expect(next.words![1]).toMatchObject({id:'b',start:1.1,alignmentStatus:'aligned'})
+  expect(next.words![1].end).toBeCloseTo(1.8)
+  const disjoint = mergeRealignedCue(line,request,returned,new Set(['a','c']))
+  expect(disjoint.words![1]).toBe(line.words[1])
+  expect(disjoint.words![0].alignmentStatus).toBe('aligned')
+  expect(disjoint.words![2].alignmentStatus).toBe('aligned')
+  expect(() => mergeRealignedCue(line,request,returned,new Set(['missing']))).toThrow('다시 선택')
+  expect(() => mergeRealignedCue(line,request,returned,new Set())).toThrow('다시 선택')
+  returned.words[1].start = 2.5
+  returned.words[1].end = 2.9
+  expect(() => mergeRealignedCue(line,request,returned,new Set(['b']))).toThrow('충돌')
+})
+
+it('retokenizes only the selected phrase and keeps context phrases unchanged', () => {
+  const line = {start:0,end:4,text:'새 문장 다른 문장',words:[
+    {id:'a',word:'새 문장',start:0,end:2}, {id:'b',word:'다른 문장',start:2,end:4}
+  ]}
+  const request = prepareRealignCue(line,'r')
+  const returned = {...request,words:request.words!.map((w,i)=>({...w,start:i,end:i+.9,
+    sourceStart:i,sourceEnd:i+.9,alignmentStatus:'aligned' as const}))}
+  const next = mergeRealignedCue(line,request,returned,new Set(['a']))
+  expect(next.words!.map(w=>w.word)).toEqual(['새','문장','다른 문장'])
+  expect(next.words![1].parentWordId).toBe('a')
+  expect(next.words![2]).toBe(line.words[1])
+})

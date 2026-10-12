@@ -122,6 +122,12 @@ beforeEach(() => {
 })
 
 describe('openSubtitleCapturePool.stream', () => {
+  it('keeps original layout dimensions when the capture is downscaled', async () => {
+    const pool = await openSubtitleCapturePool({ subtitleStyle: { ...style, layoutWidth: 3840, layoutHeight: 2160 }, stateCount: 1 })
+    try { for await (const _ of pool.stream(states(1))) { /* consume the capture */ } }
+    finally { pool.close() }
+    expect(h.state.sent[0].payload).toMatchObject({ width: 320, height: 240, layoutWidth: 3840, layoutHeight: 2160, fontSize: 26 })
+  })
   it('yields states in schedule order with the word-highlight payload', async () => {
     const pool = await openSubtitleCapturePool({ subtitleStyle: style, stateCount: 7 })
     const input = states(7)

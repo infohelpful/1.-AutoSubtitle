@@ -46,6 +46,9 @@ body {
   font-size: 0.8rem;
 }
 .word-reading-editor p { margin: 0.4rem 0; color: #b7c0ce; }
+.word-alignment-selection { margin: 0.6rem 0; padding: 0.4rem; border: 1px solid #485568; border-radius: 6px; }
+.word-alignment-selection > div { display: flex; flex-wrap: wrap; gap: 0 0.8rem; max-height: 8rem; overflow-y: auto; }
+.word-reading-editor .word-alignment-selection input { width: auto; flex: none; }
 .word-reading-editor form, .word-reading-editor > div {
   display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
 }

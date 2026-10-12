@@ -52,6 +52,8 @@ contextBridge.exposeInMainWorld('electron', {
 })
 
 contextBridge.exposeInMainWorld('api', {
+  prepareSourceMedia: (path: string, requestId: string) => ipcRenderer.invoke('media:prepareSource', path, requestId),
+  cancelMediaPreparation: (requestId: string) => ipcRenderer.invoke('media:cancelPreparation', requestId),
   openVideoFileDialog: () =>
     ipcRenderer.invoke('dialog:openVideo') as Promise<OpenVideoDialogResult>,
   getPathForFile: (file: File) => webUtils.getPathForFile(file),

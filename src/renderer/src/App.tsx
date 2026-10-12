@@ -21,6 +21,8 @@ import { setWordReading } from '../../shared/wordReading'
 import { subtitleLinesMeaningfullyChanged } from '../../shared/subtitleEditHistory'
 import { WordReadingEditor } from './components/WordReadingEditor'
 import { sameMedia, type MediaFingerprint, type MediaFingerprintResult } from '../../shared/projectMedia'
+import type { PreparedMedia } from '../../shared/preparedMedia'
+import { seekVideoElementTo } from './timeline/seekVideo'
 
 import type { CutRange, DepsStatus, ExportFormat, GpuRuntimeStatus, TranscribeMode } from '../../shared/ipc'
 import {
@@ -137,13 +139,6 @@ const PLAYHEAD_STEP_SEC = 0.001
  */
 const READ_SUBTITLES_FROM_VIRTUAL_TIMELINE = false
 
-/** 구버전 전용: 영상 옆 `{stem}.autosub-peaks.json` — 글로벌 캐시 miss 시 한 번만 읽기 */
-function legacyPeaksJsonBesideMedia(absoluteMediaPath: string): string {
-  const t = absoluteMediaPath.trim()
-  const d = t.lastIndexOf('.')
-  const base = d > 0 ? t.slice(0, d) : t
-  return `${base}.autosub-peaks.json`
-}
 const RELEASES_PAGE_URL = 'https://github.com/infohelpful/1.-AutoSubtitle/releases'
 const SUBTITLE_STYLE_STORAGE_KEY = 'autosubtitle:preview-subtitle-style'
 const RECENT_FONTS_STORAGE_KEY = 'autosubtitle:recent-fonts'
@@ -495,29 +490,6 @@ function getEditTimeFromMediaTime(mediaSec: number, cutRanges: CutRange[]): numb
   return editSec
 }
 
-function seekVideoElementTo(videoEl: HTMLVideoElement, targetVideoSec: number): Promise<void> {
-  return new Promise((resolve) => {
-    const target = Math.max(0, Number(targetVideoSec))
-    let settled = false
-    const done = (): void => {
-      if (settled) return
-      settled = true
-      window.clearTimeout(tid)
-      videoEl.removeEventListener('seeked', onSeeked)
-      resolve()
-    }
-    const tid = window.setTimeout(done, 420)
-    const onSeeked = (): void => {
-      done()
-    }
-    videoEl.addEventListener('seeked', onSeeked, { once: true })
-    videoEl.currentTime = target
-    queueMicrotask(() => {
-      if (Math.abs(videoEl.currentTime - target) < 0.002) done()
-    })
-  })
-}
-
 /**
  * `HTMLAudioElement.currentTime` 재할당은 값이 거의 같아도 seeking 이벤트를 유발해 재생을 끊을 수 있다.
  * (일시정지 시 `syncPausedMasterToEdit` 같은 경로에서 흔함)
@@ -545,6 +517,7 @@ function playMasterVideoSynced(
   videoEl: HTMLVideoElement,
   opts?: {
     onAudioPlayRejected?: (reason?: unknown) => void
+    isCurrent?: () => boolean
     targetVideoSec?: number
     targetAudioSec?: number
     /** stitched 마스터: HTML 오디오 currentTime 이 편집 축 — 비디오 미디어 시각으로 바꿀 때 사용 */
@@ -554,7 +527,10 @@ function playMasterVideoSynced(
   const A_V_PLAY_EVENT_GAP_MS = 220
   const AUDIO_PLAYING_GATE_MS = 120
   const SEEK_EVENT_FALLBACK_MS = 320
+  const isCurrent = (): boolean => opts?.isCurrent?.() !== false
   const playBoth = (): void => {
+    if (!isCurrent()) return
+    masterAudio.muted = false
     const startedAt = performance.now()
     let audioPlayingAt: number | null = null
     let videoPlayingAt: number | null = null
@@ -567,6 +543,7 @@ function playMasterVideoSynced(
     masterAudio.addEventListener('playing', onAudioPlaying, { once: true })
     videoEl.addEventListener('playing', onVideoPlaying, { once: true })
     window.setTimeout(() => {
+      if (!isCurrent()) return
       const oneSideMissing = audioPlayingAt == null || videoPlayingAt == null
       if (!oneSideMissing) return
       /**
@@ -599,9 +576,10 @@ function playMasterVideoSynced(
       try {
         await masterAudio.play()
       } catch (e: unknown) {
-        opts?.onAudioPlayRejected?.(e)
+        if (isCurrent()) opts?.onAudioPlayRejected?.(e)
         return
       }
+      if (!isCurrent()) return
       await new Promise<void>((resolve) => {
         if (!masterAudio.paused) {
           resolve()
@@ -618,7 +596,7 @@ function playMasterVideoSynced(
         masterAudio.addEventListener('playing', onPlaying, { once: true })
         window.setTimeout(finish, AUDIO_PLAYING_GATE_MS)
       })
-      void videoEl.play().catch(() => undefined)
+      if (isCurrent()) void videoEl.play().catch(() => undefined)
     })()
   }
   const targetState = HTMLMediaElement.HAVE_FUTURE_DATA
@@ -648,6 +626,7 @@ function playMasterVideoSynced(
   }
 
   const playSync = (): void => {
+    if (!isCurrent()) { done = true; cleanup(); return }
     if (done) return
     if (!videoSeekDone || !audioSeekDone) return
     if (!haveBothReady()) return
@@ -690,6 +669,7 @@ function playMasterVideoSynced(
     if (nudge != null) {
       el.currentTime = nudge
       once(el, 'seeked', () => {
+        if (!isCurrent()) { cleanup(); return }
         el.currentTime = target
         once(el, 'seeked', done)
       })
@@ -703,6 +683,7 @@ function playMasterVideoSynced(
     masterAudio.networkState === HTMLMediaElement.NETWORK_NO_SOURCE || masterAudio.readyState === 0
 
   const runSeekAndPlay = (): void => {
+    if (!isCurrent()) { cleanup(); return }
     if (shouldSeekVideo && Number.isFinite(targetVideoSec)) {
       seekWithNudge(videoEl, Number(targetVideoSec), () => {
         videoSeekDone = true
@@ -918,6 +899,24 @@ export default function App(): ReactElement {
   })
   const [busy, setBusy] = useState(false)
   const [videoPath, setVideoPath] = useState<string | null>(null)
+  const [preparedSource, setPreparedSource] = useState<{ path: string; media: PreparedMedia } | null>(null)
+  const [mediaPrepareError, setMediaPrepareError] = useState('')
+  const preparedMedia = preparedSource?.path === videoPath ? preparedSource.media : null
+  useEffect(() => {
+    let canceled = false
+    const requestId = crypto.randomUUID()
+    setPreparedSource(null)
+    setMediaPrepareError('')
+    if (videoPath) void window.api.prepareSourceMedia(videoPath, requestId).then(result => {
+      if (canceled) return
+      if (result.ok) setPreparedSource({ path: videoPath, media: result.media })
+      else setMediaPrepareError(result.reason)
+    }).catch(error => { if (!canceled) setMediaPrepareError(String(error)) })
+    return () => {
+      canceled = true
+      if (videoPath) void window.api.cancelMediaPreparation(requestId).catch(() => {})
+    }
+  }, [videoPath])
   const [modelReady, setModelReady] = useState(false)
   /** 초기 IPC로 FFmpeg·모델 존재 여부를 확인한 뒤에만 엔진 게이트 표시(미확인 시 깜빡임 방지) */
   const [depsResolved, setDepsResolved] = useState(false)
@@ -1740,10 +1739,10 @@ export default function App(): ReactElement {
   )
   const playbackTimelineMappingRef = useRef(playbackTimelineMapping)
   playbackTimelineMappingRef.current = playbackTimelineMapping
-  /** Web Audio·스티치 빌드 시 동일하게 쓸 원본 미디어 URL(blob 아님) */
+  /** ASR, peaks and WebAudio all use the video-epoch PCM, including leading silence. */
   const waveformMediaUrl = useMemo(
-    () => (videoPath ? window.api.getMediaFileUrl(videoPath) : undefined),
-    [videoPath]
+    () => (preparedMedia ? window.api.getMediaFileUrl(preparedMedia.audioPath) : undefined),
+    [preparedMedia]
   )
   const playbackSnapshot = useMemo(
     () => ({
@@ -2125,7 +2124,7 @@ export default function App(): ReactElement {
        */
       const el = videoRef.current
       const masterAudio = masterAudioRef.current
-      if (!el || !masterAudio) {
+      if (!el || !masterAudio || !waveformMediaUrl) {
         wfLog('peaks', 'startSyncedPlayback 차단 [diag-6] refs 없음', {
           targetEditSec,
           hasVideoEl: el != null,
@@ -2166,6 +2165,7 @@ export default function App(): ReactElement {
         playbackMasterMode: playbackSnapshot.masterMode
       })
 
+      masterAudio.muted = true
       masterAudio.pause()
       assignMasterAudioTimelineSecIfNeeded(masterAudio, Math.max(0, targetAudioSec))
 
@@ -2188,6 +2188,7 @@ export default function App(): ReactElement {
               hasDecodeUrl: decodeUrl != null
             })
             playMasterVideoSynced(masterAudio, el, {
+              isCurrent,
               targetVideoSec: targetMediaSec,
               targetAudioSec,
               onAudioPlayRejected: options?.onAudioPlayRejected,
@@ -2202,6 +2203,7 @@ export default function App(): ReactElement {
               segCount: scheduleInfo?.segments.length ?? 0
             })
             playMasterVideoSynced(masterAudio, el, {
+              isCurrent,
               targetVideoSec: targetMediaSec,
               targetAudioSec,
               onAudioPlayRejected: options?.onAudioPlayRejected,
@@ -2242,6 +2244,7 @@ export default function App(): ReactElement {
               segCount: scheduleInfo.segments.length
             })
             playMasterVideoSynced(masterAudio, el, {
+              isCurrent,
               targetVideoSec: targetMediaSec,
               targetAudioSec,
               onAudioPlayRejected: options?.onAudioPlayRejected,
@@ -2287,6 +2290,7 @@ export default function App(): ReactElement {
             playbackStartupProbeRef.current = null
             waLastMediaSecRef.current = null
             playMasterVideoSynced(curAudio, curVideo, {
+              isCurrent,
               targetVideoSec: targetMediaSec,
               targetAudioSec,
               onAudioPlayRejected: options?.onAudioPlayRejected,
@@ -2296,6 +2300,7 @@ export default function App(): ReactElement {
           void el.play().catch(() => undefined)
         } catch (err: unknown) {
           if (!isCurrent()) return
+          engine?.stopPlayback()
           timelineEditLog('playback', `${source} WebAudio 스케줄 실패 — HTML 폴백`, {
             message: err instanceof Error ? err.message : String(err)
           })
@@ -2303,6 +2308,7 @@ export default function App(): ReactElement {
             message: err instanceof Error ? err.message : String(err)
           })
           playMasterVideoSynced(masterAudio, el, {
+            isCurrent,
             targetVideoSec: targetMediaSec,
             targetAudioSec,
             onAudioPlayRejected: options?.onAudioPlayRejected,
@@ -3216,7 +3222,7 @@ export default function App(): ReactElement {
   )
 
   useEffect(() => {
-    if (!videoPath) {
+    if (!videoPath || !preparedMedia) {
       setWaveformPeaksJsonPath(null)
       setWaveformPeaksJsonData(null)
       setWaveformPeaksJsonLoading(false)
@@ -3236,7 +3242,6 @@ export default function App(): ReactElement {
       try {
         const cacheRes = await window.api.getWaveformPeaksCachePath(videoPath)
       const cachePath = cacheRes.ok ? cacheRes.cachePath : null
-      const legacyPath = legacyPeaksJsonBesideMedia(videoPath)
       let peaksJsonLoaded = false
 
       const readPeaksJsonUsable = async (
@@ -3280,31 +3285,6 @@ export default function App(): ReactElement {
         }
       }
 
-      if (!peaksJsonLoaded && legacyPath !== cachePath) {
-        const leg = await readPeaksJsonUsable(legacyPath)
-        if (cancelled) return
-        if (leg.ok) {
-          setWaveformPeaksJsonPath(legacyPath)
-          setWaveformPeaksJsonData(leg.json)
-          peaksJsonLoaded = true
-          void window.api
-            .logWaveformDebug(
-              'waveform',
-              '레거시(영상 옆) .autosub-peaks.json 로드 — 피크 JSON + CUT용 버퍼 디코딩 진행',
-              legacyPath
-            )
-            .catch(() => {})
-        } else if (leg.coarse) {
-          void window.api
-            .logWaveformDebug(
-              'waveform',
-              '레거시 peaks 가 거친 해상도 — audiowaveform 재생성 시도',
-              legacyPath
-            )
-            .catch(() => {})
-        }
-      }
-
       if (!peaksJsonLoaded) {
         try {
           let ffmpegPath: string | undefined
@@ -3314,6 +3294,7 @@ export default function App(): ReactElement {
           } catch {
             /* FFmpeg 미준비 시 Python env 의 AUTOSUBTITLE_FFMPEG_PATH 로 처리 */
           }
+          if (cancelled) return
           const raw = await window.api.sidecarCall('waveform_peaks', {
             path: videoPath,
             ...(ffmpegPath ? { ffmpeg_path: ffmpegPath } : {})
@@ -3361,7 +3342,7 @@ export default function App(): ReactElement {
     return () => {
       cancelled = true
     }
-  }, [videoPath])
+  }, [videoPath, preparedMedia])
 
   /** 디바운스 없이 동기 useMemo 로 만든 stitched 결과의 로그/진단만 별도 effect 에서 처리 */
   useEffect(() => {
@@ -5078,7 +5059,7 @@ export default function App(): ReactElement {
     }
   }, [videoPath])
 
-  const realignCurrentLine = useCallback(async (targetIndex?: number) => {
+  const realignCurrentLine = useCallback(async (targetIndex?: number, wordIds?: string[]) => {
     if (!videoPath || realigning || isExtracting) return
     const snapshot = subtitlesRef.current
     const index = targetIndex ?? waveformLineIndex ?? activeSubtitleIndexRef.current ?? 0
@@ -5089,7 +5070,7 @@ export default function App(): ReactElement {
     const revision = ++alignmentRevisionRef.current
     alignmentRequestRef.current = requestId
     setRealigning(true)
-    setAlignmentNotice(`${index + 1}번 줄의 음성을 다시 맞추고 있습니다…`)
+    setAlignmentNotice(`${index + 1}번 줄${wordIds ? '의 선택 단어' : ''} 싱크를 다시 맞추고 있습니다…`)
     try {
       const cue = prepareRealignCue(line, requestId)
       const result = await window.api.realignWords({ requestId, revision, timelineId: videoPath, path: videoPath, cues: [cue] })
@@ -5101,10 +5082,12 @@ export default function App(): ReactElement {
         return
       }
       if (result.subtitles.length !== 1) throw new Error('정렬 결과 줄 수가 다릅니다.')
-      const nextLine = mergeRealignedCue(line, cue, result.subtitles[0])
+      const selectedIds = wordIds ? new Set(wordIds) : undefined
+      const nextLine = mergeRealignedCue(line, cue, result.subtitles[0], selectedIds)
       applySubtitleChange(prev => prev.length === snapshot.length && prev.every((item, i) => item === snapshot[i])
         ? prev.map((item, i) => i === index ? nextLine : item) : prev)
-      const reviewWords = (nextLine.words ?? []).filter(word => !word.isDeleted && !word.isSilence && word.reviewReasons?.length).length
+      const reviewWords = (nextLine.words ?? []).filter(word => !word.isDeleted && !word.isSilence && word.reviewReasons?.length &&
+        (!selectedIds || selectedIds.has(word.id ?? '') || selectedIds.has(word.parentWordId ?? ''))).length
       setAlignmentNotice(`정렬 완료 · 검토 필요 ${reviewWords}개. 실행 취소로 되돌릴 수 있습니다.`)
     } catch (error) {
       if (alignmentRequestRef.current === requestId) setAlignmentNotice(error instanceof Error ? error.message : String(error))
@@ -6904,6 +6887,7 @@ export default function App(): ReactElement {
             style={{ width: `${previewWidthPct}%` }}
             data-waveform-no-dismiss="1"
           >
+            {videoPath && !preparedMedia ? <p role="status">{mediaPrepareError || '영상과 음성의 시간축을 준비하고 있습니다…'}</p> : null}
             {videoPath ? (
               <>
                 <div className={previewMediaClass}>
@@ -6911,7 +6895,7 @@ export default function App(): ReactElement {
                     <audio
                       ref={masterAudioRef}
                       preload="metadata"
-                      src={masterAudioSrcUrl ?? window.api.getMediaFileUrl(videoPath)}
+                      src={waveformMediaUrl}
                       className="hidden"
                       muted
                       onTimeUpdate={syncFromVideo}
@@ -6920,6 +6904,7 @@ export default function App(): ReactElement {
                       onPlay={() => {}}
                       onPlaying={() => {
                         audioPlayingSeenRef.current = true
+                        markPlaybackActiveIfAudioClockReady('audio')
                         snapUiAfterMediaPlaying()
                       }}
                       onWaiting={() => {
@@ -6931,6 +6916,7 @@ export default function App(): ReactElement {
                         freezeUiPlayheadRaf()
                       }}
                       onPause={() => {
+                        if (isEdlSessionActive() && !userPauseRequestedRef.current) return
                         freezeUiPlayheadRaf()
                         timelineEditLog('playback', 'pause-event audio.onPause entry', {
                           enginePlaybackDesired: isEdlSessionActive(),
@@ -6964,7 +6950,7 @@ export default function App(): ReactElement {
                       preload="metadata"
                       playsInline
                       muted
-                      src={window.api.getMediaFileUrl(videoPath)}
+                      src={preparedMedia ? window.api.getMediaFileUrl(preparedMedia.previewPath) : undefined}
                       title={videoPath}
                       onTimeUpdate={syncFromVideo}
                       onLoadedMetadata={() => {
@@ -7038,6 +7024,7 @@ export default function App(): ReactElement {
                   <button
                     type="button"
                     className="preview-play-btn"
+                    disabled={!preparedMedia}
                     onClick={dispatchTogglePlayIntent}
                     aria-label={isPlaying ? '일시정지' : '재생'}
                   >
@@ -7150,6 +7137,7 @@ export default function App(): ReactElement {
                   key={`${projectGenerationRef.current}:${readingLineIndex}`} line={subtitles[readingLineIndex]} lineIndex={readingLineIndex}
                   onApply={applyWordReading} onClose={() => setReadingLineIndex(null)}
                   onRealign={() => void realignCurrentLine(readingLineIndex)}
+                  onRealignWords={ids => void realignCurrentLine(readingLineIndex, ids)}
                   realignDisabled={!videoPath || realigning || isExtracting || projectIoBusy} /> : null}
                 {timelineAxisMismatch ? (
                   <p
@@ -7224,7 +7212,7 @@ export default function App(): ReactElement {
                         ref={waveformPeaksRef}
                         rows={vrewRows}
                         onRowsChange={onVrewRowsChange}
-                        audioUrl={masterAudioSrcUrl ?? waveformMediaUrl}
+                        audioUrl={waveformMediaUrl}
                         localMediaPath={videoPath}
                         precomputedWaveformJson={(stitchedWaveformJsonComputed ?? waveformPeaksJsonData)!}
                         precomputedWaveformIsEditAxis={stitchedWaveformJsonComputed != null}

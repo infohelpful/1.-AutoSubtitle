@@ -19,6 +19,37 @@ function run(args: string[]): Buffer {
 }
 
 describe.skipIf(!ffmpeg || !existsSync(ffmpeg))('real FFmpeg source-to-program export', () => {
+  it.each([[2, 0], [2, 90], [8/9, 90]])('matches display pixels and overlay placement for SAR=%s and rotation=%s', async (sar, rotation) => {
+    mkdirSync(output, { recursive: true })
+    const base = join(output, `sar-base-${sar}-${rotation}.mp4`)
+    const source = join(output, `sar-source-${sar}-${rotation}.mp4`)
+    const target = join(output, `sar-result-${sar}-${rotation}.mp4`)
+    run(['-f', 'lavfi', '-i', `color=blue:s=${sar<1?'720x480':'64x32'}:r=30:d=1`, '-vf', `setsar=${sar}`, '-c:v', 'libx264', base])
+    run(['-display_rotation:v:0', String(rotation), '-i', base, '-c', 'copy', source])
+    const media = probeMediaTiming(ffprobe, source)
+    const width = sar<1 ? 540 : rotation ? 32 : 128, height = sar<1 ? 720 : rotation ? 128 : 32
+    expect([media.width, media.height]).toEqual([width, height])
+    const overlay = Buffer.alloc(width * height * 4)
+    // Green upper-right quarter must reach the displayed right edge, without stretching the source.
+    for (let y = 0; y < height / 2; y++) for (let x = width * 3 / 4; x < width; x++) {
+      overlay[(y * width + x) * 4 + 1] = 255
+      overlay[(y * width + x) * 4 + 3] = 255
+    }
+    await runSinglePassSubtitleBurnIn({
+      ffmpegPath: ffmpeg, inputVideoPath: source, outputPath: target,
+      fullVideoWidth: media.width, fullVideoHeight: media.height, renderWidth: width, renderHeight: height,
+      overlayDurationSec: 1, rawBgraBuffers: [overlay], timing: [{ start: 0, end: 1 }], h264Encoder: 'libx264',
+      clipPlan: clipPlanFromCuts(1, []), sourceDurationSec: 1, sourceOriginSec: media.sourceOriginSec, hasAudio: false
+    })
+    expect(probeMediaTiming(ffprobe, target)).toMatchObject({ width, height })
+    const probe = spawnSync(ffprobe, ['-v', 'error', '-show_streams', '-of', 'json', target], { encoding: 'utf8', windowsHide: true })
+    expect(JSON.parse(probe.stdout).streams[0].sample_aspect_ratio).toBe('1:1')
+    const frame = run(['-ss', '0.5', '-i', target, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
+    expect(frame.length).toBe(width * height * 3)
+    const pixel = (x: number, y: number) => [...frame.subarray((y * width + x) * 3, (y * width + x) * 3 + 3)]
+    expect(pixel(width - 4, 4)[1]).toBeGreaterThan(200)
+    expect(pixel(4, height - 4)[2]).toBeGreaterThan(200)
+  })
   async function burn(source: string, target: string, cuts: Array<{ start: number; end: number }> = []): Promise<void> {
     const media = probeMediaTiming(ffprobe, source)
     const clips = clipPlanFromCuts(media.duration, cuts)

@@ -137,6 +137,8 @@ function defaultExportStyle(style: ExportSubtitleStyle | undefined): ExportSubti
     y: style?.y ?? 10,
     videoWidth: style?.videoWidth,
     videoHeight: style?.videoHeight,
+    layoutWidth: style?.layoutWidth,
+    layoutHeight: style?.layoutHeight,
     wordHighlightColor: style?.wordHighlightColor
   }
 }
@@ -153,6 +155,8 @@ function toUpdatePayload(
     text,
     width,
     height,
+    layoutWidth: s.layoutWidth ?? width,
+    layoutHeight: s.layoutHeight ?? height,
     // 항상 두 필드를 보내 이전 프레임의 강조가 남지 않게 한다.
     words: highlight?.words,
     activeIndex: highlight?.activeIndex ?? -1,

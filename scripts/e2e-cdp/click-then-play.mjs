@@ -1,6 +1,14 @@
 // Regression: a chip click while playing must become the next start for both controls.
 import { connect } from './cdp.mjs'
 const c = await connect()
+// Extraction can leave old chips visible while the new media is still preparing.
+let ready = false
+for (let i = 0; i < 600; i++) {
+  ready = await c.evaluate(`!document.querySelector('.extract-modal-backdrop') && document.querySelector('video')?.readyState >= 2 && document.querySelector('.preview-play-btn')?.disabled === false`)
+  if (ready) break
+  await c.sleep(200)
+}
+if (!ready) { c.close(); throw Error('Waited two minutes for media preparation') }
 await c.evaluate(`(() => {
   if (window.__audioSources) return;
   window.__audioSources = [];

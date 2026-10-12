@@ -722,6 +722,16 @@ def handle(method: str, params: dict[str, Any]) -> Any:
         else:
             raise ValueError("no video path; pass path in params or call set_video_path first")
 
+        # Electron supplies the same video-epoch WAV used by playback and peaks.
+        # Keep _current_video_path as the original media for export/re-alignment.
+        prepared_audio = params.get('prepared_audio_path')
+        if prepared_audio is not None:
+            if not isinstance(prepared_audio, str) or not prepared_audio.strip():
+                raise ValueError('Invalid prepared audio path')
+            prepared_resolved = _resolve_existing_file(_normalize_input_path(prepared_audio))
+            if prepared_resolved is None:
+                raise ValueError('Prepared audio file is missing')
+            audio_path = prepared_resolved
         beam_size = int(params.get("beam_size", 5))
         raw_lang = params.get("language")
         language = raw_lang if isinstance(raw_lang, str) and raw_lang.strip() else None

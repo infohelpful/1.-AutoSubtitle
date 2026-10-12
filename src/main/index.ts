@@ -44,8 +44,10 @@ import {
 } from './exportLogic'
 import { EXPORT_FPS, runSinglePassSubtitleBurnIn } from './ffmpeg-single-pass'
 import { buildRenderSchedule } from '../shared/exportRenderSchedule'
-import { probeMediaTiming } from './mediaTiming'
+import { probeMediaTimingAsync } from './mediaTiming'
 import { validateMediaDecode } from './validateMediaDecode'
+import { prepareSourceMedia, stopPreparingMedia, prunePreparedMediaCache } from './preparedMedia'
+import { exportAudio } from './audioExport'
 import { fingerprintMedia, saveProjectDocument } from './projectStorage'
 import { clipPlanFromCuts, mapSourceIntervalToProgram, programDuration, validateClipPlan } from '../shared/clipPlan'
 import { randomUUID } from 'node:crypto'
@@ -65,12 +67,19 @@ let sidecar: PythonSidecar | null = null
 let depsPrepareLocked = false
 let gpuInstallLocked = false
 const activeExports = new Set<AbortController>()
-const activeAlignments = new Map<number, { requestId: string; worker: PythonSidecar }>()
+const activeAlignments = new Map<number, { requestId: string; worker: PythonSidecar; controller: AbortController }>()
+const activePreparations = new Map<number, { requestId: string; controller: AbortController }>()
 
 function alignmentPythonPath(): string | undefined {
   if (process.env.AUTOSUBTITLE_ALIGN_PYTHON?.trim()) return process.env.AUTOSUBTITLE_ALIGN_PYTHON.trim()
   const dev = join(__dirname, '../../.venv-alignment', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
   return !app.isPackaged && existsSync(dev) ? dev : undefined
+}
+
+async function prepareMediaForSource(path: string, signal?: AbortSignal) {
+  const ffmpeg = getUsableFfmpegExecutable()
+  const ffprobe = await ensureFfprobeExecutable(ffmpeg)
+  return prepareSourceMedia({ input: path, ffmpeg, ffprobe, cacheDir: join(app.getPath('userData'), 'PreparedMedia'), signal })
 }
 
 function dialogParentWindow(event: Electron.IpcMainInvokeEvent): BrowserWindow | undefined {
@@ -841,51 +850,6 @@ function buildDrawTextFilter(subtitles: MappedSubtitle[], style?: ExportSubtitle
   return `${graph}[vout]`
 }
 
-function runFfmpegExport(
-  ffmpeg: string,
-  args: string[],
-  expectedDurationSec: number,
-  onProgress: (pct: number) => void
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(ffmpeg, args, {
-      windowsHide: true,
-      stdio: ['ignore', 'ignore', 'pipe']
-    })
-    let stderrAll = ''
-    let stderrBuf = ''
-    const expectedMs = Math.max(1, Math.round(expectedDurationSec * 1000))
-    child.stderr?.on('data', (chunk) => {
-      const text = String(chunk)
-      stderrAll += text
-      stderrBuf += text
-      let idx = stderrBuf.indexOf('\n')
-      while (idx >= 0) {
-        const line = stderrBuf.slice(0, idx).trim()
-        stderrBuf = stderrBuf.slice(idx + 1)
-        if (line.startsWith('out_time_ms=')) {
-          const raw = Number(line.slice('out_time_ms='.length))
-          if (Number.isFinite(raw) && raw >= 0) {
-            const outMs = Math.floor(raw / 1000)
-            const pct = Math.max(0, Math.min(99, Math.round((outMs / expectedMs) * 100)))
-            onProgress(pct)
-          }
-        }
-        idx = stderrBuf.indexOf('\n')
-      }
-    })
-    child.on('error', (e) => reject(e))
-    child.on('close', (code) => {
-      if (code === 0) {
-        onProgress(100)
-        resolve()
-      } else {
-        reject(new Error(`ffmpeg 내보내기 실패: ${stderrAll.trim() || `exit code ${code}`}`))
-      }
-    })
-  })
-}
-
 function getLocalGpuDllCandidates(): string[] {
   const devDllDir = join(__dirname, '../../dll')
   const packagedDllDir = join(process.resourcesPath, 'dll')
@@ -982,6 +946,27 @@ app.whenReady().then(() => {
       return { ok: true as const, arrayBuffer: ab }
     } catch (e) {
       return { ok: false as const, reason: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('media:cancelPreparation', (event, requestId: unknown) => {
+    const job = activePreparations.get(event.sender.id)
+    if (job && job.requestId === requestId) job.controller.abort()
+  })
+  ipcMain.handle('media:prepareSource', async (event, path: unknown, requestId: unknown) => {
+    if (typeof path !== 'string' || !path.trim()) return { ok: false, reason: '유효한 영상 경로가 필요합니다.' }
+    if (typeof requestId !== 'string' || !requestId) return { ok: false, reason: '유효한 준비 요청 ID가 필요합니다.' }
+    const senderId = event.sender.id
+    activePreparations.get(senderId)?.controller.abort()
+    const job = { requestId, controller: new AbortController() }
+    activePreparations.set(senderId, job)
+    const cancel = () => job.controller.abort()
+    event.sender.once('destroyed', cancel)
+    try { return { ok: true, media: await prepareMediaForSource(path, job.controller.signal) } }
+    catch (e) { return { ok: false, reason: e instanceof Error ? e.message : String(e) } }
+    finally {
+      event.sender.removeListener('destroyed', cancel)
+      if (activePreparations.get(senderId) === job) activePreparations.delete(senderId)
     }
   })
 
@@ -1211,7 +1196,8 @@ app.whenReady().then(() => {
       if (!cache.ok) {
         return { ok: false, path: null, reason: `waveform_cache: ${cache.reason}` }
       }
-      mergedParams = { ...params, out_json_path: cache.cachePath }
+      const prepared = await prepareMediaForSource(abs)
+      mergedParams = { ...params, path: prepared.audioPath, out_json_path: cache.cachePath }
     }
     const result = await sc.call(method, mergedParams, timeoutMs)
     if (method === 'prepare_model') {
@@ -1229,6 +1215,7 @@ app.whenReady().then(() => {
     const job = activeAlignments.get(event.sender.id)
     if (job && job.requestId === requestId) {
       activeAlignments.delete(event.sender.id)
+      job.controller.abort()
       job.worker.stop('정렬을 취소했습니다.')
     }
   })
@@ -1239,26 +1226,27 @@ app.whenReady().then(() => {
       return { ok: false, reason: '올바르지 않은 정렬 요청입니다.' }
     }
     activeAlignments.get(event.sender.id)?.worker.stop('새 정렬 요청으로 취소했습니다.')
+    activeAlignments.get(event.sender.id)?.controller.abort()
     const spec = resolveSidecarCommandAndArgs()
     const alignmentPython = alignmentPythonPath()
     const worker = new PythonSidecar(spec.command, spec.args, getFfmpegUserBinDir(), {
       AUTOSUBTITLE_MODELS_DIR: join(app.getPath('appData'), 'AutoSubtitle', 'models'),
       ...(alignmentPython ? { AUTOSUBTITLE_ALIGN_PYTHON: alignmentPython } : {})
     })
-    const job = { requestId: request.requestId, worker }
+    const job = { requestId: request.requestId, worker, controller: new AbortController() }
     activeAlignments.set(event.sender.id, job)
     const senderId = event.sender.id
     const cancel = () => {
       if (activeAlignments.get(senderId) === job) activeAlignments.delete(senderId)
+      job.controller.abort()
       worker.stop('정렬 창이 닫혔습니다.')
     }
     event.sender.once('destroyed', cancel)
     try {
-      const ffprobe = await ensureFfprobeExecutable(getUsableFfmpegExecutable())
+      const media = await prepareMediaForSource(request.path, job.controller.signal)
       if (activeAlignments.get(senderId) !== job || event.sender.isDestroyed()) throw new Error('정렬이 취소됐습니다.')
-      const media = probeMediaTiming(ffprobe, request.path)
       const reply = await worker.call<Omit<Extract<RealignResult, { ok: true }>, 'ok'>>('realign_words', {
-        ...request, duration: media.duration, sourceOriginSec: media.sourceOriginSec,
+        ...request, path: media.audioPath, duration: media.duration, sourceOriginSec: 0,
         ffmpeg: getUsableFfmpegExecutable()
       }, TRANSCRIBE_TIMEOUT_MS)
       if (activeAlignments.get(senderId) !== job) throw new Error('정렬이 취소됐습니다.')
@@ -1327,6 +1315,8 @@ app.whenReady().then(() => {
           if (reason) win.webContents.send('transcribe:diag', { message: reason })
         })
         const txParams: Record<string, unknown> = { path: absPath }
+        const prepared = await prepareMediaForSource(absPath)
+        txParams.prepared_audio_path = prepared.audioPath
         if (alignmentMode === 'accurate' || alignmentMode === 'fast') txParams.alignment_mode = alignmentMode
         const alignmentPython = alignmentPythonPath()
         if (alignmentPython) txParams.alignment_python = alignmentPython
@@ -1503,7 +1493,7 @@ app.whenReady().then(() => {
         sendExportProgress(win, { percent: 2, label: 'FFmpeg·인코더 확인 중…', encoderName: encDisplay })
         sendExportProgress(win, { percent: 4, label: '영상 길이 분석 중…', encoderName: encDisplay })
         const ffprobe = await ensureFfprobeExecutable(ffmpeg)
-        const media = probeMediaTiming(ffprobe, inputPath)
+        const media = await probeMediaTimingAsync(ffprobe, inputPath, controller.signal)
         const clips = validateClipPlan(req.clipPlan ?? clipPlanFromCuts(media.duration, cuts), media.duration)
         // 줄 표시 구간과 단어 발화 구간을 같은 clip plan 으로 프레임 상태에 매핑한다(컷·순서·반복 포함).
         const highlightColor = sanitizeHexColor(req.subtitleStyle?.wordHighlightColor)
@@ -1533,6 +1523,8 @@ app.whenReady().then(() => {
           y: req.subtitleStyle?.y ?? 10,
           videoWidth: subDim.width,
           videoHeight: subDim.height,
+          layoutWidth: fullW,
+          layoutHeight: fullH,
           wordHighlightColor: highlightColor
         }
 
@@ -1597,7 +1589,7 @@ app.whenReady().then(() => {
           sendExportProgress(win, { percent: 12, label: 'CPU 인코더로 다시 시도 중…', encoderName: 'CPU (libx264)' })
           await encode('libx264')
         }
-        const exported = probeMediaTiming(ffprobe, pendingOutput)
+        const exported = await probeMediaTimingAsync(ffprobe, pendingOutput, controller.signal)
         if (Math.abs(exported.duration - overlayDurationSec) > 0.1 || exported.hasAudio !== media.hasAudio) {
           throw new Error('출력 영상의 길이 또는 오디오 검증에 실패했습니다.')
         }
@@ -1622,36 +1614,34 @@ app.whenReady().then(() => {
     }
 
     if (format === 'mp3' || format === 'wav') {
-      const ffmpeg = getUsableFfmpegExecutable()
-      const cutExpr =
-        cuts.length > 0 ? cuts.map((c) => `between(t,${c.start.toFixed(3)},${c.end.toFixed(3)})`).join('+') : null
-      const args: string[] = ['-y', '-i', inputPath]
-      if (cutExpr) {
-        args.push('-af', `aselect='not(${cutExpr})',asetpts=N/SR/TB`)
+      if (normalize(outputPath).toLowerCase() === normalize(inputPath).toLowerCase()) throw new Error('원본 영상과 다른 저장 경로를 선택하세요.')
+      const controller = new AbortController()
+      const cancelExport = (): void => controller.abort()
+      activeExports.add(controller)
+      win.once('closed', cancelExport)
+      try {
+        const ffmpeg = getUsableFfmpegExecutable()
+        const prepared = await prepareMediaForSource(inputPath, controller.signal)
+        const audioClips = clipPlanFromCuts(prepared.duration, cuts)
+        await exportAudio({ ffmpeg, ffprobe: await ensureFfprobeExecutable(ffmpeg),
+          input: prepared.audioPath, output: outputPath, format,
+          clips: audioClips, duration: prepared.duration, signal: controller.signal,
+          onProgress: (pct) => {
+            sendExportProgress(win, { percent: pct, label: '오디오 인코딩 중…' })
+          }
+        })
+        return { canceled: false as const, outputPath, format }
+      } finally {
+        activeExports.delete(controller)
+        win.removeListener('closed', cancelExport)
       }
-      args.push('-vn')
-      if (format === 'mp3') {
-        args.push('-c:a', 'libmp3lame', '-q:a', '2')
-      } else {
-        args.push('-c:a', 'pcm_s16le')
-      }
-      args.push('-progress', 'pipe:2', '-nostats', outputPath)
-      const mappedEndMax = mappedSubtitles.reduce((m, s) => Math.max(m, s.end), 0)
-      await runFfmpegExport(
-        ffmpeg,
-        args,
-        Math.max(1, mappedEndMax),
-        (pct) => {
-          sendExportProgress(win, { percent: pct, label: '오디오 인코딩 중…' })
-        }
-      )
-      return { canceled: false as const, outputPath, format }
     }
 
     throw new Error(`지원하지 않는 내보내기 형식: ${format}`)
   })
 
   createWindow()
+  void prunePreparedMediaCache(join(app.getPath('userData'), 'PreparedMedia'))
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -1665,6 +1655,9 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  stopPreparingMedia()
+  for (const job of activePreparations.values()) job.controller.abort()
+  activePreparations.clear()
   for (const job of activeAlignments.values()) job.worker.stop()
   activeAlignments.clear()
   for (const controller of activeExports) controller.abort()

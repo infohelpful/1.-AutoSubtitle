@@ -15,7 +15,7 @@ function setup() {
     createGain: () => ({ connect() {}, gain: { value: 1 } }),
     decodeAudioData: async () => ({ duration: 10 }),
     createBufferSource: () => ({ connect() {}, disconnect() {}, stop() {},
-      start: (_when: number, offset: number) => starts.push(offset) })
+      start: (_when: number, offset: number) => { starts.push(offset) } })
   }
   vi.stubGlobal('AudioContext', class { constructor() { return ctx } })
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(0) })))
@@ -61,4 +61,70 @@ it('does not install a decoded buffer after disposal', async () => {
   decode.resolve({ duration: 10 })
   await pending
   expect(engine.isLoadedForUrl('old')).toBe(false)
+})
+
+it('shares an in-flight load instead of decoding the entire WAV twice', async () => {
+  const {engine,ctx} = setup()
+  const decode = deferred<{duration:number}>()
+  const spy = vi.fn(() => decode.promise)
+  ctx.decodeAudioData = spy
+  const first = engine.loadFromUrl('same'), second = engine.loadFromUrl('same')
+  await vi.waitFor(() => expect(spy).toHaveBeenCalledOnce())
+  decode.resolve({duration:10})
+  await Promise.all([first,second])
+  expect(fetch).toHaveBeenCalledOnce()
+  expect(engine.isLoadedForUrl('same')).toBe(true)
+})
+
+it('aborts the previous fetch and never decodes its late response', async () => {
+  const {engine,ctx} = setup()
+  const oldResponse = deferred<Response>()
+  const spy = vi.fn(async () => ({duration:10}))
+  ctx.decodeAudioData = spy
+  const fetchMock = vi.fn().mockImplementationOnce(() => oldResponse.promise)
+    .mockResolvedValue({ok:true,arrayBuffer:async()=>new ArrayBuffer(0)})
+  vi.stubGlobal('fetch',fetchMock)
+  const old = engine.loadFromUrl('old')
+  await engine.loadFromUrl('new')
+  expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true)
+  const oldBody = vi.fn()
+  oldResponse.resolve({ok:true,arrayBuffer:oldBody} as unknown as Response)
+  await old
+  expect(oldBody).not.toHaveBeenCalled()
+  expect(spy).toHaveBeenCalledOnce()
+  expect(engine.isLoadedForUrl('new')).toBe(true)
+})
+
+it('aborts a fetch on disposal and avoids decoding a late body', async () => {
+  const {engine,ctx} = setup()
+  const body = deferred<ArrayBuffer>()
+  const spy = vi.fn(async () => ({duration:10}))
+  ctx.decodeAudioData = spy
+  const fetchMock = vi.fn(async () => ({ok:true,arrayBuffer:()=>body.promise}))
+  vi.stubGlobal('fetch',fetchMock)
+  const load = engine.loadFromUrl('old')
+  await Promise.resolve()
+  engine.dispose()
+  body.resolve(new ArrayBuffer(0))
+  await load
+  expect((vi.mocked(fetch).mock.calls[0][1]?.signal as AbortSignal).aborted).toBe(true)
+  expect(spy).not.toHaveBeenCalled()
+})
+
+it('disconnects every source when a later clip fails to start', async () => {
+  const { engine, resume, ctx } = setup()
+  const nodes: Array<{ connect: () => void; disconnect: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; start: () => void }> = []
+  ctx.createBufferSource = () => {
+    const index = nodes.length
+    const node = { connect() {}, disconnect: vi.fn(), stop: vi.fn(), start() { if (index === 1) throw Error('source failed') } }
+    nodes.push(node)
+    return node
+  }
+  await engine.loadFromUrl('audio')
+  resume.resolve()
+  await expect(engine.scheduleFromEdl([{clipId:1,startMediaSec:0,endMediaSec:1},{clipId:2,startMediaSec:2,endMediaSec:3}],0,null)).rejects.toThrow('source failed')
+  expect(nodes).toHaveLength(2)
+  expect(nodes.every(node => node.stop.mock.calls.length===1 && node.disconnect.mock.calls.length===1)).toBe(true)
+  expect(engine.isPlaying()).toBe(false)
+  expect(engine.getCurrentMediaSec()).toBeNull()
 })

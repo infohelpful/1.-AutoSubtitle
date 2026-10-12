@@ -1,10 +1,10 @@
 import { spawn } from 'node:child_process'
 
 /** Decode every selected video/audio frame before promoting a temporary export. */
-export function validateMediaDecode(ffmpeg: string, path: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<void> {
+export function validateMediaDecode(ffmpeg: string, path: string, options: { signal?: AbortSignal; timeoutMs?: number; audioOnly?: boolean } = {}): Promise<void> {
   if (options.signal?.aborted) return Promise.reject(new Error('Export canceled'))
   return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpeg, ['-v', 'error', '-xerror', '-i', path, '-map', '0:v:0', '-map', '0:a?', '-f', 'null', '-'],
+    const proc = spawn(ffmpeg, ['-v', 'error', '-xerror', '-i', path, ...(options.audioOnly ? ['-map', '0:a:0'] : ['-map', '0:v:0', '-map', '0:a?']), '-f', 'null', '-'],
       { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
     let stderr = '', failure: Error | undefined
     const stop = (message: string) => { failure = new Error(message); proc.kill('SIGKILL') }

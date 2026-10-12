@@ -1,5 +1,11 @@
 # AutoSubtitle 데스크톱 — 단어칩·음성 싱크·자막 버닝 개발 수정계획서
 
+> 2026-10-12 15시 갱신: WebAudio 실패 시 HTML 무음/UI 상태·취소 후 재시작·부분 오디오 소스 누수를 수정했다. 영상 준비 소비자별 취소, WebAudio 중복 fetch/decode 공유·이전 fetch 취소·불필요한 WAV 복사 제거를 적용했다. 발음 패널에서 단일/복수 단어 ID 선택 정렬을 추가하고 비선택 단어 보존·저장·Undo/Redo를 실제 WhisperX로 검증했다. Chromium 한글 조합/취소/3,000자 입력도 통과. 최종 Vitest 48 files/312 tests 및 타입·build 통과. 전체 계획은 미완료이며 정확도 사람 평가·미지원 음절·장시간 스트리밍/캐시 용량·설치본 runtime·실제 Windows IME 검증이 남았다. 아래 과거 상태보다 진행 기록/인계서의 최신 절을 우선한다.
+
+> 2026-10-12 오후 갱신: SAR/90도 회전의 미리보기·export 표시 크기와 4K 원본 픽셀 자막 배치를 수정했다. 실제 4K·SAR UI export 및 기본/200% DPI offscreen 다중 줄 검증 통과. 오디오 export의 sample 단위 컷·임시 출력·전체 decode·취소/timeout 보호까지 구현했다. Vitest 301개 통과. 남은 핵심은 미지원 음절/사람 경계 평가·장시간 스트리밍·설치본 runtime·실제 IME이며 상세는 진행 기록/인계서 최신 절 참조.
+
+> 2026-10-12 오전 갱신: nonzero PTS 공통 PCM·영상 remux를 최초 ASR/RMS/정렬·부분 재정렬·파형·WebAudio·오디오 export에 연결했다. 실제 오디오 +0.5초 파일의 전사·재생·영상 export를 검증했고 탐색 완료 전 재생 경합도 수정했다. Vitest 295/Python 32, 실앱 재생 조합 36/36 통과. 사람 라벨 평가·미지원 음절·장시간 스트리밍·설치본 runtime 및 SAR/회전/4K/IME는 남았다. SAR 무시 경로는 발견했으나 아직 수정하지 않았다. 상세는 진행 기록과 인계서 최신 절 참조.
+
 > 2026-10-12 새벽 갱신: 프로젝트 v2/v1 migration·전체 미디어 SHA-256/재연결·편집 메타 저장 보존, 발음 입력 UI, 수정 문장 어절 재분할, 긴 줄 bounded window/overlap, 최초 추출 정밀/빠른 모드를 구현했다. 실앱 저장·재연결·발음/분할 Undo/Redo 검증 통과. 일반 전사 122/128 aligned, 한 긴 줄 검사 121/128(경계 충돌 1개 추가 검토). 사람 경계 정확도 측정, nonzero PTS 공통 원점, 장시간 스트리밍, 설치본 runtime/model 배포와 4K/IME 검증은 남아 있다. 최신 상세는 진행 기록과 인계서 최상단 참조.
 
 > 2026-10-11 재개 결과: 재생 입력 경합·글자 편집·진단·타입 오류를 수정하고 사용자 실영상의 accurate 경로를 검증했다. 128개 중 120개 aligned이며 사람 기준 정확도는 미측정이다. 전체 계획 완료를 뜻하지 않는다. 최신 완료/미완료 범위는 `autosubtitle-desktop-sync-progress.md` 상단과 `open-issues-handoff.md` 최신 절을 참조한다.

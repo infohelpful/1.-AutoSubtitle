@@ -82,6 +82,9 @@ export type ExportSubtitleStyle = {
   y: number
   videoWidth?: number
   videoHeight?: number
+  /** Original display-pixel canvas; capture may be smaller to bound memory. */
+  layoutWidth?: number
+  layoutHeight?: number
   /** 지정하면 영상 버닝에서 현재 발화 단어를 이 색으로 강조한다(미지정이면 줄 단위 자막만). */
   wordHighlightColor?: string
 }
@@ -166,6 +169,8 @@ export type WaveformPeaksCachePathResult =
   | { ok: false; reason: string }
 
 export type SidecarApi = {
+  prepareSourceMedia: (path: string, requestId: string) => Promise<import('./preparedMedia').PreparedMediaResult>
+  cancelMediaPreparation: (requestId: string) => Promise<void>
   fingerprintMedia: (path: string) => Promise<import('./projectMedia').MediaFingerprintResult>
   realignWords: (request: RealignRequest) => Promise<RealignResult>
   cancelRealignment: (requestId: string) => Promise<void>

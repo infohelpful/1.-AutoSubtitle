@@ -216,7 +216,7 @@ export default function ExportSubtitle(): JSX.Element {
 
       buildPreviewSubtitleTextStyle({
 
-        videoNaturalWidth: data.width,
+        videoNaturalWidth: data.layoutWidth ?? data.width,
 
         subtitleBgColor: data.bgColor,
 
@@ -263,6 +263,7 @@ export default function ExportSubtitle(): JSX.Element {
       data.textColor,
 
       data.width,
+      data.layoutWidth,
 
       data.x,
 
@@ -438,7 +439,12 @@ export default function ExportSubtitle(): JSX.Element {
 
       <div className="export-subtitle-overlay">
 
-        <div className="export-subtitle-stage">
+        <div className="export-subtitle-stage" style={{
+          width: data.layoutWidth ?? data.width,
+          height: data.layoutHeight ?? data.height,
+          transform: `scale(${data.width / (data.layoutWidth ?? data.width)}, ${data.height / (data.layoutHeight ?? data.height)})`,
+          transformOrigin: 'top left'
+        }}>
 
           {data.text.trim().length > 0 ? (
 

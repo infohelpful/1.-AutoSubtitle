@@ -17,3 +17,15 @@ node scripts/e2e-cdp/character-edit.mjs        # 글자 삭제·textarea focus·
 - 테스트 영상은 말이 있는 짧은 mp4 면 된다(8~20초, 자막 4줄 이상). 한국어 합성음성은 `scripts/alignment-tts-bench.ps1` 로 만들 수 있다.
 - 재생 영상은 `video.paused/currentTime`, 실제 출력은 WebAudio BufferSource의 연결·정지·스케줄 시간으로 검사한다. clock 허용 오차는 250ms이며 음성 인식 경계 정확도 평가는 아니다.
 - `drop-video.mjs <영상> [결과 JSON 경로]`는 새 추출 완료 이벤트와 모달 종료를 기다린다. 이전 영상의 칩을 성공으로 오인하지 않는다.
+
+추가 미디어/export 검증:
+
+- `electron scripts/e2e-cdp/export-layout.cjs`: build 후 단독 실행. 실제 offscreen 렌더러에서 4K/세로/작은 캔버스의 원본 픽셀 배치와 BGRA 크기를 검사한다. `--force-device-scale-factor=2`로 200% DPI도 검사할 수 있다.
+- `source-clock.mjs`: `launch-test-app.cjs`에서 3초 PTS5/audio+0.5초 fixture 프로젝트를 제공한다. 브라우저 원점, WebAudio의 앞 무음, 실제 영상 export를 확인한다.
+- `export-layout-ui.mjs`: 파일 선택 큐에 4K 프로젝트, 720×480/SAR8:9/90도 프로젝트 순으로 제공한다. 4K export 후 SAR 미리보기 크기를 검사한다. `--sar-only`는 SAR 프로젝트 하나를 제공하고 실제 export까지 검사한다.
+- `export-audio.mjs [출력 WAV 경로]`: 2초 프로젝트의 cuts를 `[4801/48000,9603/48000]`, `[16003/48000,19207/48000]`로 준비하고 실제 WAV 내보내기 PCM을 비교한다. 기본 출력은 `tools/sync-validation-output/audio-ui-cut-export_AutoSubtitle.wav`.
+- `audio-fallback.mjs`: 10초 이상 발화 프로젝트를 불러온다. WebAudio start 오류를 주입해 HTML 음소거 해제/UI 재생 상태, 정지, WebAudio 재시도, 지연된 fallback 취소를 확인한다. 실제 스피커 청취 검사는 아니다.
+- `prepare-cancel.mjs [영상 경로]`: 아직 캐시되지 않은 긴 영상의 준비 IPC 취소/같은 원본 재시도를 검사한다. 작은 fixture는 FFmpeg `-f lavfi -i color=blue:s=64x64:r=1/60:d=600 -c:v libx264 -an`으로 만들 수 있다. 재시도에서 600초 PCM 약 115MB를 생성한다. 재실행에는 새로운 원본 경로를 사용한다.
+- `korean-composition.mjs`: 로드된 발화 프로젝트에서 Chromium `imeSetComposition`으로 한글 조합/확정/취소, 한 번의 Undo, 3,000자 붙여넣기/복구를 검사한다. Windows IME 후보 창/키보드 레이아웃의 수동 검증을 대체하지 않는다.
+- `realign-selected.mjs [저장 프로젝트 경로]`: `reading-fixture.autosub`(3배가 있는 마지막 줄)와 새 `AUTOSUBTITLE_E2E_SAVE_PROJECT`를 제공한다. 실제 모델로 단일·비연속 복수 단어 정렬, 비선택 단어 보존, 저장·Undo/Redo를 확인한다. 저장 경로 뒤 `.png`로 선택 패널 캡처도 남긴다.
+- `launch-test-app.cjs`는 `AUTOSUBTITLE_E2E_PROJECT`, `AUTOSUBTITLE_E2E_OUTPUT` 절대경로를 요구한다. 선택 큐는 `AUTOSUBTITLE_E2E_OPEN_QUEUE` JSON 배열이다. 경로는 `tools/sync-validation-output` 내부에 두고 출력은 기존 파일과 겹치지 않는 새 이름으로 지정한다. 테스트 fixture와 큰 결과 파일은 git에서 제외되어 있다.

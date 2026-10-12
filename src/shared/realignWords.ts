@@ -38,7 +38,13 @@ export function prepareRealignCue(line: SubtitleLine, requestId: string): Prepar
 }
 
 /** A whole response is accepted once or rejected. It must never overwrite new user edits. */
-export function mergeRealignedCue(line: SubtitleLine, request: PreparedRealignCue, returned: SubtitleLine): SubtitleLine {
+export function mergeRealignedCue(line: SubtitleLine, request: PreparedRealignCue, returned: SubtitleLine, selectedWordIds?: ReadonlySet<string>): SubtitleLine {
+  if (selectedWordIds) {
+    const visibleIds = new Set((line.words ?? []).filter(w => !w.isDeleted && !w.isSilence && w.word.trim()).map(w => w.id))
+    if (!selectedWordIds.size || [...selectedWordIds].some(id => !visibleIds.has(id))) {
+      throw new Error('선택한 단어가 변경되었습니다. 다시 선택해 주세요.')
+    }
+  }
   const before = request.words ?? [], after = returned.words ?? []
   if (before.length !== after.length) throw new Error('정렬 결과 단어 수가 다릅니다.')
   const updates = new Map<string, SubtitleWord>()
@@ -57,6 +63,9 @@ export function mergeRealignedCue(line: SubtitleLine, request: PreparedRealignCu
   }
   const groups = new Map(request.wordGroups.map(group => [group.sourceIndex, group.ids]))
   const words = (line.words ?? []).flatMap((w, index) => {
+    // Align with the full sentence as acoustic context, but keep all other slots
+    // exactly as stored, including their IDs, manual edits and quality metadata.
+    if (selectedWordIds && (!w.id || !selectedWordIds.has(w.id))) return [w]
     const ids = groups.get(index)
     if (!ids) return [w]
     const children = ids.map(id => updates.get(id)!)
@@ -73,6 +82,12 @@ export function mergeRealignedCue(line: SubtitleLine, request: PreparedRealignCu
     }
     return children
   })
+  if (selectedWordIds) {
+    const speech = words.filter(w => !w.isDeleted && !w.isSilence && w.word.trim())
+    if (speech.some((word, i) => i > 0 && (word.start < speech[i - 1].start || word.end < speech[i - 1].end))) {
+      throw new Error('선택 단어의 정렬이 이웃 단어와 충돌합니다. 이 줄 전체를 재정렬하거나 경계를 확인해 주세요.')
+    }
+  }
   return { ...line, words, start: Math.min(line.start, ...words.map(w => w.start)),
     end: Math.max(line.end, ...words.map(w => w.end)) }
 }

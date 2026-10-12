@@ -53,3 +53,21 @@ class TranscribeFallbackTests(unittest.TestCase):
                     self.assertEqual(align.call_args.kwargs['python'], 'isolated-python')
                 else:
                     align.assert_not_called()
+
+    def test_prepared_audio_is_shared_by_asr_rms_and_peaks_without_replacing_original_path(self):
+        segment = SimpleNamespace(start=.5, end=1, text='말', words=[SimpleNamespace(start=.5, end=1, word='말')])
+        info = SimpleNamespace(duration=3, language='ko')
+        with patch.object(main, '_whisper_model', object()), \
+             patch.object(main, '_current_video_path', None), \
+             patch.object(main, '_resolve_existing_file', side_effect=lambda path: path), \
+             patch.object(main, '_collect_transcription', return_value=([segment], info, False)) as asr, \
+             patch.object(main, '_emit_transcribe_progress'), \
+             patch.object(main, 'apply_rms_vad_word_align', side_effect=lambda cues, *a, **kw: cues) as rms, \
+             patch.object(main, '_waveform_peaks_impl', return_value={'ok': True}) as peaks:
+            result = main.handle('transcribe', {'path': 'original.mp4', 'prepared_audio_path': 'canonical.wav',
+                                               'alignment_mode': 'fast', 'waveform_out_json_path': 'peaks.json'})
+            self.assertEqual(main._current_video_path, 'original.mp4')
+            self.assertEqual(asr.call_args.args[0], 'canonical.wav')
+            self.assertEqual(rms.call_args.args[1], 'canonical.wav')
+            self.assertEqual(peaks.call_args.args[0], 'canonical.wav')
+            self.assertEqual(result['raw_subtitles'][0]['words'][0]['start'], .5)

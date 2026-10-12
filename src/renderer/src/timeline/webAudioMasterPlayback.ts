@@ -24,6 +24,7 @@ export class WebAudioMasterPlayback {
   private scheduleSeq = 0
   private playbackRequest = 0
   private loadRequest = 0
+  private pendingLoad: {url: string; controller: AbortController; promise: Promise<void>} | null = null
   /**
    * 현재 스케줄(scheduleFromEdl 호출)의 모든 BufferSource 가 자연 종료될 때 한 번만 호출되는 콜백.
    * 외부(예: oneShotSession 정리)는 이 콜백으로 자연 종료를 통지받아야 한다 — `isPlaying()=false` 만으로는
@@ -74,16 +75,30 @@ export class WebAudioMasterPlayback {
 
   async loadFromUrl(url: string): Promise<void> {
     if (this.loadedFromUrl === url && this.buffer) return
+    if (this.pendingLoad?.url === url) return this.pendingLoad.promise
+    this.pendingLoad?.controller.abort()
     const request = ++this.loadRequest
     this.stopPlayback()
+    this.buffer = null
+    this.loadedFromUrl = null
     const ctx = this.ensureContext()
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`WebAudio load failed: ${res.status}`)
-    const arr = await res.arrayBuffer()
-    const buf = await ctx.decodeAudioData(arr.slice(0))
-    if (request !== this.loadRequest || ctx !== this.ctx) return
-    this.buffer = buf
-    this.loadedFromUrl = url
+    const controller = new AbortController()
+    const current = () => request === this.loadRequest && ctx === this.ctx && !controller.signal.aborted
+    const promise = (async () => {
+      const res = await fetch(url, {signal: controller.signal})
+      if (!current()) return
+      if (!res.ok) throw new Error(`WebAudio load failed: ${res.status}`)
+      const arr = await res.arrayBuffer()
+      if (!current()) return
+      // decodeAudioData owns this buffer. A full WAV copy doubles peak memory.
+      const buf = await ctx.decodeAudioData(arr)
+      if (!current()) return
+      this.buffer = buf
+      this.loadedFromUrl = url
+    })()
+    const job = {url, controller, promise}
+    this.pendingLoad = job
+    try { await promise } finally { if (this.pendingLoad === job) this.pendingLoad = null }
   }
 
   /**
@@ -133,31 +148,36 @@ export class WebAudioMasterPlayback {
     this.scheduleSeq += 1
     const thisScheduleId = this.scheduleSeq
 
-    for (const p of pieces) {
-      const dur = Math.min(p.durationSec, Math.max(0, bufDur - p.mediaStartSec))
-      if (dur <= EPS) continue
-      const src = ctx.createBufferSource()
-      src.buffer = buf
-      src.connect(this.gain!)
-      this.timeline.push({ ctxStart: wall, mediaStartSec: p.mediaStartSec, durationSec: dur })
-      src.start(wall, p.mediaStartSec, dur)
-      this.activeSources.push(src)
-      src.onended = () => {
-        const idx = this.activeSources.indexOf(src)
-        if (idx >= 0) this.activeSources.splice(idx, 1)
-        if (this.activeSources.length === 0 && this.scheduleSeq === thisScheduleId) {
-          /**
-           * 마지막 BufferSource 종료 — 이 스케줄이 자연 종료된 경우(외부 `stopPlayback` 으로 갈아탄
-           * 것이 아닌 경우)에만 콜백 1회 통지. `scheduleSeq` 가 그대로면 stop 도 새 스케줄도 안 일어났다.
-           */
-          this.playingFlag = false
-          const cb = this.onScheduleEnded
-          if (cb) cb(thisScheduleId, 'natural')
+    try {
+      for (const p of pieces) {
+        const dur = Math.min(p.durationSec, Math.max(0, bufDur - p.mediaStartSec))
+        if (dur <= EPS) continue
+        const src = ctx.createBufferSource()
+        src.buffer = buf
+        src.connect(this.gain!)
+        this.timeline.push({ ctxStart: wall, mediaStartSec: p.mediaStartSec, durationSec: dur })
+        this.activeSources.push(src)
+        src.start(wall, p.mediaStartSec, dur)
+        src.onended = () => {
+          const idx = this.activeSources.indexOf(src)
+          if (idx >= 0) this.activeSources.splice(idx, 1)
+          if (this.activeSources.length === 0 && this.scheduleSeq === thisScheduleId) {
+            /**
+             * 마지막 BufferSource 종료 — 이 스케줄이 자연 종료된 경우(외부 `stopPlayback` 으로 갈아탄
+             * 것이 아닌 경우)에만 콜백 1회 통지. `scheduleSeq` 가 그대로면 stop 도 새 스케줄도 안 일어났다.
+             */
+            this.playingFlag = false
+            const cb = this.onScheduleEnded
+            if (cb) cb(thisScheduleId, 'natural')
+          }
         }
+        wall += dur
       }
-      wall += dur
+      if (this.activeSources.length > 0) this.playingFlag = true
+    } catch (error) {
+      this.stopPlayback()
+      throw error
     }
-    if (this.activeSources.length > 0) this.playingFlag = true
   }
 
   /** AudioContext 현재 시각 기준 재생 중이면 해당 미디어 타임(sec), 아니면 null */
@@ -201,6 +221,8 @@ export class WebAudioMasterPlayback {
   }
 
   dispose(): void {
+    this.pendingLoad?.controller.abort()
+    this.pendingLoad = null
     this.loadRequest += 1
     this.stopPlayback()
     try {

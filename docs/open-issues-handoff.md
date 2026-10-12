@@ -1,5 +1,100 @@
 # AutoSubtitle 데스크톱 — 미해결 문제 인계서
 
+## 2026-10-12 15시 — 재생 예외·취소·선택 단어 정렬 (최신)
+
+기준 HEAD `a603f07`, 모든 변경은 로컬 미커밋 상태다. 아래 과거의 HTML fallback/전환 취소/임의 단어 선택 미완료 기록은 이 절로 갱신한다.
+
+### 완료·검증
+
+1. **HTML 오디오 fallback**: 64초 실제 영상에서 강제 `AudioBufferSourceNode.start` 실패 시 HTML audio가 muted 상태이고 UI가 재생으로 남는 오류를 재현했다. fallback 진입 시 음소거 해제, HTML playing 이벤트 UI 반영, WebAudio 재시도 시 음소거/정지, 이전 pause 이벤트 무시, 요청 세대에 따른 늦은 canplay/seek/재생 타이머 차단을 적용했다. `audio-fallback.mjs`의 실패/정지/정상 복귀/대기 중 취소 모두 통과. unmuted/playing 및 clock 검증이며 실제 스피커 청취는 아니다.
+2. **부분 스케줄 누수**: 두 번째 오디오 조각 start가 실패하면 첫 조각과 실패한 연결이 남던 경로를 수정했다. start 전에 소스를 등록하고 catch에서 전체 stop/disconnect. 회귀 검사 통과.
+3. **준비 소비자 취소**: 공통 PCM 준비 작업을 공유하되 소비자별 AbortSignal을 사용한다. 마지막 소비자가 취소한 경우에만 child를 종료한다. renderer 전환/종료, 부분 정렬 취소, 오디오 export 종료 연결. 같은 소스 재시도는 이전 FFmpeg child/temp 정리 후 실행한다. 파형 RPC는 prepared media 이후에 요청해 이전 준비 작업을 불필요하게 붙잡지 않는다. 단위 3개와 실제 600초 무음 fixture IPC 취소/재시도 통과. 이미 진행 중인 최초 ASR/파형 Python 작업 전체를 소비자별 취소하도록 바꾼 것은 아니다.
+4. **WebAudio 메모리/취소**: 동시 동일 URL fetch/decode 공유, 이전 fetch AbortController 취소, 오래된 body는 decode 전 차단, 전체 WAV slice 복사 제거. decodeAudioData 자체는 취소 API가 없어 이미 시작한 디코드는 완료 후 폐기한다. 전체 파일 디코딩/장시간 메모리 문제를 모두 해결한 것은 아니다.
+5. **단일·복수 선택 정렬 UI**: 발음 입력 패널의 체크박스에서 같은 줄의 비연속 단어도 고를 수 있다. 전체 줄을 문맥으로 측정하되 결과는 선택 ID에만 적용한다. 비선택 슬롯 객체·시간·ID·메타 보존, 선택 문구 재분할 자식 lineage 유지, 누락 ID/이웃 시간 순서 충돌 시 거부. 실제 `reading-fixture.autosub`의 3배→테스트 발음 세배를 단독 정렬하고, 그리고/3배 두 단어 선택도 확인했다. 비선택 단어 전체 JSON 동일성과 한 번의 Undo/Redo 통과. 이는 실제 발음 정답 판정이 아니다. 여러 줄 선택은 아직 없다.
+6. **조합/장문 입력**: Chromium `imeSetComposition`의 ㅎ→하→한→한글 중간 draft/확정/취소, 한 번 Undo, 3,000자 붙여넣기/복구 통과. 체크박스 패널의 실제 앱 PNG도 확인했다. 실제 Windows IME 후보 창/키보드 레이아웃/OS 조합 키 입력은 여전히 수동 검증 필요.
+7. **비동기 ffprobe**: 공통 준비와 영상 export의 입력/출력 probe를 비동기 execFile로 전환하고 AbortSignal, 30초 timeout, 4MiB 출력 제한을 적용했다. 실제 ffprobe가 로컬 HTTP media body를 기다리는 동안 Node 이벤트 루프 응답/취소를 검증했다. 취소된 요청·잘못된 파일도 검사. native 재검사에서 준비 취소 약 85ms/재시도, nonzero PTS 재생·실제 export 통과. FFmpeg 인코더 탐색 등 다른 동기 호출을 모두 없앤 것은 아니다.
+
+### 검증과 재현
+
+- 최종 **Vitest 48 files/312 tests**, web/node 타입 검사와 production build 통과. 실제 FFmpeg 환경변수 포함 전체 검사다. Python은 오전 32 tests 이후 추가 변경 없음.
+- 일반 클릭→버튼/Space, 정지/재생, 지연 0/50/150ms **36/36** 재검사 통과.
+- 결과: `tools/sync-validation-output/resume-48-vitest-final.log`, `selected-final-build.log`, `selected-word-result-2.autosub`, `selected-word-result-2.autosub.png`. E2E 재현 조건은 `scripts/e2e-cdp/README.md`에 추가했다.
+- 마지막 격리 앱은 `electron-resume` profile/CDP 9333, PID 35560에서 비동기 probe와 `offset-async-probe-export_AutoSubtitle.mp4` 출력을 검증한 후 정상 종료했다. 사용자 원본/일반 프로젝트는 덮어쓰지 않았다. 선택 패널 PNG는 이전 PID 38272에서 촬영한 것이다.
+
+### 다음 우선순위·제한
+
+1. **음성 정확도**: 미지원 `캡`/`둡` 모델 해결, 사람 경계 라벨/CER·WER/median·p95. 122/128 coverage는 정확도가 아니다.
+2. **장시간 안정성**: 전체 PCM/전체 WebAudio의 스트리밍, 디스크 캐시 용량 상한, 최초 ASR/파형 작업 취소 범위와 나머지 동기 프로세스 호출 검토. 현재 30일 캐시 정리와 중복 decode 방지뿐이며 긴 파일 메모리 상한을 보장하지 않는다.
+3. **설치본**: 정렬 runtime/model 배포·GPU/오프라인 새 설치 검증. 개발 venv 탐색으로 배포 완료를 주장하지 않는다.
+4. **넓은 회귀**: 실제 Windows IME, 여러 줄 선택, 긴 4K/VFR/RF64, MP4 remux 비호환 코덱, 임의각/반사 display matrix, 폰트 fallback/모니터 DPI 전환. 기존 nonzero PTS 프로젝트 수동 경계도 임의 이동하지 않았다.
+
+전체 계획은 미완료다. usage 잔여 약 7%에서 새 범위를 중단하고 검증·기록을 마무리했다. reset credit은 사용하지 않았고 기존 사용자 pyc 변경은 보존했다.
+
+---
+
+## 2026-10-12 오후 — SAR·4K·오디오 export 수정 (최신)
+
+오전 변경을 그대로 보존한 후 추가 수정했다. 기준 HEAD는 계속 `a603f07`이며 아직 커밋/배포하지 않았다.
+
+### 완료·검증
+
+- **SAR/회전**: `mediaTiming.ts`가 coded width/height만 쓰던 오류를 수정했다. Chromium처럼 SAR>1은 폭, SAR<1은 높이를 확장한 표시 크기를 사용하고 90도 회전을 반영한다. 출력은 짝수 크기와 SAR=1로 정규화하며, 원본 영상과 자막 레이어를 같은 표시 캔버스로 합성한다.
+- SAR=2의 정방향/90도, SAR=8:9의 90도 FFmpeg 통합 검사에서 출력 크기·색상·자막 마커 위치를 확인했다. 실제 Chromium은 720×480/SAR8:9/90도 파일을 **540×720**으로 표시한다(480×640으로 줄이는 방식과 다름). 실앱 내보내기도 540×720/SAR1:1로 일치했다.
+- **4K 자막 크기/줄바꿈**: 캡처를 Full HD 이하로 줄이면서 fontSize를 그대로 해석해 최종 글자가 커지던 경로를 수정했다. `layoutWidth/layoutHeight` 원본 표시 픽셀 공간에서 먼저 배치하고 캡처 공간으로 변환하므로 미리보기와 같은 폰트/여백/줄바꿈을 유지한다. 작은/아주 넓은 캡처의 최소 크기 보정도 배치 공간과 분리했다.
+- `export-layout.cjs`: 실제 offscreen renderer/한글 폰트로 3840×2160→1920×1080, 세로 1080×1920→608×1080, 작은 캔버스의 좌표를 원본 공간에 환산해 비교했다. 기본 DPI와 `--force-device-scale-factor=2` 모두 통과했고 BGRA 크기도 검사했다. 한글 다중 줄 캡처를 육안 확인했다. 이는 OS 모니터 변경/모든 fallback 폰트 검증은 아니다.
+- 실제 4K UI export: `layout-ui-4k-export_AutoSubtitle.mp4`, 3840×2160/SAR1:1, 전체 decode 통과. 60px 폰트의 흰 글자 픽셀 높이 54px 확인(이전 축소 경로에서 생기는 2배 확대 방지). `layout-ui-4k-frame.png`에서 자막 위치/글자를 확인했다.
+- **오디오 컷**: 기존 `aselect` 프레임 삭제를 prepared 48kHz PCM의 sample 단위 `atrim/concat`으로 변경했다. 합성 1초 파일에서 기대 39,994 samples vs 이전 39,808 samples 오차를 재현했고 수정 후 PCM 바이트가 정확히 일치했다. 진행률 기준도 마지막 자막 끝 대신 전체 편집 오디오 길이로 변경했다.
+- **오디오 출력 보호**: WAV/MP3를 임시 경로로 인코딩하고 길이/오디오 존재/전체 decode 후 rename한다. 취소·30분 timeout·앱/창 종료 시 child 정리와 임시 파일 삭제를 추가했다. 실패/timeout/취소 시 기존 출력이 유지되는 통합 검사 통과. 현재 취소 연결은 AbortSignal 및 앱/창 종료이며 별도 오디오 취소 버튼을 추가한 것은 아니다.
+- 실제 앱에서 컷 프로젝트→WAV 선택→내보내기→decoded PCM 비교 **87,994 stereo samples 완전 일치**, 최종 보호 경로까지 재검사 통과. 결과 `audio-ui-cut-export-2_AutoSubtitle.wav`.
+- 최종 **Vitest 47 files/301 tests**, web/node 타입·production build·diff 검사 통과. Python은 이 오후 작업에서 변경하지 않았고 오전 **32 tests 통과** 상태다. 로그 `layout-audio-vitest-final.log`, `layout-audio-build-final.log`, `layout-test.log`, `layout-dpi2.log`.
+
+### 이어서 할 일
+
+0. **추가 발견 — HTML 오디오 fallback**: `<audio muted>`인데 `playMasterVideoSynced`가 음소거를 해제하지 않아 WebAudio 실패 시 무음일 수 있다. 강제 `AudioBufferSourceNode.start` 실패 주입으로 확인을 시도했다. 음소거 해제 시 HTML 재생은 진입했지만 UI 일시정지 버튼 상태 검증은 실패했다. 사용량 잔여 약 3%에서 미검증 변경 3줄과 임시 E2E 스크립트를 되돌렸다. 다음 작업은 긴 fixture에서 fallback UI 상태·실제 음소거·WebAudio 재시도 시 중복 출력을 함께 재현/수정하는 것이다. 일반 WebAudio 36/36 통과와 별개의 예외 경로다.
+
+1. 한국어 `캡`/`둡` 미지원과 사람 경계 라벨/CER·WER/median·p95. 현재 coverage를 정확도로 표시하면 안 된다.
+2. 전체 PCM/전체 WebAudio decode의 장시간 메모리·디스크 개선, 캐시 용량 상한 및 미디어 전환 준비 작업 취소. 기존 30일 정리는 용량 상한이 아니다.
+3. 설치본 alignment runtime/model 배포·GPU/오프라인 새 설치. 개발 venv 자동 탐색만으로 배포 완료가 아니다.
+4. 실제 Windows IME 조합·장문·전체 편집 조합, 임의 단어 선택 재정렬. 회전은 90도 사례까지 검증했으며 임의각/반사 display matrix, 폰트 fallback/모니터 DPI 전환, 긴 4K 영상의 성능 검증은 남았다.
+5. prepared remux의 MP4 비호환 코덱, RF64/장시간 Chromium decode, 기존 nonzero PTS 프로젝트 수동 경계 재검토. 오디오만 내보내기는 cuts를 지원하며 명시적인 순서/반복 clipPlan은 기존대로 지원 범위 밖이다.
+
+전체 계획은 미완료다. 최신 변경은 로컬에 보존했으며 기존 사용자 pyc를 변경 취소하거나 삭제하지 않았다. reset credit은 사용하지 않았다.
+
+---
+
+## 2026-10-12 오전 — 공통 시간축 수정 (최신)
+
+기준 HEAD `a603f07`. 아래 과거 기록의 미완료 상태는 당시 기준이며 이 절을 우선한다.
+
+### 완료·검증
+
+- `preparedMedia.ts`: 영상 첫 프레임을 0초로 하는 48kHz stereo PCM을 생성한다. 늦은 오디오의 앞 무음, 영상보다 일찍 시작하는 오디오의 음수 구간 제거, 짧은 오디오의 뒤 무음, 오디오 없는 영상, 영상보다 긴 오디오의 tail을 처리한다. 원본은 변경하지 않는다.
+- 최초 ASR/RMS/강제 정렬, 부분 재정렬, peaks, WebAudio 및 오디오 단독 export가 같은 PCM을 사용한다. 영상 export는 기존 원본+공통 원점 필터를 유지한다. 프로젝트 경로/fingerprint는 원본을 가리킨다.
+- Chromium이 nonzero PTS 파일에서 `currentTime=5`와 컨테이너 길이를 노출하는 현상을 재현했다. 해당 영상은 영상 트랙만 무손실 remux하여 미리보기 0초/정상 길이를 사용한다. 오디오가 먼저 시작하거나 더 긴 경우도 대상이다.
+- 캐시는 파일 경로·크기·mtime·ctime·버전으로 구분하고 동시 요청을 공유한다. 임시 파일 후 rename, 30분 timeout, 앱 종료 시 FFmpeg 취소, 오래된 전용 캐시 파일 정리(30일/임시 1일)를 추가했다. peaks 버전 변경 및 시간축 불명의 구형 인접 JSON fallback 제거. 준비/실패 상태 표시와 준비 전 재생 차단.
+- 추가 발견: 클릭 후 탐색에서 `currentTime`이 곧바로 목표값이 되는 것을 완료로 오인해 소리만 시작하고 영상이 멈출 수 있었다. 실제 `seeked`까지 기다리며 5초 timeout과 요청 세대 검사를 적용했다. 준비가 끝난 실영상에서 버튼/Space·정지/재생·0/50/150ms 조합 **36/36 통과**. 추출 중 검사 시작으로 생긴 초기 실패를 구분하고 E2E 준비 대기 조건을 추가했다.
+
+### 실행 결과·재현
+
+- 합성 PTS=5초/오디오 +0.5초 및 -1초, 무음 영상, 긴 audio tail의 FFmpeg 통합 검사 통과.
+- `source-clock.mjs`: 실제 Electron 불러오기→재생→내보내기 통과. 미리보기 3초/시작 0초, WebAudio 앞 0.5초 무음 유지. `offset-ui-export-1_AutoSubtitle.mp4` PCM 검사도 0.2초 무음/0.7초 음성으로 일치했다.
+- 사용자 원본의 첫 8초에 video PTS=5초/audio=5.5초를 적용한 별도 `shifted-korean.mp4`를 실앱 드롭/정밀 전사. 최초 결과 약 19.8초, 20단어 중 19 aligned/1 unaligned, 첫 `업무` 시작 **0.532초**. coverage/합성 offset 확인이며 사람 경계 정확도 측정은 아니다. 재검사 결과는 `shifted-korean-retest.json`.
+- 전체 **Vitest 46 files/295 tests**, **Python 32 tests**, web/node 타입·build·diff 공백 검사 통과. 결과는 `tools/sync-validation-output/clock-*-final.log`. 실제 FFmpeg 실행에는 `AUTOSUBTITLE_TEST_FFMPEG_DIR` 절대경로가 필요하다.
+- 앱 검사는 격리된 `electron-resume` profile/CDP 9333에서 수행했다. 숨김 창에서도 36/36 통과했으나 표시된 창의 수동 시청/청취 검증은 별개다. 사용자의 기존 앱 인스턴스는 종료하지 않았다. 최신 소스를 사용하려면 앱 재시작이 필요하다.
+
+### 남은 일·제한
+
+1. 한국어 모델의 `캡`/`둡` 미지원과 실제 사람 경계 라벨 평가. 모델 교체/보완 및 CER/WER·median/p95는 미완료다.
+2. 긴 파일은 전체 PCM 생성/전체 WebAudio decode를 사용하므로 디스크·메모리 비용이 있다. 캐시 용량 상한/스트리밍, 영상 전환 시 준비 작업의 소비자별 취소, 긴 영상 부하 검증이 남았다. 현재 전환 후 결과는 폐기하지만 준비 작업은 캐시 생성까지 계속된다.
+3. 기존 nonzero PTS 프로젝트의 수동 시간은 임의로 이동하지 않는다. 예전 잘못된 축의 자막은 재전사/재정렬 검토가 필요하다. Electron을 거치지 않는 직접 Python transcribe RPC는 `prepared_audio_path` 제공 시에만 공통 PCM을 쓴다.
+4. remux는 MP4에 담을 수 있는 원본 영상 코덱을 전제로 한다. 다른 코덱/손상 파일·VFR·대용량 RF64의 Chromium decode 및 설치본 검증은 남았다.
+5. SAR 점검 중 `mediaTiming.ts`가 회전만 고려하고 sample_aspect_ratio를 반영하지 않는 경로를 확인했다. 실제 SAR/회전 fixture에서 자막 위치/영상 비율 회귀를 만든 뒤 probe와 export base-video scale/setsar를 함께 고쳐야 한다. 이번에는 수정하지 않았다. 4K/DPI/멀티라인도 계속 미검증이다.
+6. 임의 단어 선택 재정렬, 설치본 alignment runtime/model·GPU/오프라인 새 설치, 실제 Windows IME·장문·전체 편집 조합 검증이 남았다.
+
+이번 변경은 로컬 미커밋 상태이며 배포하지 않았다. 기존 pyc 변경을 보존했고 reset credit은 사용하지 않았다. 전체 계획 완료가 아니다.
+
+---
+
 ## 2026-10-12 새벽 재개 결과 (최신)
 
 HEAD `951990b`에서 이전 미커밋 변경을 보존하고 이어서 작업했다. 아래 이전 절의 미완료 목록 중 **프로젝트 v2, 발음 입력 UI, 긴 줄 분할, 수정 문장 어절 재분할**을 이번에 진행했다.

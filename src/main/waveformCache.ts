@@ -22,7 +22,7 @@ export function ensureWaveformCacheDir(): void {
 }
 
 export function computeWaveformCacheHash(absPath: string, size: number, mtimeMs: number): string {
-  const key = `${absPath}|${size}|${mtimeMs}`
+  const key = `video-epoch-v1|${absPath}|${size}|${mtimeMs}`
   return createHash('md5').update(key, 'utf8').digest('hex')
 }
 

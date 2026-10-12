@@ -227,7 +227,7 @@ export async function runSinglePassSubtitleBurnIn(params: SinglePassBurnInParams
   const H = Math.max(1, Math.round(fullVideoHeight))
 
   /** 오버레이: stdin 자막 레이어를 `fullVideoWidth×fullVideoHeight`로 스케일 — export 창·캡처 해상도와 동일해야 좌우·줄바꿈 정렬이 맞음 */
-  const filterComplex = `${buildClipGraph(clips, params.sourceDurationSec, params.sourceOriginSec, params.hasAudio)};[1:v]format=rgba,scale=${W}:${H}:flags=bilinear[sub];[vmain][sub]overlay=0:0:eof_action=pass:repeatlast=0[vout]`
+  const filterComplex = `${buildClipGraph(clips, params.sourceDurationSec, params.sourceOriginSec, params.hasAudio)};[vmain]scale=${W}:${H}:flags=lanczos,setsar=1[display];[1:v]format=rgba,scale=${W}:${H}:flags=bilinear,setsar=1[sub];[display][sub]overlay=0:0:eof_action=pass:repeatlast=0[vout]`
 
   /** 첫 번째 입력 전용: 데이터·자막 스트림 무시 — `-sn`은 해당 `-i` 바로 앞에 두는 편이 매핑에 유리한 경우가 있음 */
   const argv: string[] = [

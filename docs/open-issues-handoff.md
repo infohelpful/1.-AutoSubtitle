@@ -1,5 +1,38 @@
 # AutoSubtitle 데스크톱 — 미해결 문제 인계서
 
+## 2026-10-12 21시 — 구간 PCM 재생·추출/파형 취소 (최신)
+
+기준 HEAD `2be3a7b`. 이전 작업은 사용자 커밋에 포함되어 있고, 이번 변경은 로컬 미커밋 상태다. 아래 과거의 전체 WebAudio 디코딩·최초 추출/파형 취소 미완료 기록은 이 절로 갱신한다.
+
+### 완료·검증
+
+1. **긴 영상 재생 메모리**: 준비된 48kHz stereo PCM을 main에서 최대 6초씩 읽고, renderer는 12초 앞까지 예약한다. 재생 완료/정지 시 AudioBuffer 참조를 해제한다. 일반 재생은 전체 WAV fetch/decodeAudioData를 호출하지 않는다. 컷을 가로지르는 블록도 sample 단위로 연결하고 원본 시각을 따로 추적한다. 읽기가 재생을 따라가지 못하면 시간을 임의로 밀지 않고 정지·오류를 표시한다. 창 비활성화 시 refill 타이머가 지연되지 않도록 backgroundThrottling도 해제했다.
+2. **PCM IPC**: 전용 캐시의 실제 경로만 허용하고 요청당 6초/256구간으로 제한한다. RIFF/RF64 헤더만 읽어 위치를 찾으며, 형식/범위/잘린 파일을 검증한다. RF64는 작은 헤더 fixture 검증이며 실제 4GiB 초과 파일의 전체 검증은 아니다.
+3. **최초 추출 취소**: 추출 모달에 취소 버튼을 추가했다. 준비 작업의 소비자를 취소하고 Python worker 및 하위 프로세스를 종료한다. 늦은 진행률/완료 결과는 폐기하며 다음 추출에서 worker/model을 다시 준비한다. 30분 fixture의 진행 중 작업 취소→모달 종료 약 250ms, 늦은 완료 없음, worker 재시작 통과. 이어 8초 한국어 nonzero PTS fixture를 다시 추출해 칩/모달 완료 및 WhisperX 19/20 aligned를 확인했다. coverage는 정확도가 아니다.
+4. **독립 파형 worker**: 파형 RPC를 ASR worker와 분리하고 요청 ID별 취소를 연결했다. 오래된 취소 ID는 새 요청을 중단하지 않는다. ASR과 동시에 캐시를 생성할 수 있으므로 파형은 고유 work.json/part 경로를 사용한 뒤 최종 rename한다. 취소/종료 시 자체 임시 파일만 정리한다. 실제 30분 파일의 준비 단계(100ms)/worker 단계(500ms) 취소, 재시도, ASR 모델 유지, 잔여 work 파일 0개를 확인했다.
+5. **오류 안내**: 추출 실패 원인을 화면에 표시하고 취소 요청 실패 메시지가 성공 안내로 덮이지 않도록 했다. 최신 빌드에서 손상된 MP4를 드롭해 오류 원인 표시·모달 종료를 확인했고, 추출 취소도 약 248ms로 재통과했다.
+
+### 검증과 재현
+
+- **Vitest 50 files/320 tests**, **Python 32 tests**, web/node 타입 검사, production build, diff 검사 통과. Python 소스는 이번에 변경하지 않았고 최종 재검사했다.
+- 실제 한국어 64초 파일에서 22초 연속 재생: 최대 영상/오디오 clock 차이 0.048686초. 컷 두 개를 적용한 재생은 0.087295초. 30분 합성 파일 시작 22초는 0.040052초, 1780초 탐색 후에도 정상 재생. 관측한 보유 AudioBuffer는 최대 18초, 정지 후 0개. 3시간 가상 길이는 단위 검사로 제한된 읽기를 검증했다.
+- 일반 클릭→버튼/Space 재생 **36/36**, HTML fallback 실패/정지/복귀/지연 취소 통과. 이는 clock/버퍼 검사이며 스피커 청취나 사람 기준 단어 경계 평가, 30분 전체 재생 검사는 아니다.
+- 재현: `stream-playback.mjs`, `cancel-transcription.mjs`, `cancel-waveform.mjs`, `drop-video.mjs`. 조건은 `scripts/e2e-cdp/README.md` 참조.
+- 로그/결과는 git 제외 `tools/sync-validation-output`의 `stream-cancel-vitest-final.log`, `stream-cancel-build-final.log`, `stream-cancel-python-final.log`, `cancel-retry-result.json`. 격리 profile은 `electron-stream`, CDP 9333이다. 마지막 검사는 PID 27244에서 실행했다.
+
+### 다음 우선순위·제한
+
+1. **음성 정확도**: 미지원 `캡`/`둡`, 사람 경계 라벨/CER·WER/median·p95. 실제 음성 122/128과 이번 19/20은 coverage다.
+2. **장시간 처리**: 재생만 구간 읽기로 변경했다. 공통 PCM 디스크 파일은 여전히 전체 생성하고, 최초 ASR의 전체 오디오 메모리 및 캐시 용량 상한은 미해결이다. OS 강제 종료 후 새 파형 work 파일 정리 정책도 남았다. 긴 4K/VFR/실제 대형 RF64 부하 검사 필요.
+3. **배포**: 정렬 runtime/model 번들, GPU/오프라인 새 설치 검증. 개발 venv 성공으로 설치본 완료를 주장하지 않는다.
+4. **편집/표시**: 실제 Windows IME, 여러 줄 단어 선택, remux 비호환 코덱, 임의각/반사 display matrix, 폰트 fallback/모니터 DPI 전환.
+
+전체 개발 계획은 아직 미완료다. 사용자 원본과 기존 pyc 변경을 보존했고 reset credit은 사용하지 않았다.
+
+마무리: 5시간 사용량 약 5% 잔여에서 새 범위 착수를 중단하고 검증/인계 기록을 완료했다. 마지막 테스트 전용 Electron(PID 27244)은 정상 종료했다. 최신 production build는 남아 있으며 사용자 일반 앱을 강제 종료하지 않았다. 변경은 커밋/배포하지 않았다.
+
+---
+
 ## 2026-10-12 15시 — 재생 예외·취소·선택 단어 정렬 (최신)
 
 기준 HEAD `a603f07`, 모든 변경은 로컬 미커밋 상태다. 아래 과거의 HTML fallback/전환 취소/임의 단어 선택 미완료 기록은 이 절로 갱신한다.

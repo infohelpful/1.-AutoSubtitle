@@ -15,7 +15,7 @@ await c.evaluate(`(() => {
   const p = AudioBufferSourceNode.prototype;
   const start = p.start, stop = p.stop, connect = p.connect, disconnect = p.disconnect;
   p.start = function(when = 0, offset = 0, duration) {
-    this.__trace = { node: this, when: when || this.context.currentTime, offset, duration: duration ?? this.buffer.duration - offset, stopped: false, connected: this.__connected === true };
+    this.__trace = { node: this, ranges:this.__autosubtitleSourceRanges, when: when || this.context.currentTime, offset, duration: duration ?? this.buffer.duration - offset, stopped: false, connected: this.__connected === true };
     window.__audioSources.push(this.__trace); return start.apply(this, arguments);
   };
   p.stop = function() { if (this.__trace) this.__trace.stopped = true; return stop.apply(this, arguments); };
@@ -25,7 +25,10 @@ await c.evaluate(`(() => {
 const state = () => c.evaluate(`(() => {
   const v = document.querySelector('video');
   const active = window.__audioSources.filter(s => !s.stopped && s.connected && s.node.context.state === 'running' && s.node.context.currentTime >= s.when && s.node.context.currentTime < s.when + s.duration);
-  return { playing: !v.paused, t: v.currentTime, audioCount: active.length, audioTime: active.map(s => s.offset + s.node.context.currentTime - s.when) };
+  return { playing: !v.paused, t: v.currentTime, audioCount: active.length, audioTime: active.map(s => {
+    const now=s.node.context.currentTime, r=s.ranges?.find(r=>now>=r.ctxStart&&now<r.ctxStart+r.durationSec);
+    return r?r.mediaStartSec+now-r.ctxStart:s.offset+now-s.when;
+  }) };
 })()`)
 const button = async (playing) => {
   const point = await c.evaluate(`(() => { const b = [...document.querySelectorAll('button')].find(b => ${playing ? '/일시정지/' : '/재생/'} .test((b.getAttribute('aria-label') || '') + b.title)); if (!b) throw Error('Playback button missing'); const r = b.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; })()`)

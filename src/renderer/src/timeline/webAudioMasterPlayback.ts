@@ -1,4 +1,6 @@
 import type { ScheduledMediaSegment } from './playbackSchedule'
+import type { PcmAudioBlock, PcmReader } from '../../../shared/pcmAudio'
+import { PcmStreamPlayback } from './pcmStreamPlayback'
 
 const EPS = 1e-4
 const SCHEDULE_LOOKAHEAD_SEC = 0.02
@@ -14,6 +16,11 @@ export type WebAudioSchedulePiece = {
  * HTMLAudioElement 재생 대신 실제 소리는 여기서만 낸다.
  */
 export class WebAudioMasterPlayback {
+  constructor(private pcmReader?: PcmReader) {}
+  private pcmInfo: PcmAudioBlock | null = null
+  private stream: PcmStreamPlayback | null = null
+  private onPlaybackError: ((error: Error) => void) | null = null
+  setOnPlaybackError(callback: ((error: Error) => void) | null): void { this.onPlaybackError=callback }
   private ctx: AudioContext | null = null
   private gain: GainNode | null = null
   private buffer: AudioBuffer | null = null
@@ -41,11 +48,11 @@ export class WebAudioMasterPlayback {
   }
 
   isLoadedForUrl(url: string): boolean {
-    return this.buffer != null && this.loadedFromUrl === url
+    return (this.buffer != null || this.pcmInfo != null) && this.loadedFromUrl === url
   }
 
   isPlaying(): boolean {
-    return this.playingFlag
+    return this.stream?.isPlaying() ?? this.playingFlag
   }
 
   /** 현재 스케줄 식별자(scheduleFromEdl 호출 단위). 자연 종료 콜백 비교용. */
@@ -74,17 +81,26 @@ export class WebAudioMasterPlayback {
   }
 
   async loadFromUrl(url: string): Promise<void> {
-    if (this.loadedFromUrl === url && this.buffer) return
+    if (this.isLoadedForUrl(url)) return
     if (this.pendingLoad?.url === url) return this.pendingLoad.promise
     this.pendingLoad?.controller.abort()
     const request = ++this.loadRequest
     this.stopPlayback()
     this.buffer = null
+    this.pcmInfo = null
     this.loadedFromUrl = null
     const ctx = this.ensureContext()
     const controller = new AbortController()
     const current = () => request === this.loadRequest && ctx === this.ctx && !controller.signal.aborted
     const promise = (async () => {
+      if (this.pcmReader) {
+        const info=await this.pcmReader(url,[])
+        if (!current()) return
+        if (info.sampleRate!==48000 || info.channels!==2 || !Number.isSafeInteger(info.totalFrames) || info.totalFrames<=0) throw new Error('유효하지 않은 준비 오디오입니다.')
+        this.pcmInfo=info
+        this.loadedFromUrl=url
+        return
+      }
       const res = await fetch(url, {signal: controller.signal})
       if (!current()) return
       if (!res.ok) throw new Error(`WebAudio load failed: ${res.status}`)
@@ -117,6 +133,14 @@ export class WebAudioMasterPlayback {
     await ctx.resume()
     if (request !== this.playbackRequest || ctx !== this.ctx) return
     if (ctx.state !== 'running') throw new Error('Audio context is not running')
+    if (this.pcmReader && this.pcmInfo && this.loadedFromUrl) {
+      const stream=new PcmStreamPlayback(ctx,this.gain!,this.pcmReader)
+      this.stream=stream
+      const id=++this.scheduleSeq
+      await stream.start(this.loadedFromUrl,this.pcmInfo,segments,startMediaSec,endMediaSec,
+        ()=>this.onScheduleEnded?.(id,'natural'), error=>this.onPlaybackError?.(error))
+      return
+    }
     const buf = this.buffer
     if (!buf || segments.length === 0) return
 
@@ -182,6 +206,7 @@ export class WebAudioMasterPlayback {
 
   /** AudioContext 현재 시각 기준 재생 중이면 해당 미디어 타임(sec), 아니면 null */
   getCurrentMediaSec(ctxNow?: number): number | null {
+    if (this.stream) return this.stream.currentMediaSec()
     const ctx = this.ctx
     if (!ctx || !this.playingFlag || this.timeline.length === 0) return null
     const now = ctxNow ?? ctx.currentTime
@@ -196,7 +221,9 @@ export class WebAudioMasterPlayback {
 
   stopPlayback(): void {
     this.playbackRequest += 1
-    const hadActive = this.activeSources.length > 0
+    const hadActive = this.activeSources.length > 0 || this.stream?.isPlaying() === true
+    this.stream?.stop()
+    this.stream=null
     const stoppedScheduleId = this.scheduleSeq
     for (const n of this.activeSources) {
       n.onended = null
@@ -234,5 +261,6 @@ export class WebAudioMasterPlayback {
     this.gain = null
     this.buffer = null
     this.loadedFromUrl = null
+    this.pcmInfo=null
   }
 }

@@ -901,12 +901,14 @@ export default function App(): ReactElement {
   const [videoPath, setVideoPath] = useState<string | null>(null)
   const [preparedSource, setPreparedSource] = useState<{ path: string; media: PreparedMedia } | null>(null)
   const [mediaPrepareError, setMediaPrepareError] = useState('')
+  const [playbackError, setPlaybackError] = useState('')
   const preparedMedia = preparedSource?.path === videoPath ? preparedSource.media : null
   useEffect(() => {
     let canceled = false
     const requestId = crypto.randomUUID()
     setPreparedSource(null)
     setMediaPrepareError('')
+    setPlaybackError('')
     if (videoPath) void window.api.prepareSourceMedia(videoPath, requestId).then(result => {
       if (canceled) return
       if (result.ok) setPreparedSource({ path: videoPath, media: result.media })
@@ -1252,7 +1254,16 @@ export default function App(): ReactElement {
     }
   }, [])
   useEffect(() => {
-    const engine = new WebAudioMasterPlayback()
+    const engine = new WebAudioMasterPlayback(async (url,ranges) => {
+      const result=await window.api.readPreparedPcm(url,ranges)
+      if (!result.ok) throw new Error(result.reason)
+      return result.block
+    })
+    engine.setOnPlaybackError(error => {
+      finalizePlaybackStopRef.current?.('PCM stream failed', {markUserPause:true})
+      clearOneShotSessionRef.current?.('PCM stream failed')
+      setPlaybackError(error.message)
+    })
     webAudioMasterPlaybackRef.current = engine
     /**
      * **WebAudio 자연 종료 콜백 — oneShotSession 정리의 단일 결정점.**
@@ -1298,6 +1309,7 @@ export default function App(): ReactElement {
     })
     return () => {
       engine.setOnScheduleEnded(null)
+      engine.setOnPlaybackError(null)
       engine.dispose()
       if (webAudioMasterPlaybackRef.current === engine) {
         webAudioMasterPlaybackRef.current = null
@@ -1547,6 +1559,7 @@ export default function App(): ReactElement {
   const [projectIoBusy, setProjectIoBusy] = useState(false)
 
   const [isExtracting, setIsExtracting] = useState(false)
+  const acceptTranscriptionRef = useRef(false)
   /** IPC 100% 이후 — 리스트·가상행 레이아웃이 끝날 때까지 오버레이 유지할 때 true */
   const [extractAwaitListPaint, setExtractAwaitListPaint] = useState(false)
   const [progress, setProgress] = useState(0)
@@ -2179,6 +2192,7 @@ export default function App(): ReactElement {
 
       const request = ++playbackStartRequestRef.current
       const isCurrent = () => request === playbackStartRequestRef.current && videoRef.current === el
+      setPlaybackError('')
       void (async () => {
         const engine = webAudioMasterPlaybackRef.current
         try {
@@ -3238,6 +3252,7 @@ export default function App(): ReactElement {
     setWaveformMediaSpanSec(null)
     setWaveformPeaksJsonLoading(true)
     let cancelled = false
+    const waveformRequestId=crypto.randomUUID()
     void (async () => {
       try {
         const cacheRes = await window.api.getWaveformPeaksCachePath(videoPath)
@@ -3296,6 +3311,7 @@ export default function App(): ReactElement {
           }
           if (cancelled) return
           const raw = await window.api.sidecarCall('waveform_peaks', {
+            requestId:waveformRequestId,
             path: videoPath,
             ...(ffmpegPath ? { ffmpeg_path: ffmpegPath } : {})
           })
@@ -3341,6 +3357,7 @@ export default function App(): ReactElement {
     })()
     return () => {
       cancelled = true
+      void window.api.cancelWaveform(waveformRequestId).catch(()=>{})
     }
   }, [videoPath, preparedMedia])
 
@@ -5725,6 +5742,7 @@ export default function App(): ReactElement {
       if (modelReady && !busy) {
         pendingAutoTranscribeRef.current = null
         setIsExtracting(true)
+        acceptTranscriptionRef.current=true
         window.api.sendVideoDropPath(absPath, alignmentMode)
       } else {
         pendingAutoTranscribeRef.current = absPath
@@ -5740,6 +5758,7 @@ export default function App(): ReactElement {
     pendingAutoTranscribeRef.current = null
     setExtractAwaitListPaint(false)
     setIsExtracting(true)
+    acceptTranscriptionRef.current=true
     window.api.sendVideoDropPath(p, alignmentMode)
   }, [modelReady, busy, isExtracting, alignmentMode])
 
@@ -5802,9 +5821,13 @@ export default function App(): ReactElement {
       setTranscribeDiagnostics(prev => [...prev.slice(-7), message])
     })
     const offP = window.api.onTranscribeProgress((pct) => {
+      if (!acceptTranscriptionRef.current) return
       setProgress((prev) => Math.max(prev, Math.min(100, pct)))
     })
     const offC = window.api.onTranscribeComplete((raw) => {
+      if (!acceptTranscriptionRef.current) return
+      const generation=projectGenerationRef.current
+      const isCurrent=()=>acceptTranscriptionRef.current && projectGenerationRef.current===generation
       const rawLines = parseSubtitleLines((raw as { subtitles?: unknown })?.subtitles)
       /**
        * `end > start` 가 깨진 단어는 카드 레이아웃·캐럿 측정에서 NaN/음수 폭을 만들어
@@ -5826,6 +5849,7 @@ export default function App(): ReactElement {
       })
       const wordCount = lines.reduce((acc, l) => acc + (l.words?.length ?? 0), 0)
       if (lines.length === 0 || wordCount === 0) {
+        acceptTranscriptionRef.current=false
         setExtractAwaitListPaint(false)
         setIsExtracting(false)
         setProgress(0)
@@ -5846,6 +5870,7 @@ export default function App(): ReactElement {
           if (wp?.ok && wp.path) {
             setWaveformPeaksJsonPath(wp.path)
             const jr = await window.api.readLocalPeaksJsonFile(wp.path)
+            if (!isCurrent()) return
             if (jr.ok && jr.json) {
               const j = jr.json as JsonWaveformData
               setWaveformPeaksJsonData(j)
@@ -5873,6 +5898,8 @@ export default function App(): ReactElement {
           })
         }
 
+        if (!isCurrent()) return
+        acceptTranscriptionRef.current=false
         const t0 = performance.now()
         const finalWordCount = finalLines.reduce((acc, l) => acc + (l.words?.length ?? 0), 0)
         wfLog('perf', '단어 추출 완료 — setSentenceTokenTimeline 시작', {
@@ -5901,12 +5928,15 @@ export default function App(): ReactElement {
         redoStackRef.current = []
       })()
     })
-    const offE = window.api.onTranscribeError(() => {
+    const offE = window.api.onTranscribeError((error) => {
+      if (!acceptTranscriptionRef.current) return
+      acceptTranscriptionRef.current=false
       setExtractAwaitListPaint(false)
       setIsExtracting(false)
       setProgress(0)
       setTranscribeMode(null)
-      setTranscribeDiagnostics([])
+      setTranscribeDiagnostics([error.message])
+      setAlignmentNotice(`자막 추출 실패: ${error.message}`)
     })
     return () => {
       offM()
@@ -6888,6 +6918,7 @@ export default function App(): ReactElement {
             data-waveform-no-dismiss="1"
           >
             {videoPath && !preparedMedia ? <p role="status">{mediaPrepareError || '영상과 음성의 시간축을 준비하고 있습니다…'}</p> : null}
+            {playbackError ? <p role="alert">{playbackError}</p> : null}
             {videoPath ? (
               <>
                 <div className={previewMediaClass}>
@@ -7298,6 +7329,21 @@ export default function App(): ReactElement {
             </div>
             <p className="extract-modal-pct">{Math.round(progress)}%</p>
             <p className="text-xs" role="status">{transcribeDiagnostics.at(-1)}</p>
+            <button type="button" disabled={extractAwaitListPaint} onClick={async () => {
+              acceptTranscriptionRef.current=false
+              pendingAutoTranscribeRef.current=null
+              let notice='자막 추출을 취소했습니다. 영상을 다시 가져오면 재시도합니다.'
+              try { await window.api.cancelTranscription() }
+              catch (error) { notice=`추출 취소 요청 실패: ${String(error)}` }
+              finally {
+                setExtractAwaitListPaint(false)
+                setIsExtracting(false)
+                setProgress(0)
+                setTranscribeMode(null)
+                setTranscribeDiagnostics([notice])
+                setAlignmentNotice(notice)
+              }
+            }}>추출 취소</button>
           </div>
         </div>
       ) : null}

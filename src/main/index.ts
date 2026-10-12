@@ -13,7 +13,7 @@ import {
   unlinkSync,
   writeFileSync
 } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { readFile, rename, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { PythonSidecar } from './sidecar'
 import { ensureFfprobeExecutable, ffmpegReadyForUse, getBundledFfmpegPath, getFfmpegUserBinDir, systemFfmpegWorks } from './ffmpeg-deps'
@@ -48,6 +48,8 @@ import { probeMediaTimingAsync } from './mediaTiming'
 import { validateMediaDecode } from './validateMediaDecode'
 import { prepareSourceMedia, stopPreparingMedia, prunePreparedMediaCache } from './preparedMedia'
 import { exportAudio } from './audioExport'
+import { readPreparedPcm } from './pcmAudio'
+import type { PcmRange } from '../shared/pcmAudio'
 import { fingerprintMedia, saveProjectDocument } from './projectStorage'
 import { clipPlanFromCuts, mapSourceIntervalToProgram, programDuration, validateClipPlan } from '../shared/clipPlan'
 import { randomUUID } from 'node:crypto'
@@ -67,8 +69,68 @@ let sidecar: PythonSidecar | null = null
 let depsPrepareLocked = false
 let gpuInstallLocked = false
 const activeExports = new Set<AbortController>()
+const activeTranscriptions = new Map<number, {worker: PythonSidecar; controller: AbortController}>()
+
+function cancelTranscription(senderId: number): void {
+  const job=activeTranscriptions.get(senderId)
+  if (!job) return
+  activeTranscriptions.delete(senderId)
+  job.controller.abort()
+  job.worker.setTranscribeProgressHandler(null)
+  job.worker.setTranscribeDeviceHandler(null)
+  job.worker.stop('자막 추출을 취소했습니다.')
+}
 const activeAlignments = new Map<number, { requestId: string; worker: PythonSidecar; controller: AbortController }>()
 const activePreparations = new Map<number, { requestId: string; controller: AbortController }>()
+const activeWaveforms = new Map<number, {requestId: string; controller: AbortController; worker?: PythonSidecar}>()
+function cancelWaveform(senderId: number, requestId?: unknown): void {
+  const job=activeWaveforms.get(senderId)
+  if (!job || (requestId!==undefined && job.requestId!==requestId)) return
+  activeWaveforms.delete(senderId)
+  job.controller.abort()
+  job.worker?.stop('파형 생성을 취소했습니다.')
+}
+
+async function generateWaveform(event: Electron.IpcMainInvokeEvent, params?: Record<string,unknown>) {
+  if (typeof params?.path!=='string' || !params.path.trim() || typeof params.requestId!=='string' || !params.requestId) {
+    return {ok:false,path:null,reason:'유효한 파형 요청 ID와 영상 경로가 필요합니다.'}
+  }
+  const senderId=event.sender.id
+  cancelWaveform(senderId)
+  const job: {requestId:string;controller:AbortController;worker?:PythonSidecar}={requestId:params.requestId,controller:new AbortController()}
+  activeWaveforms.set(senderId,job)
+  const cancel=()=>cancelWaveform(senderId,job.requestId)
+  event.sender.once('destroyed',cancel)
+  let scratch: string | undefined
+  try {
+    const abs=normalizeDroppedPath(params.path)
+    const cache=await getWaveformCacheJsonPathForMedia(abs)
+    if (!cache.ok) throw new Error(cache.reason)
+    const prepared=await prepareMediaForSource(abs,job.controller.signal)
+    if (job.controller.signal.aborted) throw new Error('파형 생성을 취소했습니다.')
+    const spec=resolveSidecarCommandAndArgs(), aw=resolveBundledAudiowaveformPath()
+    job.worker=new PythonSidecar(spec.command,spec.args,getFfmpegUserBinDir(),{
+      AUTOSUBTITLE_MODELS_DIR:join(app.getPath('appData'),'AutoSubtitle','models'),
+      AUTOSUBTITLE_FFMPEG_PATH:getUsableFfmpegExecutable(),
+      ...(aw?{AUTOSUBTITLE_AUDIOWAVEFORM_PATH:aw}:{})
+    })
+    // ASR can generate this cache concurrently. Give this worker its own partial
+    // destination so cancellation never removes another producer's output.
+    scratch=cache.cachePath+'.'+randomUUID()+'.work.json'
+    const result=await job.worker.call<{ok:boolean;path:string|null;reason?:string}>('waveform_peaks',
+      {...params,path:prepared.audioPath,out_json_path:scratch},TRANSCRIBE_TIMEOUT_MS)
+    if (job.controller.signal.aborted) throw new Error('파형 생성을 취소했습니다.')
+    if (result.ok) { await rename(scratch,cache.cachePath);return {...result,path:cache.cachePath} }
+    return result
+  } catch (error) { return {ok:false,path:null,reason:error instanceof Error?error.message:String(error)} }
+  finally {
+    event.sender.removeListener('destroyed',cancel)
+    job.controller.abort()
+    job.worker?.stop()
+    if (scratch) await Promise.all([scratch,scratch+'.part'].map(path=>unlink(path).catch(()=>{})))
+    if(activeWaveforms.get(senderId)===job)activeWaveforms.delete(senderId)
+  }
+}
 
 function alignmentPythonPath(): string | undefined {
   if (process.env.AUTOSUBTITLE_ALIGN_PYTHON?.trim()) return process.env.AUTOSUBTITLE_ALIGN_PYTHON.trim()
@@ -224,6 +286,8 @@ function createWindow(): void {
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false,
+      // Keep PCM prefetch and video-clock updates running when minimized.
+      backgroundThrottling: false,
       // renderer(http://localhost)에서도 file:// 로컬 미디어(<video>) 로드를 허용
       webSecurity: false
     }
@@ -953,6 +1017,10 @@ app.whenReady().then(() => {
     const job = activePreparations.get(event.sender.id)
     if (job && job.requestId === requestId) job.controller.abort()
   })
+  ipcMain.handle('media:readPcm', async (_event, url: string, ranges: PcmRange[]) => {
+    try { return {ok:true,block:await readPreparedPcm(join(app.getPath('userData'),'PreparedMedia'),url,ranges)} }
+    catch (error) { return {ok:false,reason:error instanceof Error?error.message:String(error)} }
+  })
   ipcMain.handle('media:prepareSource', async (event, path: unknown, requestId: unknown) => {
     if (typeof path !== 'string' || !path.trim()) return { ok: false, reason: '유효한 영상 경로가 필요합니다.' }
     if (typeof requestId !== 'string' || !requestId) return { ok: false, reason: '유효한 준비 요청 ID가 필요합니다.' }
@@ -1181,25 +1249,17 @@ app.whenReady().then(() => {
     }
   })
 
-  ipcMain.handle('sidecar:call', async (_evt, method: string, params?: Record<string, unknown>) => {
+  ipcMain.handle('waveform:cancel',(event,requestId:unknown)=>cancelWaveform(event.sender.id,requestId))
+  ipcMain.handle('sidecar:call', async (event, method: string, params?: Record<string, unknown>) => {
+    if (method==='waveform_peaks') return generateWaveform(event,params)
     const sc = ensureSidecar()
     const timeoutMs =
       method === 'prepare_model'
         ? PREPARE_MODEL_TIMEOUT_MS
-        : method === 'transcribe' || method === 'waveform_peaks'
+        : method === 'transcribe'
           ? TRANSCRIBE_TIMEOUT_MS
           : undefined
-    let mergedParams: Record<string, unknown> | undefined = params
-    if (method === 'waveform_peaks' && params && typeof params.path === 'string' && params.path.trim()) {
-      const abs = normalizeDroppedPath(params.path)
-      const cache = await getWaveformCacheJsonPathForMedia(abs)
-      if (!cache.ok) {
-        return { ok: false, path: null, reason: `waveform_cache: ${cache.reason}` }
-      }
-      const prepared = await prepareMediaForSource(abs)
-      mergedParams = { ...params, path: prepared.audioPath, out_json_path: cache.cachePath }
-    }
-    const result = await sc.call(method, mergedParams, timeoutMs)
+    const result = await sc.call(method, params, timeoutMs)
     if (method === 'prepare_model') {
       const load = (result as { load?: { device?: string | null; reason?: string; cuda_error?: string } } | null)?.load
       logMain('transcribe', `모델 준비 장치=${load?.device ?? '-'}`, load?.reason ?? '', load?.cuda_error ?? '')
@@ -1260,6 +1320,7 @@ app.whenReady().then(() => {
     }
   })
 
+  ipcMain.handle('transcribe:cancel', event => cancelTranscription(event.sender.id))
   ipcMain.on('video-drop-path', (event, raw: unknown, alignmentMode?: unknown) => {
     void (async () => {
       const win = BrowserWindow.fromWebContents(event.sender)
@@ -1277,15 +1338,28 @@ app.whenReady().then(() => {
         win.webContents.send('transcribe:error', { message: '지원하지 않는 영상 형식입니다. (mp4, mkv, avi)' })
         return
       }
-      let sc: PythonSidecar | null = null
+      const senderId=event.sender.id
+      cancelTranscription(senderId)
+      let sc: PythonSidecar
+      try { sc=ensureSidecar() }
+      catch (error) {
+        win.webContents.send('transcribe:error',{message:error instanceof Error?error.message:String(error)})
+        return
+      }
+      const job={worker:sc,controller:new AbortController()}
+      activeTranscriptions.set(senderId,job)
+      const isCurrent=()=>activeTranscriptions.get(senderId)===job && !win.isDestroyed()
+      const cancel=()=>{if(activeTranscriptions.get(senderId)===job)cancelTranscription(senderId)}
+      win.once('closed',cancel)
       try {
-        sc = ensureSidecar()
         const reqStartMs = Date.now()
         const status = (await sc.call('get_model_status')) as { loaded?: boolean; device?: string | null }
+        if (!isCurrent()) return
         if (!status.loaded) {
           const prep = (await sc.call('prepare_model', {}, PREPARE_MODEL_TIMEOUT_MS)) as {
             load?: { device?: string | null; reason?: string; cuda_error?: string }
           }
+          if (!isCurrent()) return
           // CPU 로 떨어진 사유(드라이버·CUDA DLL·VRAM 등)를 남겨 두어야 원인을 추적할 수 있다.
           logMain(
             'transcribe',
@@ -1307,15 +1381,16 @@ app.whenReady().then(() => {
           })
         }
         sc.setTranscribeProgressHandler((pct) => {
-          if (!win.isDestroyed()) win.webContents.send('transcribe:progress', pct)
+          if (isCurrent()) win.webContents.send('transcribe:progress', pct)
         })
         sc.setTranscribeDeviceHandler((device, reason) => {
-          if (win.isDestroyed()) return
+          if (!isCurrent()) return
           win.webContents.send('transcribe:mode', mapDeviceToMode(device))
           if (reason) win.webContents.send('transcribe:diag', { message: reason })
         })
         const txParams: Record<string, unknown> = { path: absPath }
-        const prepared = await prepareMediaForSource(absPath)
+        const prepared = await prepareMediaForSource(absPath,job.controller.signal)
+        if (!isCurrent()) return
         txParams.prepared_audio_path = prepared.audioPath
         if (alignmentMode === 'accurate' || alignmentMode === 'fast') txParams.alignment_mode = alignmentMode
         const alignmentPython = alignmentPythonPath()
@@ -1324,6 +1399,7 @@ app.whenReady().then(() => {
         if (wfCache.ok) {
           txParams.waveform_out_json_path = wfCache.cachePath
         }
+        if (!isCurrent()) return
         const result = (await sc.call('transcribe', txParams, TRANSCRIBE_TIMEOUT_MS)) as {
           device?: string | null
           device_before?: string | null
@@ -1338,6 +1414,7 @@ app.whenReady().then(() => {
             counts?: { aligned?: number }
           }
         }
+        if (!isCurrent()) return
         if (!win.isDestroyed()) win.webContents.send('transcribe:mode', mapDeviceToMode(result?.device))
         if (!win.isDestroyed()) {
           const totalMs = Date.now() - reqStartMs
@@ -1376,10 +1453,15 @@ app.whenReady().then(() => {
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e)
         logMain('transcribe', 'video-drop-path 실패', message)
-        if (!win.isDestroyed()) win.webContents.send('transcribe:error', { message })
+        if (isCurrent()) win.webContents.send('transcribe:error', { message })
       } finally {
-        sc?.setTranscribeProgressHandler(null)
-        sc?.setTranscribeDeviceHandler(null)
+        win.removeListener('closed',cancel)
+        job.controller.abort()
+        if(activeTranscriptions.get(senderId)===job) {
+          activeTranscriptions.delete(senderId)
+          sc.setTranscribeProgressHandler(null)
+          sc.setTranscribeDeviceHandler(null)
+        }
       }
     })()
   })
@@ -1655,6 +1737,8 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  for (const senderId of activeWaveforms.keys()) cancelWaveform(senderId)
+  for (const senderId of activeTranscriptions.keys()) cancelTranscription(senderId)
   stopPreparingMedia()
   for (const job of activePreparations.values()) job.controller.abort()
   activePreparations.clear()

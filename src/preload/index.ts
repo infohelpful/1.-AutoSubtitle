@@ -54,6 +54,7 @@ contextBridge.exposeInMainWorld('electron', {
 contextBridge.exposeInMainWorld('api', {
   prepareSourceMedia: (path: string, requestId: string) => ipcRenderer.invoke('media:prepareSource', path, requestId),
   cancelMediaPreparation: (requestId: string) => ipcRenderer.invoke('media:cancelPreparation', requestId),
+  readPreparedPcm: (url: string, ranges: import('../shared/pcmAudio').PcmRange[]) => ipcRenderer.invoke('media:readPcm',url,ranges),
   openVideoFileDialog: () =>
     ipcRenderer.invoke('dialog:openVideo') as Promise<OpenVideoDialogResult>,
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
@@ -108,6 +109,8 @@ contextBridge.exposeInMainWorld('api', {
   sendVideoDropPath: (absolutePath: string, alignmentMode?: 'accurate' | 'fast') => {
     ipcRenderer.send(CH_VIDEO_DROP, absolutePath, alignmentMode)
   },
+  cancelTranscription: () => ipcRenderer.invoke('transcribe:cancel'),
+  cancelWaveform: (requestId: string) => ipcRenderer.invoke('waveform:cancel',requestId),
   onTranscribeMode: (callback: (mode: 'cpu' | 'gpu') => void) => {
     const listener = (_event: IpcRendererEvent, mode: 'cpu' | 'gpu') => callback(mode)
     ipcRenderer.on(CH_TX_MODE, listener)

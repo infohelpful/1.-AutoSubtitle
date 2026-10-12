@@ -171,6 +171,7 @@ export type WaveformPeaksCachePathResult =
 export type SidecarApi = {
   prepareSourceMedia: (path: string, requestId: string) => Promise<import('./preparedMedia').PreparedMediaResult>
   cancelMediaPreparation: (requestId: string) => Promise<void>
+  readPreparedPcm: (url: string, ranges: import('./pcmAudio').PcmRange[]) => Promise<import('./pcmAudio').PcmReadResult>
   fingerprintMedia: (path: string) => Promise<import('./projectMedia').MediaFingerprintResult>
   realignWords: (request: RealignRequest) => Promise<RealignResult>
   cancelRealignment: (requestId: string) => Promise<void>
@@ -197,6 +198,8 @@ export type SidecarApi = {
   onModelReady: (callback: () => void) => () => void
   /** 절대 경로를 메인 프로세스로 넘기면 `transcribe` 파이프라인이 실행됩니다 (`ipcRenderer.send`). */
   sendVideoDropPath: (absolutePath: string, alignmentMode?: 'accurate' | 'fast') => void
+  cancelTranscription: () => Promise<void>
+  cancelWaveform: (requestId: string) => Promise<void>
   onTranscribeMode: (callback: (mode: TranscribeMode) => void) => () => void
   onTranscribeDiag: (callback: (payload: TranscribeDiagPayload) => void) => () => void
   onTranscribeProgress: (callback: (percent: number) => void) => () => void

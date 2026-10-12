@@ -29,3 +29,10 @@ node scripts/e2e-cdp/character-edit.mjs        # 글자 삭제·textarea focus·
 - `korean-composition.mjs`: 로드된 발화 프로젝트에서 Chromium `imeSetComposition`으로 한글 조합/확정/취소, 한 번의 Undo, 3,000자 붙여넣기/복구를 검사한다. Windows IME 후보 창/키보드 레이아웃의 수동 검증을 대체하지 않는다.
 - `realign-selected.mjs [저장 프로젝트 경로]`: `reading-fixture.autosub`(3배가 있는 마지막 줄)와 새 `AUTOSUBTITLE_E2E_SAVE_PROJECT`를 제공한다. 실제 모델로 단일·비연속 복수 단어 정렬, 비선택 단어 보존, 저장·Undo/Redo를 확인한다. 저장 경로 뒤 `.png`로 선택 패널 캡처도 남긴다.
 - `launch-test-app.cjs`는 `AUTOSUBTITLE_E2E_PROJECT`, `AUTOSUBTITLE_E2E_OUTPUT` 절대경로를 요구한다. 선택 큐는 `AUTOSUBTITLE_E2E_OPEN_QUEUE` JSON 배열이다. 경로는 `tools/sync-validation-output` 내부에 두고 출력은 기존 파일과 겹치지 않는 새 이름으로 지정한다. 테스트 fixture와 큰 결과 파일은 git에서 제외되어 있다.
+
+구간 PCM 재생/작업 취소 검증:
+
+- `stream-playback.mjs [--tail]`: 23초 이상의 프로젝트를 launcher로 제공한다. 22초 재생 중 전체 decodeAudioData 미호출, 실제 노드의 source clock/영상 오차 250ms 이내, 보유 AudioBuffer 18초 이내, 정지 후 버퍼 해제를 검사한다. `--tail`은 1780초 단어칩이 있는 30분 프로젝트를 요구하고 끝부분 탐색도 검사한다. 컷이 6초 블록 경계에 걸리는 프로젝트로 반복하면 연결 경계도 검사할 수 있다.
+- `cancel-transcription.mjs [긴 영상 경로]`: 기본은 `tools/sync-validation-output/stream-30min.mp4`. 영상 드롭 후 2.5초에 취소 버튼을 눌러 모달 종료·늦은 완료 없음·worker 재시작을 검사한다. 당시 작업이 모델 준비/PCM 준비/인식 중 어느 단계인지는 이 테스트만으로 구분하지 않는다. 이후 `drop-video.mjs`로 짧은 한국어 영상을 추출해 실제 재시도를 검증한다.
+- `cancel-waveform.mjs [긴 영상 경로] [취소 지연 ms]`: 짧은 영상 추출로 ASR 모델이 로드된 상태에서 실행한다. 파형 취소/재시도, 오래된 취소 ID 무시, ASR 모델 유지 및 work 파일 정리를 검사한다. 기본 지연 100ms는 준비 단계, 이 PC에서 500ms는 worker 단계 취소를 확인했다(컴퓨터별 속도에 따라 달라질 수 있음).
+- 30분 fixture는 64×64/1fps 단색 영상+48kHz 440Hz AAC로 만들었다. canonical PCM은 약 345MB다. 테스트는 시작 22초와 끝부분 탐색이며 전체 30분 재생/실제 스피커 청취/단어 경계 정확도 평가는 아니다.

@@ -2,8 +2,19 @@ import { connect } from './cdp.mjs'
 import { writeFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
 const c = await connect()
-const file = process.argv[2]
+const positional = process.argv.slice(2).filter(arg => arg !== '--fast')
+const file = positional[0]
 assert.ok(file, 'Video path required')
+if (process.argv.includes('--fast')) {
+  const selected = await c.evaluate(`(() => {
+    const s = document.querySelector('select[aria-label="추출 싱크 정밀도"]');
+    if (!s || s.disabled) return false;
+    s.value = 'fast'; s.dispatchEvent(new Event('change', {bubbles: true})); return true;
+  })()`)
+  assert.ok(selected, 'Wait for the app to become ready before selecting fast mode')
+  await c.sleep(150)
+  assert.equal(await c.evaluate(`document.querySelector('select[aria-label="추출 싱크 정밀도"]').value`), 'fast')
+}
 await c.evaluate(`(() => {
   window.__e2eTranscription = null; window.__e2eTranscriptionError = null;
   const done = window.api.onTranscribeComplete(result => { window.__e2eTranscription = result; done(); failed(); });
@@ -24,6 +35,10 @@ for (let i = 0; i < 150; i++) {
 }
 console.log('cards', await c.evaluate(`document.querySelectorAll('[id^="subtitle-card-"]').length`))
 const result = await c.evaluate('window.__e2eTranscription')
-if (process.argv[3] && result) await writeFile(process.argv[3], JSON.stringify(result, null, 2))
+if (positional[1] && result) await writeFile(positional[1], JSON.stringify(result, null, 2))
 c.close()
 assert.ok(result, 'Transcription did not finish within five minutes')
+if (process.argv.includes('--fast')) {
+  assert.equal(result.alignmentSummary?.appliedEngine, 'rms', JSON.stringify(result.alignmentSummary))
+  assert.deepEqual(result.alignmentSummary?.reviewReasons, [])
+}

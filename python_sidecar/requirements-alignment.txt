@@ -1,5 +1,6 @@
 # Experimental isolated Python 3.12 runtime; not yet the packaged sidecar default.
 whisperx==3.8.6
+av==18.0.0
 torch==2.8.0
 torchaudio==2.8.0
 torchvision==0.23.0

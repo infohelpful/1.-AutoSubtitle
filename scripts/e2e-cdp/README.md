@@ -17,6 +17,7 @@ node scripts/e2e-cdp/character-edit.mjs        # 글자 삭제·textarea focus·
 - 테스트 영상은 말이 있는 짧은 mp4 면 된다(8~20초, 자막 4줄 이상). 한국어 합성음성은 `scripts/alignment-tts-bench.ps1` 로 만들 수 있다.
 - 재생 영상은 `video.paused/currentTime`, 실제 출력은 WebAudio BufferSource의 연결·정지·스케줄 시간으로 검사한다. clock 허용 오차는 250ms이며 음성 인식 경계 정확도 평가는 아니다.
 - `drop-video.mjs <영상> [결과 JSON 경로]`는 새 추출 완료 이벤트와 모달 종료를 기다린다. 이전 영상의 칩을 성공으로 오인하지 않는다.
+- `drop-video.mjs <영상> [결과 JSON 경로] --fast`는 준비가 완료된 앱에서 빠른 싱크 모드를 선택하고 결과 엔진이 RMS인지 확인한다.
 
 추가 미디어/export 검증:
 
@@ -36,3 +37,9 @@ node scripts/e2e-cdp/character-edit.mjs        # 글자 삭제·textarea focus·
 - `cancel-transcription.mjs [긴 영상 경로]`: 기본은 `tools/sync-validation-output/stream-30min.mp4`. 영상 드롭 후 2.5초에 취소 버튼을 눌러 모달 종료·늦은 완료 없음·worker 재시작을 검사한다. 당시 작업이 모델 준비/PCM 준비/인식 중 어느 단계인지는 이 테스트만으로 구분하지 않는다. 이후 `drop-video.mjs`로 짧은 한국어 영상을 추출해 실제 재시도를 검증한다.
 - `cancel-waveform.mjs [긴 영상 경로] [취소 지연 ms]`: 짧은 영상 추출로 ASR 모델이 로드된 상태에서 실행한다. 파형 취소/재시도, 오래된 취소 ID 무시, ASR 모델 유지 및 work 파일 정리를 검사한다. 기본 지연 100ms는 준비 단계, 이 PC에서 500ms는 worker 단계 취소를 확인했다(컴퓨터별 속도에 따라 달라질 수 있음).
 - 30분 fixture는 64×64/1fps 단색 영상+48kHz 440Hz AAC로 만들었다. canonical PCM은 약 345MB다. 테스트는 시작 22초와 끝부분 탐색이며 전체 30분 재생/실제 스피커 청취/단어 경계 정확도 평가는 아니다.
+
+캐시/메모리/패키징 추가 검사:
+
+- `node scripts/e2e-cdp/cache-startup.mjs`: build 후 실행. 포트 9334의 새 격리 프로필을 생성하고 시작 시 오래된 캐시/work 정리·무관한 파일 보존·중복 앱 종료·활성 캐시 보존을 확인한 뒤 종료한다. `real-video-fixture.autosub`가 필요하다. 용량/LRU·변경 감지·링크 제외는 `mediaCacheRetention.test.ts`의 작은 파일 예산으로 검사한다.
+- `python -B scripts/rms-stream-bench.py --media <영상> --ffmpeg <실행 파일>`: 모델 없이 RMS 전체 길이를 블록 처리하고 frame/kernel 크기·추적 메모리를 출력한다. 짧은 fixture에만 `--compare`를 추가하면 이전 전체 오디오 mask와 비교한다. 추적 수치는 앱/모델/FFmpeg 전체 RSS가 아니다.
+- `scripts/frozen-sidecar-smoke.py`: 실제 패키징된 helper에서 로컬 모델을 사용한 전사/파형/빠른 보정/선택적인 외부 정밀 정렬을 검증한다. 인자/환경/한계는 `docs/sidecar-packaging.md` 참조.

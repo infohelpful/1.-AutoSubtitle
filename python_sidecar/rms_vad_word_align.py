@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import math
 import subprocess
+import tempfile
+import threading
+from contextlib import closing
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import numpy as np
@@ -46,38 +50,56 @@ MIN_SNAPPED_TO_WHISPER_RATIO = 0.36
 GAP_INSERT_SILENCE_SEC = 0.30
 
 
-def _decode_mono_f32_16k(media_path: str, ffmpeg_exe: str) -> np.ndarray:
-    """ffmpeg → raw f32le mono 16kHz, shape (n_samples,)"""
-    cflags = _subprocess_creationflags()
-    r = subprocess.run(
-        [
-            ffmpeg_exe,
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            media_path,
-            "-ac",
-            "1",
-            "-ar",
-            str(SR),
-            "-f",
-            "f32le",
-            "-",
-        ],
-        capture_output=True,
-        timeout=3 * 60 * 60,
-        creationflags=cflags,
-    )
-    if r.returncode != 0:
-        err = (r.stderr or b"").decode("utf-8", errors="replace")
-        raise RuntimeError(err.strip() or f"ffmpeg decode exit {r.returncode}")
-    raw = r.stdout or b""
-    if len(raw) < 4:
-        raise RuntimeError("ffmpeg produced empty audio")
-    n = len(raw) // 4
-    return np.frombuffer(raw[: n * 4], dtype=np.float32).copy()
+def _decode_mono_f32_chunks(media_path: str, ffmpeg_exe: str, *,
+                            timeout_sec: float = 3 * 60 * 60) -> Iterator[np.ndarray]:
+    """Decode at most 64 KiB per read; kill/reap FFmpeg on timeout or early close."""
+    command = [ffmpeg_exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", media_path,
+               "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"]
+    # A file prevents stderr backpressure while stdout is consumed incrementally.
+    with tempfile.TemporaryFile() as errors:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors,
+                                creationflags=_subprocess_creationflags())
+        expired = threading.Event()
+
+        def expire() -> None:
+            expired.set()
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+        timer = threading.Timer(timeout_sec, expire)
+        timer.daemon = True
+        timer.start()
+        tail = b""
+        count = 0
+        try:
+            while True:
+                raw = proc.stdout.read(65536)
+                if not raw:
+                    break
+                raw = tail + raw
+                size = len(raw) - len(raw) % 4
+                tail = raw[size:]
+                if size:
+                    count += size // 4
+                    yield np.frombuffer(raw[:size], dtype="<f4")
+            code = proc.wait(timeout=5)
+            if expired.is_set():
+                raise subprocess.TimeoutExpired(command, timeout_sec)
+            if code != 0:
+                errors.seek(0, 2)
+                errors.seek(max(0, errors.tell() - 4000))
+                error = errors.read().decode("utf-8", errors="replace")
+                raise RuntimeError(error.strip() or f"ffmpeg decode exit {code}")
+            if tail or not count:
+                raise RuntimeError("ffmpeg produced incomplete or empty audio")
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            proc.stdout.close()
 
 
 def _rms_db_frames(samples: np.ndarray) -> tuple[np.ndarray, float, int, int]:
@@ -101,6 +123,33 @@ def _rms_db_frames(samples: np.ndarray) -> tuple[np.ndarray, float, int, int]:
         rms = float(math.sqrt(max(mean_sq, 1e-24)))
         out[i] = 20.0 * math.log10(rms + RMS_EPS)
     return out, hop_sec, hop, win
+
+
+def _rms_db_chunks(chunks: Iterable[np.ndarray]) -> tuple[np.ndarray, float, int]:
+    """Keep < one window of overlap and the compact 100 Hz energy envelope.
+
+    Frame starts stay on the global hop grid across arbitrary decoder boundaries.
+    Sample/cumulative arrays never scale with the recording duration.
+    """
+    hop = max(1, int(SR * HOP_MS / 1000))
+    win = max(hop, int(SR * WIN_MS / 1000))
+    pending = np.empty(0, dtype=np.float32)
+    frames: list[np.ndarray] = []
+    count = 0
+    for chunk in chunks:
+        count += len(chunk)
+        for offset in range(0, len(chunk), 16384):
+            samples = np.concatenate((pending, chunk[offset:offset + 16384]))
+            if len(samples) < win:
+                pending = samples
+                continue
+            values, _, _, _ = _rms_db_frames(samples)
+            frames.append(values)
+            pending = samples[len(values) * hop:].copy()
+    if not count:
+        raise RuntimeError("ffmpeg produced empty audio")
+    return (np.concatenate(frames) if frames else np.array([-100.0], dtype=np.float64),
+            hop / float(SR), count)
 
 
 def _dynamic_threshold_db(db_frames: np.ndarray) -> float:
@@ -273,21 +322,16 @@ def apply_rms_vad_word_align(
     """
     if not cues:
         return cues
-    try:
-        ff = ffmpeg_exe if (ffmpeg_exe and str(ffmpeg_exe).strip()) else _which_ffmpeg(None)
-    except FileNotFoundError:
-        return cues
+    # Let the caller keep Whisper times and report rms_failed on decode failure.
+    # Returning untouched cues here would incorrectly claim RMS was applied.
+    ff = ffmpeg_exe if (ffmpeg_exe and str(ffmpeg_exe).strip()) else _which_ffmpeg(None)
+    with closing(_decode_mono_f32_chunks(media_path, ff)) as chunks:
+        db_frames, hop_sec, sample_count = _rms_db_chunks(chunks)
 
-    try:
-        samples = _decode_mono_f32_16k(media_path, ff)
-    except (RuntimeError, OSError, subprocess.TimeoutExpired):
-        return cues
-
-    dur_audio = len(samples) / float(SR)
+    dur_audio = sample_count / float(SR)
     dur_max = float(total_duration) if total_duration and total_duration > 0 else dur_audio
     dur_max = min(dur_max, dur_audio + 0.5)
 
-    db_frames, hop_sec, _hop, _win = _rms_db_frames(samples)
     thresh = _dynamic_threshold_db(db_frames)
     mask = _binary_mask(db_frames, thresh)
     mask = _debounce_mask(mask, hop_sec)

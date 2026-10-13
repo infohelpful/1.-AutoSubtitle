@@ -7,9 +7,24 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import main
 from alignment_runner import AlignmentUnavailable
+import rms_vad_word_align
 
 
 class TranscribeFallbackTests(unittest.TestCase):
+    def test_rms_decode_failure_keeps_whisper_times_and_reports_actual_engine(self):
+        segment = SimpleNamespace(start=.5, end=1, text='말', words=[SimpleNamespace(start=.5, end=1, word='말')])
+        with patch.object(main, '_whisper_model', object()), \
+             patch.object(main, '_resolve_existing_file', return_value='test.mp4'), \
+             patch.object(main, '_collect_transcription', return_value=([segment], SimpleNamespace(duration=1), False)), \
+             patch.object(main, '_emit_transcribe_progress'), \
+             patch.object(rms_vad_word_align, '_which_ffmpeg', return_value='ffmpeg'), \
+             patch.object(rms_vad_word_align, '_decode_mono_f32_chunks', side_effect=RuntimeError('decoder unavailable')):
+            result = main.handle('transcribe', {'path': 'test.mp4', 'alignment_mode': 'fast'})
+        self.assertEqual(result['alignmentSummary']['appliedEngine'], 'whisper')
+        self.assertIn('rms_failed: decoder unavailable', result['alignmentSummary']['reviewReasons'])
+        word = next(w for c in result['subtitles'] for w in c['words'] if w['word'] == '말')
+        self.assertEqual((word['start'], word['end']), (.5, 1))
+
     def test_lazy_cuda_error_retries_whole_transcript_without_partial_duplicates(self):
         def broken():
             yield SimpleNamespace(end=1)

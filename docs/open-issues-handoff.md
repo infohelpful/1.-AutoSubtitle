@@ -1,5 +1,36 @@
 # AutoSubtitle 데스크톱 — 미해결 문제 인계서
 
+## 2026-10-13 오전 — 캐시 보관·RMS 메모리·사이드카 패키징 (최신)
+
+기준 HEAD `085b79f`. 이전 작업은 사용자 커밋에 포함되어 있고 아래 변경은 로컬 미커밋 상태다.
+
+### 완료·검증
+
+1. **시작 시 캐시 보관 정책**: renderer/미디어 작업을 시작하기 전에 정리를 완료한다. 준비 미디어 8GiB·파형 1GiB를 보관 목표로 오래된 항목부터 제거한다. WAV/미리보기 MP4는 같은 항목으로 취급하고 가장 최근 사용 시간을 적용한다. 30일 미사용 파일과 1일 이상 된 고유 파형 work/part 파일을 정리한다. 생성 규칙에 맞는 직접 자식 파일만 처리하고, 삭제 전 변경 여부를 재검사하며 링크/하위 디렉터리는 건드리지 않는다. 대기 중인 준비 키도 보호한다.
+2. **프로필 단일 실행**: 같은 userData 프로필의 두 번째 실행은 기존 창을 복원/표시한다. 기존 앱이 사용하는 캐시를 다른 인스턴스가 시작 시 삭제하지 않게 하기 위함이다. 실제 Electron에서 시작 정리·무관한 파일 보존·중복 앱 종료·활성 캐시 보존을 확인했다. 별도 userData의 테스트 앱은 독립 실행 가능하다.
+3. **RMS 빠른 보정 스트리밍**: 전체 float32 오디오/float64 누적 배열 대신 FFmpeg 64KiB 출력 블록과 100Hz 에너지 배열만 보관한다. 블록 사이 overlap을 유지해 전역 10ms frame grid를 보존한다. 타임아웃·조기 종료 시 FFmpeg를 종료/reap하고 stderr backpressure를 피한다. 30분 fixture 전체 분석에서 kernel 최대 16,608 samples, energy 배열 1,439,992 bytes, Python/NumPy 추적 피크 3,229,473 bytes, 약 2.1초였다. 이는 모델/FFmpeg 프로세스 메모리나 전체 앱 RSS 수치가 아니다.
+4. **RMS 회귀/진단**: 사용자 실제 64초 영상에서 기존 전체 오디오 방식과 음성/무음 mask 차이 0개, 최대 dB 차이 약 0.000085. 합성 단어 경계 출력 동일성도 검사했다. 디코드 실패를 조용히 반환해 `appliedEngine=rms`로 표시하던 오류를 수정했다. 실패 시 Whisper 시간을 보존하고 `rms_failed`를 보고한다. 실앱 8초 한국어 빠른/정밀 모드 추출 모두 통과.
+5. **패키징 오류**: stdin/stdout RPC인데 `console=False`였던 spec를 수정하고, 별도 인터프리터가 실행하는 정렬 worker 소스 5개를 data로 포함했다. ASR 번들에서 torch/WhisperX/transformers를 제외했다. 빌드는 고유 임시 경로를 쓰며 실패/산출물 누락/잘못된 RPC면 기존 실행 파일을 보존한다. `runtime_check`가 실제 WAV 디코드·VAD ONNX·worker 소스를 검증한 후에만 최종 파일을 교체한다.
+6. **추가 발견한 배포 의존성 오류**: frozen 전사에서 faster-whisper 1.2.1/PyAV 19의 `metadata_errors` 오류를 재현했다. PyAV 18.0.0과 faster-whisper 1.2.1을 고정하고 requirements/정렬 lock에 반영했다. 프로젝트 가상환경에 PyInstaller 6.22.3/hooks 2026.8을 설치하고 새 `resources/bin/main.exe`(152,075,076 bytes)를 생성했다. 이 바이너리는 기존부터 git 추적 대상이며 작업 트리에 수정으로 남아 있다.
+
+### 검증
+
+- **Vitest 52 files/336 tests**, **Python 40 tests**, web/node 타입 검사, production build, diff 및 `pip check` 통과. 실제 FFmpeg 검사 포함. 마지막 빌드 인터프리터 탐색 변경 후 bundler 9 tests도 재통과. 최종 앱 build 로그는 `cache-rms-build-final.log`다.
+- 실제 frozen 실행 파일: 오프라인 기존 모델 로드, 한국어 전사, 빠른 RMS, 파형 생성 통과. 외부 `.venv-alignment`를 지정한 정밀 정렬도 WhisperX CPU 19/20 aligned로 통과. 이 수치는 coverage이며 정확도가 아니다.
+- `tools/sync-validation-output`: `cache-rms-bundle-vitest-final.log`, `cache-rms-bundle-python-final.log`, `cache-build.log`, `cache-rms-bundle-2.log`, `rms-stream-30min.json`, `rms-stream-real-compare.json`, `cache-rms-fast-transcription.json`, `frozen-sidecar-smoke-2.json` 및 `.stderr.log`.
+- 재현법: `scripts/e2e-cdp/README.md`, `docs/sidecar-packaging.md`, `scripts/rms-stream-bench.py`. native 검증 앱 PID 24408과 시작 정리 테스트 앱은 정상 종료했고 standalone frozen helper도 완료 후 종료했다.
+
+### 아직 남은 범위
+
+1. **사람 기준 정확도**: `캡`/`둡` 미지원, 사람 경계 라벨/CER·WER/median·p95. 모델 coverage와 물리적 싱크 정확도는 구분한다.
+2. **장시간/용량**: 보관 목표는 앱 시작 때 적용하는 정책이다. 실행 중/단일 대형 작업의 하드 디스크 상한이나 free-space 사전 보장은 아니다. 최근 임시 파일·잠긴 파일은 목표를 초과해 남을 수 있고 로그에 overBudget을 표시한다. 전체 canonical PCM 디스크 생성 및 최초 ASR/정밀 정렬의 전체 오디오 메모리도 남아 있다. RMS만 개선했다.
+3. **설치본**: 정렬 Python/torch runtime 및 모델 배포, 새 PC/GPU/오프라인 첫 설치 검증. 이번에는 helper exe를 빌드/검증했고 전체 installer는 생성·배포하지 않았다. 정밀 모드는 외부 개발 venv를 명시한 검증이다.
+4. **편집/표시 회귀**: 실제 Windows IME, 여러 줄 선택, 긴 4K/VFR/실제 대형 RF64, remux 비호환 코덱, 임의각/반사 display matrix, 폰트/DPI 전환.
+
+전체 계획은 미완료다. 사용자 원본과 기존 pyc 변경을 보존했고 reset credit은 사용하지 않았다.
+
+---
+
 ## 2026-10-12 21시 — 구간 PCM 재생·추출/파형 취소 (최신)
 
 기준 HEAD `2be3a7b`. 이전 작업은 사용자 커밋에 포함되어 있고, 이번 변경은 로컬 미커밋 상태다. 아래 과거의 전체 WebAudio 디코딩·최초 추출/파형 취소 미완료 기록은 이 절로 갱신한다.

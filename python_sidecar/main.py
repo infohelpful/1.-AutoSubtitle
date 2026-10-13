@@ -685,6 +685,32 @@ def handle(method: str, params: dict[str, Any]) -> Any:
             "downloaded": downloaded,
             "load": load_info,
         }
+    if method == "runtime_check":
+        # No downloads/model load: exercise the decoder API and frozen assets.
+        import tempfile
+        import wave
+        from importlib.metadata import version
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.utils import get_assets_path
+        from alignment_runner import WORKER
+        with tempfile.TemporaryDirectory(prefix='autosubtitle-runtime-') as directory:
+            source = str(Path(directory) / 'probe.wav')
+            with wave.open(source, 'wb') as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(bytes(1600))
+            audio = decode_audio(source)
+            if len(audio) != 800:
+                raise RuntimeError('Runtime audio decode sample mismatch')
+        required = ('align_worker.py', 'forced_align.py', 'alignment_contract.py', 'alignment_text.py', 'alignment_windows.py')
+        missing = [name for name in required if not (WORKER.parent / name).is_file()]
+        if missing:
+            raise RuntimeError(f'Missing alignment worker sources: {missing}')
+        if not (Path(get_assets_path()) / 'silero_vad_v6.onnx').is_file():
+            raise RuntimeError('Missing bundled VAD model')
+        return {'audioDecode': True, 'alignmentSources': True, 'vadAsset': True,
+                'fasterWhisper': version('faster-whisper'), 'av': version('av')}
     if method == "get_model_status":
         return {
             "repo_id": HF_REPO_ID,

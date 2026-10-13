@@ -1,5 +1,21 @@
 # AutoSubtitle 싱크 개발 진행 기록
 
+## 2026-10-13 오전 — 캐시 보관·RMS 메모리·패키징 (최신)
+
+- 기준 HEAD `085b79f`. 이전 변경은 커밋에 포함되었고 이번 수정은 로컬 미커밋 상태다.
+- 시작 시 캐시 정리를 renderer/작업보다 먼저 완료한다. 준비 미디어 8GiB·파형 1GiB 보관 목표, WAV/MP4 쌍 LRU, 30일 미사용/1일 crash work 파일 정리, 링크/무관한 파일 제외·삭제 전 변경 재검사를 구현했다. 같은 프로필의 중복 실행은 기존 창을 표시한다. 실제 Electron의 정리·원본 보존·중복 실행·활성 캐시 보존 통과.
+- RMS: 전체 PCM/누적 배열을 64KiB 블록 처리로 바꿨다. overlap/전역 hop 유지, FFmpeg timeout·조기 종료·stderr 처리 포함. 30분 전체 분석에서 kernel 최대 16,608 samples, energy 배열 약 1.44MB, Python/NumPy 추적 피크 약 3.23MB. 실제 64초 음성에서 이전 방식과 mask 차이 0개. 모델·FFmpeg·앱 전체 메모리 측정은 아니다.
+- RMS 실패를 성공으로 표기하던 경로를 수정했다. 실패 시 원본 Whisper 시간/엔진과 `rms_failed` 원인을 남긴다. 실앱 빠른/정밀 한국어 추출 통과.
+- 패키징: 표준 입출력이 필요한 helper의 console 설정, 정렬 worker 소스 누락, 오래된 빌드 재사용 위험을 수정했다. 새 임시 build→기본 RPC→실제 WAV 디코드/VAD/worker 검증→staging rename 순서로 최종 파일을 교체한다.
+- 실제 frozen 전사로 발견한 faster-whisper 1.2.1/PyAV 19 호환성 오류를 PyAV 18.0.0 고정으로 수정했다. requirements/정렬 lock을 갱신했고 build requirements도 추가했다. PyInstaller 6.22.3/hooks 2026.8을 개발 venv에 설치했다.
+- 새 `resources/bin/main.exe`는 152,075,076 bytes이며 git 추적 중인 바이너리 변경으로 남는다. 오프라인 기존 모델/빠른 보정/파형, 외부 정렬 Python을 사용한 WhisperX 19/20 coverage까지 실제 실행 파일에서 확인했다. 설치본 runtime 자동 배포/새 PC 검증을 뜻하지 않는다.
+- 검증: **Vitest 52 files/336 tests**, **Python 40 tests**, node/web 타입·production build·diff·`pip check` 통과. 마지막 bundler 선택 경로 수정 후 9 tests 재검사. 최종 앱 build는 `cache-rms-build-final.log`. 실제 Electron/FFmpeg/frozen 실행 결과와 한계는 인계서 최신 절 및 `sidecar-packaging.md` 참조.
+- 남음: 사람 경계 정답·미지원 음절, 실행 중 디스크 hard cap/free-space 보장·전체 ASR/정밀 정렬 메모리, 정렬 runtime/model 설치본·GPU/오프라인 첫 설치, 실제 Windows IME·여러 줄 선택·긴 4K/VFR/RF64 등.
+
+테스트 앱/standalone helper는 정상 종료했다. 사용자 영상·기존 pyc 변경은 보존했고 reset credit·커밋·배포는 하지 않았다.
+
+---
+
 ## 2026-10-12 21시 — 구간 PCM 재생·추출/파형 취소 (최신)
 
 - 기준 HEAD `2be3a7b`, 이번 변경은 로컬 미커밋. 기존 개발 내용은 사용자 커밋에 포함되어 있다.

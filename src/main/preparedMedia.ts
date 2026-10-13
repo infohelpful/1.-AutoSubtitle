@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, stat, rename, unlink, readdir, utimes } from 'node:fs/promises'
+import { mkdir, stat, rename, unlink, utimes } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { probeMediaTimingAsync } from './mediaTiming'
 import type { PreparedMedia } from '../shared/preparedMedia'
+import { CACHE_MAX_AGE_MS, PREPARED_CACHE_BYTES, pruneMediaCache } from './mediaCacheRetention'
 
 // Bump when the common epoch, decode parameters, or preview container changes.
 export const PREPARED_MEDIA_VERSION = 'video-epoch-v1-48k-stereo'
@@ -39,18 +40,9 @@ function consume(job: PreparationJob, signal?: AbortSignal): Promise<PreparedMed
 }
 
 /** Delete only our named, unused cache files; unrelated files and source media are never touched. */
-export async function prunePreparedMediaCache(cacheDir: string, maxAgeMs = 30 * 24 * 60 * 60_000): Promise<void> {
-  const entries = await readdir(cacheDir, { withFileTypes: true }).catch(() => [])
-  const now = Date.now()
-  for (const entry of entries) {
-    const match = /^([a-f0-9]{64})(\.[a-f0-9-]{36})?\.(wav|mp4)$/.exec(entry.name)
-    if (!entry.isFile() || !match || pending.has(join(cacheDir, match[1]))) continue
-    const path = join(cacheDir, entry.name)
-    try {
-      const info = await stat(path)
-      if (now - info.atimeMs > (match[2] ? Math.min(maxAgeMs, 24 * 60 * 60_000) : maxAgeMs)) await unlink(path)
-    } catch { /* Another app instance may be using or updating this cache. */ }
-  }
+export async function prunePreparedMediaCache(cacheDir: string, maxAgeMs = CACHE_MAX_AGE_MS) {
+  return pruneMediaCache({ directory: cacheDir, kind: 'prepared', maxBytes: PREPARED_CACHE_BYTES,
+    maxAgeMs, isProtected: key => pending.has(join(cacheDir, key)) })
 }
 
 function run(ffmpeg: string, args: string[], signal: AbortSignal): Promise<void> {

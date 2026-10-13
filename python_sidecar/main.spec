@@ -4,8 +4,12 @@
 # datas 비우면 frozen exe에서 NO_SUCHFILE (main.log 의 ONNXRuntimeError).
 
 from PyInstaller.utils.hooks import collect_data_files
+from pathlib import Path
 
 datas = collect_data_files("faster_whisper")
+# Executed by the separate interpreter; these must be physical source files.
+for name in ("align_worker.py", "forced_align.py", "alignment_contract.py", "alignment_text.py", "alignment_windows.py"):
+    datas.append((str(Path(SPECPATH) / name), "."))
 
 a = Analysis(
     ["main.py"],
@@ -16,7 +20,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # CTranslate2 ASR and the external torch/WhisperX runtime stay isolated.
+    excludes=["torch", "whisperx", "transformers"],
     noarchive=False,
     optimize=0,
 )
@@ -35,7 +40,8 @@ exe = EXE(
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    # stdin/stdout are JSON-RPC pipes; Electron already uses windowsHide=True.
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

@@ -939,7 +939,17 @@ function hasNvidiaGpu(): boolean {
   }
 }
 
-app.whenReady().then(() => {
+// One process per userData profile owns its cache. A second launch focuses the
+// existing editor instead of pruning media that the first process is playing.
+const ownsProfile = app.requestSingleInstanceLock()
+if (!ownsProfile) app.quit()
+else app.on('second-instance', () => {
+  if (mainWindow?.isMinimized()) mainWindow.restore()
+  mainWindow?.show()
+  mainWindow?.focus()
+})
+
+if (ownsProfile) app.whenReady().then(async () => {
   /** 설치본은 cwd에 개발용 .env가 없음 → %AppData% 등 userData의 .env에서 GitHub PAT 등 로드 */
   mergeEnvFromFile(join(app.getPath('userData'), '.env'))
   logMain(
@@ -952,9 +962,15 @@ app.whenReady().then(() => {
     '세션 시작 — 단어별 파동 UI 사용 시 이 파일에 디버그가 append 됩니다',
     getWaveformLogFilePath()
   )
-  void pruneStaleWaveformCacheEntries().catch(() => {
-    /* 캐시 정리 실패는 앱 동작에 필수 아님 */
-  })
+  // Complete retention before creating a renderer or accepting media jobs.
+  const cacheResults = await Promise.allSettled([
+    pruneStaleWaveformCacheEntries(),
+    prunePreparedMediaCache(join(app.getPath('userData'), 'PreparedMedia'))
+  ])
+  for (const [index, result] of cacheResults.entries()) {
+    logMain('cache', index === 0 ? 'waveform' : 'prepared',
+      result.status === 'fulfilled' ? JSON.stringify(result.value) : String(result.reason))
+  }
 
   ipcMain.handle('waveform:getPeaksCachePath', async (_event, rawPath: unknown) => {
     if (typeof rawPath !== 'string' || !rawPath.trim()) {
@@ -1723,7 +1739,6 @@ app.whenReady().then(() => {
   })
 
   createWindow()
-  void prunePreparedMediaCache(join(app.getPath('userData'), 'PreparedMedia'))
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()

@@ -42,6 +42,39 @@ class AlignmentContractTests(unittest.TestCase):
         self.assertEqual(result[0]["end"], .5)
         self.assertEqual(result[0]["alignmentStatus"], "manual")
 
+    def test_end_stretched_across_a_pause_is_clamped_near_the_asr_end(self):
+        # 문장 끝 뒤 3초 침묵: 마지막 글자의 끝이 다음 단어 직전(4.0)까지 늘어난 경우
+        words = [{"word": "가나", "start": 0, "end": 1.0}]
+        chars = [{"char": "가", "start": .2, "end": .5, "score": .9},
+                 {"char": "나", "start": .5, "end": 4.0, "score": .9}]
+        result = self.apply(words, chars)[0]
+        self.assertEqual(result["alignmentStatus"], "aligned")
+        self.assertAlmostEqual(result["end"], 1.4)          # 원본 끝 1.0 + 0.4
+        self.assertEqual(result["sourceEnd"], 4.0)           # 엔진 추정치는 보존
+        self.assertEqual(result["rawEnd"], 1.0)
+        self.assertIn("end_clamped_to_asr", result["reviewReasons"])
+
+    def test_normal_and_slightly_late_ends_are_not_clamped(self):
+        words = [{"word": "가", "start": 0, "end": 1.0}, {"word": "나", "start": 1.0, "end": 1.4}]
+        chars = [{"char": "가", "start": .1, "end": 1.3, "score": .9},   # 원본 끝보다 0.3 늦음(허용)
+                 {"char": "나", "start": 1.5, "end": 2.3, "score": .9}]  # 길이 0.8 < 1.0
+        first, second = self.apply(words, chars)
+        self.assertEqual(first["end"], 1.3)
+        self.assertEqual(second["end"], 2.3)
+        self.assertNotIn("end_clamped_to_asr", first["reviewReasons"] + second["reviewReasons"])
+
+    def test_long_but_late_word_is_not_clamped_when_end_is_near_raw(self):
+        # 정말 길게 발음한 단어(1.5초)가 원본 끝과 0.4초 이내면 그대로 둔다.
+        words = [{"word": "가", "start": 0, "end": 1.6}]
+        result = self.apply(words, [{"char": "가", "start": .1, "end": 1.9, "score": .9}])[0]
+        self.assertEqual(result["end"], 1.9)
+
+    def test_manual_end_lock_prevents_clamping(self):
+        words = [{"word": "가", "start": 0, "end": 3.9, "manualEndLocked": True, "rawEnd": 1.0}]
+        result = self.apply(words, [{"char": "가", "start": .1, "end": 4.0, "score": .9}])[0]
+        self.assertEqual(result["end"], 3.9)
+        self.assertEqual(result["alignmentStatus"], "manual")
+
     def test_missing_boundaries_remain_in_evaluation_denominator(self):
         labels = [{"id": "a", "start": 0, "end": 1}, {"id": "b", "start": 1, "end": 2}]
         result = evaluate_boundaries(labels, [{"id": "a", "sourceStart": .05, "sourceEnd": 1.1, "alignmentStatus": "aligned"}])

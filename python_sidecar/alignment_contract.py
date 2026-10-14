@@ -11,8 +11,30 @@ import unicodedata
 from typing import Any
 
 
+#: 정렬된 끝이 ASR 원본 끝보다 이만큼(초) 넘게 뒤로 가면 늘어난 단어로 본다.
+END_OVERHANG_SEC = 0.4
+#: 늘어난 단어로 판정하려면 정렬된 길이가 이보다 길어야 한다(정상적인 긴 발음을 자르지 않기 위해).
+STRETCHED_MIN_SEC = 1.0
+#: 자른 뒤에도 단어에 남겨 두는 최소 길이.
+STRETCHED_KEEP_MIN_SEC = 0.3
+
+
 def finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def clamp_stretched_end(start: float, end: float, raw_end: Any) -> float | None:
+    """다음 발화까지 끝이 늘어난 단어를 ASR 원본 끝 근처로 자른다. 자를 필요가 없으면 None.
+
+    문장 끝 뒤의 긴 침묵에서 CTC 정렬이 마지막 글자의 끝을 다음 단어 직전까지 늘리는 경우가 있다.
+    그러면 하이라이트가 침묵 동안 한 단어에 몇 초씩 머문다. 엔진이 낸 `sourceEnd` 는 건드리지 않고
+    화면·재생이 쓰는 `end` 만 줄인다.
+    """
+    if not finite(raw_end) or not finite(start) or not finite(end):
+        return None
+    if end - start <= STRETCHED_MIN_SEC or end <= raw_end + END_OVERHANG_SEC:
+        return None
+    return max(raw_end + END_OVERHANG_SEC, start + STRETCHED_KEEP_MIN_SEC)
 
 
 def normalized_letters(text: str) -> str:
@@ -67,6 +89,11 @@ def apply_character_alignment(words: list[dict], chars: list[dict], dictionary: 
                 start = original.get("start")
             if word.get("manualEndLocked"):
                 end = original.get("end")
+            else:
+                clamped = clamp_stretched_end(start, end, word.get("rawEnd"))
+                if clamped is not None:
+                    end = clamped
+                    word["reviewReasons"].append("end_clamped_to_asr")
             if finite(start) and finite(end) and 0 <= start < end <= duration:
                 word.update(start=start, end=end, sourceStart=speech_chars[0]['start'], sourceEnd=speech_chars[-1]['end'],
                             alignmentScore=sum(c["score"] for c in speech_chars) / len(speech_chars),

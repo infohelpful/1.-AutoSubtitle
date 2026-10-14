@@ -134,6 +134,10 @@ class AlignmentAudioTests(unittest.TestCase):
                 pass
         self.assertEqual(len(children), 1)
         self.assertIsNotNone(children[0].poll())
+        # Windows 는 강제 종료된 자식의 핸들을 비동기로 닫는다. delete-on-close 파일이 사라질 때까지 잠시 기다린다.
+        deadline = time.monotonic() + 5
+        while list(Path(self.directory.name).iterdir()) and time.monotonic() < deadline:
+            time.sleep(0.02)
         self.assertEqual(list(Path(self.directory.name).iterdir()), [])
 
     def test_os_cleans_mapping_after_worker_is_force_killed(self):

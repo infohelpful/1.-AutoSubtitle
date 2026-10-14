@@ -525,28 +525,9 @@ def _rpc_write(obj: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
-# 무음 삽입 vs 미세 간격(stitch): 이 임계값 이상이면 "-- " 블록 삽입, 미만이면 이전 cue의 end를 다음 start에 맞춤
+# 미세 간격의 화면 표시만 이어 준다. 시간 간격만으로 무음을 생성하지 않는다.
 _GAP_THRESHOLD_SEC = 0.1
-# STT 직후 무음 구간 자동 삽입 시 단일 플레이스홀더 — 렌더러 `SILENCE_PLACEHOLDER_TEXT` 와 동일
-_SILENCE_GAP_TEXT = "-- "
 _UNKNOWN_WORD_LABEL = "???"
-
-
-def _silence_gap_cue(start: float, end: float) -> dict[str, Any]:
-    """이전 세그먼트 end ~ 현재 세그먼트 start 사이 무음(편집용 플레이스홀더)."""
-    s = float(start)
-    e = float(end)
-    if not (e > s):
-        s, e = min(s, e), max(s, e)
-        if not (e > s):
-            s, e = 0.0, max(0.01, e)
-    token = _SILENCE_GAP_TEXT.strip() or "--"
-    return {
-        "start": s,
-        "end": e,
-        "text": _SILENCE_GAP_TEXT,
-        "words": [{"start": s, "end": e, "word": token}],
-    }
 
 
 def _extend_last_cue_end(out: list[dict[str, Any]], new_end: float) -> None:
@@ -593,10 +574,9 @@ def _normalize_cue_words_and_empty_text(c: dict[str, Any]) -> dict[str, Any] | N
 
 def _fill_unvoiced_gaps(raw_cues: list[dict[str, Any]], total_dur: float) -> list[dict[str, Any]]:
     """
-    STT 직후: prev_end(초기 0) ~ 각 세그먼트 start 사이를 점검.
-    - 간격 >= 0.1s → `--` 무음 블록 1행 삽입
-    - 간격 0.1s 미만 → 무음 대신 *이전* cue의 end를 현재 start에 맞춤(끊김 제거)
-    - total_dur > 0이면 마지막 세그먼트 end ~ 영상 끝도 동일 규칙으로 맞춤(빈틈 없이)
+    Normalize cues and bridge short display gaps without changing speech times.
+    A timestamp gap is NOT proof of silence. The renderer may mark sustained
+    quiet spans using canonical audio peaks; this function never invents `--`.
     """
     td = max(0.0, float(total_dur or 0))
     normalized: list[dict[str, Any]] = []
@@ -607,8 +587,6 @@ def _fill_unvoiced_gaps(raw_cues: list[dict[str, Any]], total_dur: float) -> lis
     normalized.sort(key=lambda x: float(x["start"]))
 
     if not normalized:
-        if td > 0:
-            return [_silence_gap_cue(0.0, td)]
         return []
 
     out: list[dict[str, Any]] = []
@@ -626,11 +604,8 @@ def _fill_unvoiced_gaps(raw_cues: list[dict[str, Any]], total_dur: float) -> lis
         s = max(0.0, s)
 
         gap = s - prev_end
-        if gap > 1e-9:
-            if gap >= _GAP_THRESHOLD_SEC:
-                out.append(_silence_gap_cue(prev_end, s))
-            elif out:
-                _extend_last_cue_end(out, s)
+        if 1e-9 < gap < _GAP_THRESHOLD_SEC and out:
+            _extend_last_cue_end(out, s)
 
         out.append(
             {
@@ -645,9 +620,7 @@ def _fill_unvoiced_gaps(raw_cues: list[dict[str, Any]], total_dur: float) -> lis
 
     if td > 0:
         gap_tail = td - prev_end
-        if gap_tail >= _GAP_THRESHOLD_SEC:
-            out.append(_silence_gap_cue(prev_end, td))
-        elif gap_tail > 1e-9 and out:
+        if 1e-9 < gap_tail < _GAP_THRESHOLD_SEC and out:
             _extend_last_cue_end(out, td)
 
     return out
@@ -703,7 +676,7 @@ def handle(method: str, params: dict[str, Any]) -> Any:
             audio = decode_audio(source)
             if len(audio) != 800:
                 raise RuntimeError('Runtime audio decode sample mismatch')
-        required = ('align_worker.py', 'forced_align.py', 'alignment_contract.py', 'alignment_text.py', 'alignment_windows.py')
+        required = ('align_worker.py', 'forced_align.py', 'alignment_audio.py', 'alignment_contract.py', 'alignment_text.py', 'alignment_windows.py')
         missing = [name for name in required if not (WORKER.parent / name).is_file()]
         if missing:
             raise RuntimeError(f'Missing alignment worker sources: {missing}')

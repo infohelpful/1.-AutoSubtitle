@@ -59,6 +59,24 @@ describe('subtitleLineEditDisplayText', () => {
 })
 
 describe('mergeConsecutiveSilenceWords', () => {
+  it('does not bridge unclassified audio between separate quiet intervals', () => {
+    const words = [
+      { start: 0, end: .5, word: '--', isSilence: true },
+      { start: .8, end: 1.5, word: '--', isSilence: true }
+    ]
+    expect(mergeConsecutiveSilenceWords(words)).toEqual(words)
+    expect(normalizeSilenceWordsForLineWords(words)).toEqual(words)
+  })
+
+  it('keeps manually trimmed silence boundaries separate from adjoining automatic silence', () => {
+    const words = [
+      { start: 0, end: .5, word: '--', isSilence: true },
+      { start: .5, end: 1.5, word: '--', isSilence: true, manualStartLocked: true, manualEndLocked: true }
+    ]
+    expect(mergeConsecutiveSilenceWords(words)).toEqual(words)
+    expect(parseSubtitleLines([{ start: 0, end: 1.5, text: '', words }])[0].words).toEqual(words)
+  })
+
   it('merges adjacent silence blocks into one interval', () => {
     const merged = mergeConsecutiveSilenceWords([
       { start: 0, end: 1, word: '--', isSilence: true },
@@ -97,7 +115,7 @@ describe('mergeConsecutiveSilenceWords', () => {
 })
 
 describe('normalizeSilenceWordsForLineWords', () => {
-  it('collapses … / -- alternation between speech into one --', () => {
+  it('preserves continuation tokens between quiet spans instead of labeling unverified audio as silence', () => {
     const ell = '\u2026'
     const out = normalizeSilenceWordsForLineWords([
       { start: 0, end: 1, word: 'A' },
@@ -107,13 +125,13 @@ describe('normalizeSilenceWordsForLineWords', () => {
       { start: 1.4, end: 1.6, word: '--', isSilence: true },
       { start: 1.6, end: 3, word: 'B' }
     ])
-    expect(out).toHaveLength(3)
+    expect(out).toHaveLength(6)
     expect(out[0]!.word).toBe('A')
-    expect(out[1]!.isSilence).toBe(true)
-    expect(out[1]!.word).toBe('--')
-    expect(out[1]!.start).toBeCloseTo(1, 4)
-    expect(out[1]!.end).toBeCloseTo(1.6, 4)
-    expect(out[2]!.word).toBe('B')
+    expect(out[1]!.isSilence).toBeUndefined()
+    expect(out[1]!.word).toBe(ell)
+    expect(out[3]!.isSilence).toBeUndefined()
+    expect(out[3]!.word).toBe(ell)
+    expect(out[5]!.word).toBe('B')
   })
 
   it('does not merge a single -- plus trailing continuation (same-word split tail)', () => {

@@ -1,5 +1,42 @@
 # AutoSubtitle 데스크톱 — 미해결 문제 인계서
 
+## 2026-10-13 22:10 — 탐색기 파일 드롭 금지 표시
+
+- 사용자 증상: 파일을 앱에 끌어오면 금지 표시가 뜸. 탐색기 PID 12972는 Medium(8192), 당시 앱을 실행한 Node PID 31392는 High(12288)로 확인했다. 앱 PID 23184의 token 조회는 접근 거부였으며, 관리자 실행에서 상속된 권한 차이가 원인으로 판단된다. Windows UIPI는 낮은 권한 프로세스에서 높은 권한 창으로의 상호작용을 제한한다. [Microsoft 설명](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/user-account-control-only-elevate-uiaccess-applications-that-are-installed-in-secure-locations)
+- 사용자가 기존 창을 닫은 뒤 일반 권한으로 재실행했다. 새 앱 PID 33416과 탐색기가 모두 Medium(8192)이고 앱 시작 로그도 정상인 것을 확인했다. OS에서 실제 마우스로 다시 드롭하는 최종 확인은 사용자에게 요청한다.
+- `start-autosubtitle.cmd` / `scripts/start-desktop.cjs` 추가: 기존 빌드를 일반 권한으로 실행한다. 관리자/System 권한이거나 권한 확인에 실패하면 실행하지 않고 일반 실행을 안내한다. 정상/관리자/조회 불가 세 분기와 JS 문법 검증을 통과했다. 관리자 실행 중인 기존 앱은 먼저 저장 후 닫아야 한다. 시스템 보안 설정이나 React 드롭 로직은 변경하지 않았다.
+
+## 2026-10-13 22시 — 정밀 정렬 메모리·디스크 사전 검사 (최신)
+
+기준 HEAD `0624c26`: 오전까지의 소스는 GitHub push 완료. 이 절의 후속 변경은 로컬 미커밋이다. 기존 pyc 및 추적 중인 실행 파일 변경은 보존했다.
+
+### 완료·검증
+
+1. `alignment_audio.py`에서 FFmpeg 출력을 `TemporaryFile`에 직접 기록하고 copy-on-write NumPy memmap으로 정렬 모델에 전달한다. 기존 전체 stdout/ndarray heap 복사를 제거했다. 기존 절대 시각과 정렬 window/문자 매핑을 유지한다. context 종료 때 mmap을 먼저 닫고 임시 파일을 닫는다. 호출자는 context 밖에서 audio를 사용하면 안 된다.
+2. 실제 FFmpeg의 trim/padding 3가지와 기존 decoder의 모든 sample 동일성, 빈/잘린 오디오·decode 실패·모델 예외·실제 timeout·worker 강제 종료 시 임시 파일 정리를 검사했다. Windows delete-on-close를 실제 프로세스 종료로 확인했다.
+3. 사용자 실영상 64.256초, 기존 raw 128단어를 두 개의 독립 CPU worker에서 기존/새 decoder로 정렬했다. **전체 JSON 동일**, 122 aligned/6 unaligned/8 reviewWords. 모델 coverage이며 사람 기준 정확도가 아니다.
+4. 실제 30분 decode/mapping: 115,200,000 bytes 디스크, Python/NumPy 추적 peak 33,567 bytes, 약 2.02초, 종료 후 파일 0개. 3시간 691,200,000 bytes 가상 길이 map의 heap peak <1MiB 단위 검사도 통과했다. OS 페이지 캐시/RSS·FFmpeg·모델 메모리는 이 측정에서 제외되며, 30분 전체 모델 추론을 돌린 것은 아니다.
+5. `mediaDiskSpace.ts`: 미디어 준비 전에 생성할 PCM(48kHz/stereo/s16)/필요한 미리보기의 예상 bytes와 256MiB 여유분을 `statfs`의 사용 가능 bytes와 비교한다. 기존 캐시는 새 공간 검사를 생략한다. 미리보기 전에 다시 조회하며 부족/조회 실패를 오류로 알린다. FFmpeg 미실행·원본 보존·공간 확보 후 재시도·작업 사이 용량 감소를 검증했다.
+6. worker data/runtime 확인 목록에 새 모듈을 추가해 helper를 재빌드했다. frozen helper에서 기존 모델 오프라인 로드·전사·RMS·파형·외부 개발 정렬 Python을 통한 WhisperX 19/20 coverage까지 통과했다. 새 exe 크기 152,076,482 bytes. 설치본 runtime 배포/새 PC 검증은 아니다.
+
+### 재현·결과
+
+- **Vitest 54 files/343 tests**, **Python 46 tests**, 실제 FFmpeg 통합 검사, node/web 타입 검사, production build, diff 검사 통과.
+- `scripts/alignment-audio-bench.py --media <영상> --ffmpeg <ffmpeg> --output <새 JSON>`: 모델 없이 전체 decode/mapping과 heap 추적. `--cues <raw_subtitles가 있는 JSON> --cache-dir <기존 hf-align-cache>`를 추가하면 기존/새 decoder의 실제 모델 결과를 오프라인 비교한다. 모델 비교는 짧은 실영상으로 수행한다.
+- `tools/sync-validation-output/alignment-mapped-real-compare-2.json` 및 legacy/mapped 로그, `alignment-mapped-30min.json`, `alignment-mapped-python.log`, `alignment-mapped-bundle.log`, `frozen-sidecar-mapped-smoke.json` 및 stderr 로그, `alignment-disk-vitest.log`, `alignment-disk-build.log`.
+- 첫 비교는 sandbox가 AppData 모델 캐시 접근을 차단해 실패했다. 로컬 캐시 읽기 권한으로 재실행한 `-2` 결과가 최종 검증이다. 모델을 새로 다운로드한 것이 아니다.
+
+### 아직 남은 범위
+
+1. 사람 경계 라벨/CER·WER/median·p95, `캡`/`둡` 미지원. 122/128은 경계 정확도가 아니다.
+2. 전체 ASR 오디오/feature 메모리, 전체 canonical PCM 디스크 생성. 새 정렬 memmap은 추가로 약 64kB/초의 임시 디스크를 쓴다. TEMP 드라이브의 별도 사전 검사·동시 작업 예약·작업 중 지속 감시/하드 상한은 아직 없다. 준비 미디어의 사전 검사는 이후 다른 프로세스의 디스크 소비까지 보장하지 않는다.
+3. 설치본 정렬 Python/torch/model 배포 및 새 PC/GPU/오프라인 첫 설치. 현재 정밀 smoke는 개발 venv를 명시했다.
+4. 실제 Windows IME, 여러 줄 선택, 장시간 4K/VFR/실제 대형 RF64, remux 비호환 코덱, 임의각/반사 display matrix, 폰트/DPI 전환.
+
+전체 계획은 미완료다. 이번 helper 검증 프로세스는 종료했고 원본 영상·reset credit은 변경하지 않았다.
+
+---
+
 ## 2026-10-13 오전 — 캐시 보관·RMS 메모리·사이드카 패키징 (최신)
 
 기준 HEAD `085b79f`. 이전 작업은 사용자 커밋에 포함되어 있고 아래 변경은 로컬 미커밋 상태다.

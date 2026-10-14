@@ -103,6 +103,7 @@ function rebuildLineMetaAfterWordsChange(line: SubtitleLine, newWords: SubtitleW
     return {
       ...line,
       words: newWords,
+      isDeleted: true,
       text: displayTextFromSubtitleWords(newWords)
     }
   }
@@ -143,7 +144,9 @@ export function subtitleLinesAfterSoftDeleteWordRange(
   }
 
   const deletedIndices: number[] = []
-  for (let i = fromWordIndex; i < toWordIndexExclusive; i += 1) deletedIndices.push(i)
+  for (let i = fromWordIndex; i < toWordIndexExclusive; i += 1) {
+    if (!words[i].isDeleted) deletedIndices.push(i)
+  }
 
   let totalDur = 0
   for (const i of deletedIndices) {

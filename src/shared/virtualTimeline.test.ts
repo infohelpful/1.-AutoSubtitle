@@ -16,6 +16,29 @@ import {
 } from './virtualTimeline'
 
   describe('virtualTimeline', () => {
+  it('retains the last deleted chip as an undoable audio cut and shortens playback', () => {
+    const lines = [{ start: 24.264, end: 24.6, text: '빨간', words: [{ start: 24.264, end: 24.6, word: '빨간' }] }]
+    const result = subtitleLinesAfterSoftDeleteWordRange(lines, 0, 0, 1, [])!
+    expect(result.lines[0].isDeleted).toBe(true)
+    expect(result.lines[0].words![0].isDeleted).toBe(true)
+    const cuts = mergeWaveformPeaksStitchCutRanges([], result.lines, [])
+    expect(cuts).toHaveLength(1)
+    expect(cuts[0].start).toBeCloseTo(24.264, 8)
+    expect(cuts[0].end).toBeCloseTo(24.6, 8)
+    expect(lines[0].text).toBe('빨간')
+    expect(mergeWaveformPeaksStitchCutRanges([], lines, [])).toEqual([])
+  })
+
+  it('deletes a visual selection spanning an already hidden chip', () => {
+    const lines = [{ start: 1, end: 4, text: '하나 셋', words: [
+      { start: 1, end: 2, word: '하나' },
+      { start: 2, end: 3, word: '둘', isDeleted: true },
+      { start: 3, end: 4, word: '셋' }
+    ] }]
+    const result = subtitleLinesAfterSoftDeleteWordRange(lines, 0, 0, 3, [])!
+    expect(result.lines[0].isDeleted).toBe(true)
+    expect(mergeWaveformPeaksStitchCutRanges([], result.lines, [])).toEqual([{ start: 1, end: 4 }])
+  })
   it('soft-delete cut clamps to alive neighbors when silence span overlaps next speech (merged timestamps)', () => {
     /** 무음 블록이 실제로는 12에서 끝나야 하는데 구 타임스탬프가 다음 단어와 겹침 */
     const lines = [

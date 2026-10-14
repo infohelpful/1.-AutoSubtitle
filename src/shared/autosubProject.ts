@@ -1,6 +1,6 @@
 import type { CutRange } from './ipc'
 import type { SubtitleLine, SubtitleWord } from './subtitles'
-import { parseWordAlignmentMeta } from './wordAlignmentMeta'
+import { parseManualBoundaryLocks, parseWordAlignmentMeta } from './wordAlignmentMeta'
 import { ensureWordIdentities } from './wordIdentity'
 import { parseMediaFingerprint, type MediaFingerprint } from './projectMedia'
 import { parseVirtualTimeline, type VirtualTimelineBlock } from './virtualTimeline'
@@ -114,6 +114,7 @@ function parseProjectSubtitles(raw: unknown, legacy: boolean): SubtitleLine[] | 
           if (rawWord[key] === true) word[key] = true
         }
         if (typeof rawWord.splitChain === 'string' && /^[12]+$/.test(rawWord.splitChain)) word.splitChain = rawWord.splitChain
+        if (word.isSilence) Object.assign(word, parseManualBoundaryLocks(rawWord))
         if (!word.isSilence) {
           Object.assign(word, parseWordAlignmentMeta(rawWord))
           if (legacy && !word.alignmentStatus) {

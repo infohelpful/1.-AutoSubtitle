@@ -22,6 +22,7 @@
  * 모든 함수는 **불변(pure)** — 입력을 변형하지 않고 새 배열/객체를 반환한다. 시간 단위는 *초*.
  */
 import type { SubtitleLine, SubtitleWord } from './subtitles'
+import { markWordEdited } from './wordAlignmentMeta'
 
 /** 단어 한 칸이 가질 수 있는 최소 폭. 0 이하 / NaN 으로 무너지지 않도록 항상 양수. */
 export const MIN_WORD_DURATION_SEC = 0.01
@@ -116,6 +117,13 @@ function joinWords(words: readonly string[]): string {
   return words.map((w) => String(w ?? '').trim()).filter((w) => w.length > 0).join(' ')
 }
 
+function mergeWordLabels(left: FlatWord, right: FlatWord): { word: string; isSilence: boolean } {
+  const isSilence = left.isSilence && right.isSilence
+  return { isSilence, word: isSilence ? '--' : joinWords([
+    left.isSilence ? '' : left.word, right.isSilence ? '' : right.word
+  ]) }
+}
+
 /** flat 배열에서 (li, wi) 위치를 직접 찾는다. (`findFlat` 과 동일 의도, 내부 헬퍼) */
 function flatAt(flat: FlatWord[], li: number, wi: number): FlatWord | null {
   for (const fw of flat) {
@@ -201,7 +209,7 @@ function applyEdgeChangeInPlace(
         }
 
         /** commit + 끝점 도달 → 통째 흡수. */
-        target.word = joinWords([prev.word, target.word])
+        Object.assign(target, mergeWordLabels(prev, target))
         prev.isDeleted = true
         prev.mergedByEdgeTrim = true
         onTombstone(prev)
@@ -258,7 +266,7 @@ function applyEdgeChangeInPlace(
         break
       }
 
-      target.word = joinWords([target.word, next.word])
+      Object.assign(target, mergeWordLabels(target, next))
       next.isDeleted = true
       next.mergedByEdgeTrim = true
       onTombstone(next)
@@ -309,7 +317,7 @@ function reviveTombstonedPrevs(
     const fw = flat[i]!
     /** same-card only — 다른 카드 단어 까지 부활하면 cross-line 변형이 일어난다. */
     if (fw.lineIndex !== target.lineIndex) break
-    if (!fw.isDeleted) break
+    if (!fw.isDeleted || !fw.mergedByEdgeTrim) break
     const origStart = fw.start
     const origEnd = fw.end
     if (origStart >= newStart - 1e-9) break
@@ -351,7 +359,7 @@ function reviveTombstonedNexts(
     const fw = flat[i]!
     /** same-card only — 다른 카드로 건너가면 cross-line 변형이 일어난다. */
     if (fw.lineIndex !== target.lineIndex) break
-    if (!fw.isDeleted) break
+    if (!fw.isDeleted || !fw.mergedByEdgeTrim) break
     const origStart = fw.start
     const origEnd = fw.end
     if (origEnd <= newEnd + 1e-9) continue
@@ -406,7 +414,8 @@ function removeActive(active: ActiveLinkedWord[], target: ActiveLinkedWord): voi
 /** flat 배열의 최신 값으로 원본 `subtitles` 를 새 객체로 재구성 + SubtitleLine 메타 동기화. */
 export function unflattenAndSync(
   original: readonly SubtitleLine[],
-  flat: readonly FlatWord[]
+  flat: readonly FlatWord[],
+  markManualEdits = false
 ): SubtitleLine[] {
   /** lineIndex → wordIndex → 최신 FlatWord */
   const byLine: FlatWord[][] = original.map(() => [])
@@ -420,8 +429,11 @@ export function unflattenAndSync(
     const newWords: SubtitleWord[] = (line.words ?? []).map((w, wi) => {
       const fw = flatRow[wi]
       if (!fw) return w
+      const base = { ...w }
+      if (fw.isSilence) base.isSilence = true
+      else delete base.isSilence
       const next: SubtitleWord = {
-        ...w,
+        ...(markManualEdits ? markWordEdited(base, fw) : base),
         start: fw.start,
         end: fw.end,
         word: fw.word,
@@ -555,6 +567,7 @@ export function applyWordEdgeDrag(input: ApplyWordEdgeDragInput): EdgeDragResult
     fw.start = a.start
     fw.end = a.end
     fw.word = a.word
+    fw.isSilence = a.isSilence
     fw.isDeleted = false
     fw.mergedByEdgeTrim = false
   }
@@ -570,7 +583,7 @@ export function applyWordEdgeDrag(input: ApplyWordEdgeDragInput): EdgeDragResult
     }
   }
 
-  const nextSubtitles = unflattenAndSync(subtitles, flat)
+  const nextSubtitles = unflattenAndSync(subtitles, flat, commitMode)
 
   const mutated: WordRef[] = [{ lineIndex: target.lineIndex, wordIndex: target.wordIndex }]
   for (const r of revivedRefs) mutated.push(r)

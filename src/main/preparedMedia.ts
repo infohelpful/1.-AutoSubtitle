@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process'
 import { probeMediaTimingAsync } from './mediaTiming'
 import type { PreparedMedia } from '../shared/preparedMedia'
 import { CACHE_MAX_AGE_MS, PREPARED_CACHE_BYTES, pruneMediaCache } from './mediaCacheRetention'
+import { estimatePreparedBytes, requireMediaDiskReserve, requireMediaDiskSpace } from './mediaDiskSpace'
 
 // Bump when the common epoch, decode parameters, or preview container changes.
 export const PREPARED_MEDIA_VERSION = 'video-epoch-v1-48k-stereo'
@@ -45,23 +46,39 @@ export async function prunePreparedMediaCache(cacheDir: string, maxAgeMs = CACHE
     maxAgeMs, isProtected: key => pending.has(join(cacheDir, key)) })
 }
 
-function run(ffmpeg: string, args: string[], signal: AbortSignal): Promise<void> {
+function run(ffmpeg: string, args: string[], signal: AbortSignal, cacheDir: string): Promise<void> {
   if (signal.aborted) return Promise.reject(new Error('미디어 준비가 취소됐습니다.'))
   return new Promise((resolveJob, reject) => {
     const child = spawn(ffmpeg, ['-nostdin', '-v', 'error', '-y', ...args], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
-    let error: Error | undefined, stderr = ''
-    const stop = (message: string) => { error = new Error(message); child.kill('SIGKILL') }
+    let error: Error | undefined, stderr = '', closed = false
+    let diskTimer: ReturnType<typeof setTimeout> | undefined
+    const stop = (message: string) => {
+      if (closed || error) return
+      error = new Error(message)
+      child.kill('SIGKILL')
+    }
+    const checkDisk = async (): Promise<void> => {
+      try { await requireMediaDiskReserve(cacheDir) }
+      catch (e) { stop(e instanceof Error ? e.message : '미디어 임시 저장 공간을 확인하지 못했습니다.') }
+      if (!closed && !error) diskTimer = setTimeout(() => void checkDisk(), 250)
+    }
+    diskTimer = setTimeout(() => void checkDisk(), 250)
     const abort = () => stop('미디어 준비가 취소됐습니다.')
     const timer = setTimeout(() => stop('미디어 준비 시간이 초과됐습니다.'), 30 * 60_000)
     signal.addEventListener('abort', abort, { once: true })
     child.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4000) })
     child.on('error', e => { error = e })
-    child.on('close', code => {
+    child.on('close', async code => {
+      closed = true
       clearTimeout(timer)
+      clearTimeout(diskTimer)
       signal.removeEventListener('abort', abort)
       if (error) reject(error)
       else if (code !== 0) reject(new Error(`미디어 시간축 준비 실패: ${stderr}`))
-      else resolveJob()
+      else {
+        try { await requireMediaDiskReserve(cacheDir); resolveJob() }
+        catch (e) { reject(e) }
+      }
     })
     if (signal.aborted) abort()
   })
@@ -98,23 +115,30 @@ export async function prepareSourceMedia(options: { input: string; ffmpeg: strin
     checkCancelled(controller.signal)
     const tempPaths: string[] = []
     try {
-      if (!await exists(audioPath)) {
+      const needsAudio = !await exists(audioPath)
+      const needsPreviewFile = needsPreview && !await exists(previewPath)
+      await requireMediaDiskSpace(options.cacheDir, estimatePreparedBytes(timing.duration, before.size, needsAudio, needsPreviewFile))
+      checkCancelled(controller.signal)
+      if (needsAudio) {
         const temp = key + `.${randomUUID()}.wav`
         tempPaths.push(temp)
         const filter = `asetpts=PTS-(${timing.sourceOriginSec})/TB,aresample=48000:async=1:first_pts=0,apad,atrim=duration=${timing.duration}`
         await run(options.ffmpeg, timing.hasAudio
           ? ['-copyts', '-i', input, '-map', '0:a:0', '-vn', '-af', filter, '-ac', '2', '-ar', '48000', '-c:a', 'pcm_s16le', '-rf64', 'auto', temp]
-          : ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', String(timing.duration), '-c:a', 'pcm_s16le', '-rf64', 'auto', temp], controller.signal)
+          : ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', String(timing.duration), '-c:a', 'pcm_s16le', '-rf64', 'auto', temp], controller.signal, options.cacheDir)
         checkCancelled(controller.signal)
         await rename(temp, audioPath)
       }
-      if (needsPreview && !await exists(previewPath)) {
+      if (needsPreviewFile) {
+        // Audio may have taken minutes to prepare; refresh the remaining-space check.
+        await requireMediaDiskSpace(options.cacheDir, estimatePreparedBytes(timing.duration, before.size, false, true))
+        checkCancelled(controller.signal)
         const temp = key + `.${randomUUID()}.mp4`
         tempPaths.push(temp)
         // Stream-copy the video only: Chromium otherwise exposes nonzero container
         // timestamps as currentTime/duration. Audio always comes from the common WAV.
         await run(options.ffmpeg, ['-copyts', '-itsoffset', String(-timing.sourceOriginSec), '-i', input,
-          '-map', '0:v:0', '-an', '-c:v', 'copy', '-avoid_negative_ts', 'disabled', '-movflags', '+faststart', temp], controller.signal)
+          '-map', '0:v:0', '-an', '-c:v', 'copy', '-avoid_negative_ts', 'disabled', '-movflags', '+faststart', temp], controller.signal, options.cacheDir)
         checkCancelled(controller.signal)
         const prepared = await probeMediaTimingAsync(options.ffprobe, temp, controller.signal)
         if (Math.abs(prepared.sourceOriginSec) > .001 || Math.abs(prepared.duration - timing.duration) > .1) {

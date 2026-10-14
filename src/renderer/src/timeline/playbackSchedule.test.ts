@@ -1,5 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import { buildScheduledMediaSegmentsFromSubtitleWords } from './playbackSchedule'
+import { buildScheduledMediaSegments, buildScheduledMediaSegmentsFromSubtitleWords } from './playbackSchedule'
+import { buildTimelineClips, createTimelineMapping, programDurationSec } from './mapping'
+
+describe('continuous source playback', () => {
+  it('keeps the speech tail and row gaps, ending at the media end rather than the last aligned word', () => {
+    const clips = buildTimelineClips([], 150)
+    expect(buildScheduledMediaSegments(clips, 128.682, null)).toEqual([
+      { clipId: 1, startMediaSec: 128.682, endMediaSec: 150 }
+    ])
+  })
+
+  it('skips only the explicitly deleted word and maps the shorter display clock both ways', () => {
+    const map = createTimelineMapping([{ start: 24.264, end: 24.6 }], 150, { masterMode: 'passthrough' })
+    expect(buildScheduledMediaSegments(map.clips, 24, null)).toEqual([
+      { clipId: 1, startMediaSec: 24, endMediaSec: expect.closeTo(24.264, 8) },
+      { clipId: 2, startMediaSec: 24.6, endMediaSec: 150 }
+    ])
+    expect(programDurationSec(map.clips)).toBeCloseTo(149.664, 6)
+    expect(map.mediaToProgramSec(24.6)).toBeCloseTo(24.264, 6)
+    expect(map.programToMediaSec(map.clips[1].editStart)).toBeCloseTo(24.6, 6)
+  })
+})
 import type { SubtitleLine } from '../../../shared/subtitles'
 
 describe('buildScheduledMediaSegmentsFromSubtitleWords', () => {

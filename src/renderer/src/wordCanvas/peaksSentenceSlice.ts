@@ -86,7 +86,7 @@ export function slicePeaksJsonToRmsChunk(
 }
 
 const SLICE_CACHE_MAX = 8192
-const sliceResultCache = new Map<string, number[]>()
+const waveformCaches = new WeakMap<JsonWaveformData, Map<string, number[]>>()
 
 function sliceCacheKey(
   peaksDataLen: number,
@@ -107,11 +107,17 @@ export function slicePeaksJsonToRmsChunkCached(
   endSec: number,
   opts?: SlicePeaksOpts
 ): number[] {
+  if (json == null) return []
+  let sliceResultCache = waveformCaches.get(json)
+  if (!sliceResultCache) {
+    sliceResultCache = new Map()
+    waveformCaches.set(json, sliceResultCache)
+  }
   const peaksLen = peaksJsonRawDataLength(json)
   const lo = Math.max(0, Math.min(startSec, endSec))
   const hi = Math.max(0, Math.max(startSec, endSec))
-  const startMs = Math.round(lo * 1000)
-  const endMs = Math.round(hi * 1000)
+  const startMs = lo * 1000
+  const endMs = hi * 1000
   const durHintKey =
     opts?.mediaDurationHintSec != null && Number.isFinite(opts.mediaDurationHintSec)
       ? String(Math.round(opts.mediaDurationHintSec * 1000))

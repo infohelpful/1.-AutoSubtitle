@@ -652,7 +652,8 @@ function normalizeMappedSubtitles(subtitles: MappedSubtitle[]): MappedSubtitle[]
       continue
     }
     const last = out[out.length - 1]
-    const nextStart = Math.max(cur.start, last.end + 0.01)
+    // Touching cues replace each other directly; an inserted 10 ms gap flashes blank.
+    const nextStart = Math.max(cur.start, last.end)
     if (cur.end <= nextStart + 0.01) continue
     out.push({ start: nextStart, end: cur.end, text })
   }

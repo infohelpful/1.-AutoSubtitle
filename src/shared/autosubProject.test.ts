@@ -25,6 +25,18 @@ export const projectFixture = () => ({
 })
 
 describe('project v2 storage', () => {
+  it('preserves manual silence boundary locks through save and reopen without speech alignment status', () => {
+    const words = [{ start: 0, end: 1, word: '--', isSilence: true, manualStartLocked: true, manualEndLocked: true }]
+    for (const version of [1, 2]) {
+      const parsed = parseAutosubProjectFile({ ...projectFixture(), version,
+        subtitles: [{ start: 0, end: 1, text: '', words }] })
+      expect(parsed.ok).toBe(true)
+      if (!parsed.ok) continue
+      expect(parsed.data.subtitles[0].words).toEqual(words)
+      const reopened = parseAutosubProjectFile(JSON.parse(JSON.stringify(parsed.data)))
+      expect(reopened.ok && reopened.data.subtitles[0].words).toEqual(words)
+    }
+  })
   it('round trips exact text, empty slots, tombstones, split flags, highlight and all alignment metadata', () => {
     const raw = projectFixture()
     const parsed = parseAutosubProjectFile(JSON.parse(JSON.stringify(raw)))

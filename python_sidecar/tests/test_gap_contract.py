@@ -28,12 +28,16 @@ class GapContractTests(unittest.TestCase):
         result = _fill_unvoiced_gaps([self.cue(0, 2), self.cue(1, 1.5, "겹말")], 3)
         self.assertEqual(result[1]["start"], 1)
         self.assertEqual(result[1]["end"], 1.5)
-        self.assertEqual(result[2]["start"], 2)
+        self.assertEqual(len(result), 2)
 
     def test_nonfinite_boundaries_are_rejected(self):
         result = _fill_unvoiced_gaps([self.cue(0, float("inf"))], 2)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["text"].strip(), "--")
+        self.assertEqual(result, [])
+
+    def test_timestamp_holes_and_empty_asr_are_not_proof_of_silence(self):
+        raw = [self.cue(0, 15.6), self.cue(15.74, 41.36), self.cue(41.62, 50)]
+        self.assertEqual(_fill_unvoiced_gaps(raw, 60), raw)
+        self.assertEqual(_fill_unvoiced_gaps([], 60), [])
 
 
 if __name__ == '__main__':

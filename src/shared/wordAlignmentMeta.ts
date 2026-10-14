@@ -119,9 +119,16 @@ export function parseWordAlignmentMeta(raw: Record<string, unknown>): WordAlignm
       .slice(0, MAX_REVIEW_REASONS)
     if (reasons.length > 0) out.reviewReasons = reasons
   }
-  if (raw.manualStartLocked === true) out.manualStartLocked = true
-  if (raw.manualEndLocked === true) out.manualEndLocked = true
+  Object.assign(out, parseManualBoundaryLocks(raw))
   return out
+}
+
+/** Silence has editable boundaries too, but does not carry speech alignment status. */
+export function parseManualBoundaryLocks(raw: Record<string, unknown>): Pick<WordAlignmentMeta, 'manualStartLocked' | 'manualEndLocked'> {
+  const locks: Pick<WordAlignmentMeta, 'manualStartLocked' | 'manualEndLocked'> = {}
+  if (raw.manualStartLocked === true) locks.manualStartLocked = true
+  if (raw.manualEndLocked === true) locks.manualEndLocked = true
+  return locks
 }
 
 /** `parseWordAlignmentMeta` 용 입력 가드 */
@@ -152,6 +159,10 @@ export function markWordEdited<T extends EditableWord>(
   next: { start: number; end: number; word: string }
 ): T & WordAlignmentMeta {
   const result: T & WordAlignmentMeta = { ...prev, start: next.start, end: next.end, word: next.word }
+  const startChanged = Math.abs(next.start - prev.start) > WORD_EDIT_TIME_EPS_SEC
+  const endChanged = Math.abs(next.end - prev.end) > WORD_EDIT_TIME_EPS_SEC
+  if (startChanged) result.manualStartLocked = true
+  if (endChanged) result.manualEndLocked = true
   if (prev.isSilence === true) return result
 
   const textChanged = next.word !== prev.word
@@ -161,8 +172,6 @@ export function markWordEdited<T extends EditableWord>(
     delete result.alignmentText
     delete result.readingOverride
   }
-  const startChanged = Math.abs(next.start - prev.start) > WORD_EDIT_TIME_EPS_SEC
-  const endChanged = Math.abs(next.end - prev.end) > WORD_EDIT_TIME_EPS_SEC
 
   if (textChanged && prev.alignmentStatus === 'aligned') {
     result.alignmentStatus = 'stale'
@@ -171,8 +180,6 @@ export function markWordEdited<T extends EditableWord>(
     result.reviewReasons = [...reasons].slice(0, MAX_REVIEW_REASONS)
   }
   if (startChanged || endChanged) {
-    if (startChanged) result.manualStartLocked = true
-    if (endChanged) result.manualEndLocked = true
     result.alignmentStatus = 'manual'
   }
   return result

@@ -889,6 +889,11 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
     useEffect(() => {
       if (!editRange || !contextClampLimits) return
       const { lo, hi } = contextClampLimits
+      // Selection and view-window updates commit separately. Never clamp a
+      // new word to the previous word's viewport: that moves both handles
+      // and range playback to unrelated audio.
+      if (!activeWordSpan || Math.min(activeWordSpan.start, activeWordSpan.end) < lo - 1e-6 ||
+          Math.max(activeWordSpan.start, activeWordSpan.end) > hi + 1e-6) return
       setEditRange((er) => {
         if (!er) return er
         let s = Math.min(er.start, er.end)
@@ -904,7 +909,7 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
         }
         return { start: s, end: e }
       })
-    }, [activeRowTimesSig, contextClampLimits])
+    }, [activeRowTimesSig, contextClampLimits, activeWordSpan])
 
     const editRangeRef = useRef(editRange)
     editRangeRef.current = editRange

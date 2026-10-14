@@ -27,7 +27,6 @@ import { seekVideoElementTo } from './timeline/seekVideo'
 import type { CutRange, DepsStatus, ExportFormat, GpuRuntimeStatus, TranscribeMode } from '../../shared/ipc'
 import {
   displayTextFromSubtitleWords,
-  insertMissingTemporalSilenceGapsInLine,
   parseSubtitleLines,
   type SubtitleLine,
   type SubtitleWord
@@ -43,7 +42,7 @@ import {
   sentenceTokenTimelineToSubtitleLines,
   subtitleLinesToSentenceTokenTimeline
 } from '../../shared/sentenceTokenTimelineAdapter'
-import { splitLeadingSilenceInSubtitleLines } from './utils/leadingSilenceSplitAfterExtract'
+import { confirmExtractedSilence } from './utils/confirmedSilenceAfterExtract'
 import {
   buildActiveBlocksSnapshotFromSubtitles,
   deriveVisibleSubtitleLinesForUi,
@@ -60,11 +59,7 @@ import {
 } from '../../shared/phase5EditPolicy'
 import { SILENCE_PLACEHOLDER_TEXT } from '../../shared/wordContract'
 import { buildExportCueLines } from '../../shared/exportCuePipeline'
-import {
-  hasPlayableSubtitleWordIntervals,
-  lastPlaybackEndSec,
-  playbackIntervalsFromSubtitleLines
-} from '../../shared/playbackIntervals'
+
 import { applyProgramTimeRangeTombstoneCutToSubtitleLines } from '../../shared/subtitleTombstoneCut'
 import { getSubtitleBoxChromeInline } from '../../shared/subtitleBoxChrome'
 import { splitWordTextAtMediaCut } from '../../shared/subtitleWordTextSplit'
@@ -107,10 +102,9 @@ import {
 import { createPlaybackCommandRouter } from './timeline/playbackCommandRouter'
 import {
   buildScheduledMediaSegments,
-  buildScheduledMediaSegmentsFromSubtitleWords,
   type ScheduledMediaSegment
 } from './timeline/playbackSchedule'
-import { USE_WORD_BASED_PLAYBACK_SCHEDULE } from './timeline/playbackPolicy'
+import { pickActiveSubtitleIndex } from '../../shared/subtitlePresentation'
 import { WebAudioMasterPlayback } from './timeline/webAudioMasterPlayback'
 import { useVideoSeekUi } from './sync/useVideoSeekUi'
 
@@ -271,12 +265,6 @@ function formatClock(sec: number): string {
   const s = Math.floor(sec % 60)
   if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
   return `${m}:${String(s).padStart(2, '0')}`
-}
-
-/** `playheadSec`이 걸리는 자막 줄 인덱스, 없으면 null */
-function pickActiveSubtitleIndex(lines: readonly SubtitleLine[], t: number): number | null {
-  const i = lines.findIndex((s) => t >= s.start && t < s.end)
-  return i >= 0 ? i : null
 }
 
 /** `bottom: y%` — 0 에 가까울수록 화면 아래, 값이 클수록 위. 슬라이더 범위와 동일하게 클램프 */
@@ -1750,6 +1738,15 @@ export default function App(): ReactElement {
     () => buildTimelineClips(mergedWaveformPeaksStitchCuts, timelineMediaEndHint),
     [mergedWaveformPeaksStitchCuts, timelineMediaEndHint]
   )
+  const displayTimelineMapping = useMemo(
+    () => createTimelineMapping(mergedWaveformPeaksStitchCuts, timelineMediaEndHint, { masterMode: 'passthrough' }),
+    [mergedWaveformPeaksStitchCuts, timelineMediaEndHint]
+  )
+  const displayDurationSec = programDurationSec(displayTimelineMapping.clips)
+  const formatEditedTimecode = useCallback(
+    (sourceSec: number) => formatTimecode(displayTimelineMapping.mediaToProgramSec(sourceSec)),
+    [displayTimelineMapping]
+  )
   const playbackTimelineMappingRef = useRef(playbackTimelineMapping)
   playbackTimelineMappingRef.current = playbackTimelineMapping
   /** ASR, peaks and WebAudio all use the video-epoch PCM, including leading silence. */
@@ -1850,22 +1847,8 @@ export default function App(): ReactElement {
     return 0
   }, [timelineMapping, timelineMediaEndHint, mapMediaToEditSec])
 
-  /** 살아 있는 단어 구간의 미디어 축 끝 — 재생·UI 상한 클램프용 */
-  const visibleWordsMediaEndSec = useMemo(
-    () => lastPlaybackEndSec(playbackIntervalsFromSubtitleLines(subtitles)),
-    [subtitles]
-  )
-
-  /** 진행 바·플레이헤드 상한 — 매핑된 편집 길이와 마지막 유효 단어 끝 중 짧은 쪽 */
-  const uiTimelineEndEditSec = useMemo((): number => {
-    const prog = programTimelineEndEditSec
-    const lastMedia = visibleWordsMediaEndSec
-    if (lastMedia == null || !Number.isFinite(lastMedia)) return prog
-    const mappedEnd = mapMediaToEditSec(lastMedia)
-    if (!(mappedEnd > 0)) return prog
-    if (prog > 0) return Math.min(prog, mappedEnd)
-    return mappedEnd
-  }, [programTimelineEndEditSec, mapMediaToEditSec, visibleWordsMediaEndSec])
+  // Playback includes all source audio except explicit edits, including unaligned speech tails.
+  const uiTimelineEndEditSec = programTimelineEndEditSec
 
   const clampProgramEditSec = useCallback(
     (editSec: number): number => {
@@ -1894,13 +1877,7 @@ export default function App(): ReactElement {
     return undefined
   }, [programTimelineEndEditSec, timelineMediaEndHint, waveformPeaksJsonLoading, durationSec])
 
-  /** 파형·진단용 미디어 길이 상한 — 파일 끝과 마지막 유효 단어 끝 중 짧은 쪽 */
-  const waveformMediaDurationCapSec = useMemo((): number | undefined => {
-    const vm = visibleWordsMediaEndSec
-    if (vm == null) return undefined
-    if (durationSec > 0) return Math.min(durationSec, vm)
-    return vm
-  }, [visibleWordsMediaEndSec, durationSec])
+  const waveformMediaDurationCapSec = durationSec > 0 ? durationSec : undefined
 
   /** 편집 타임라인 초를 ref·미리보기·자막 DOM·파형 재생선에 반영하는 단일 진입점 */
   const commitEditSecToUi = useCallback(
@@ -1919,13 +1896,13 @@ export default function App(): ReactElement {
       activeSubtitleIndexRef.current = ai
 
       const timeEl = previewCurrentTimeRef.current
-      if (timeEl) timeEl.textContent = formatClock(editSec)
+      if (timeEl) timeEl.textContent = formatClock(displayTimelineMapping.mediaToProgramSec(editSec))
 
       const seekEl = previewSeekInputRef.current
       if (seekEl) {
-        const d = uiTimelineEndEditSec > 0 ? uiTimelineEndEditSec : 0.001
+        const d = displayDurationSec > 0 ? displayDurationSec : 0.001
         seekEl.max = String(Math.max(d, 0.001))
-        const v = uiTimelineEndEditSec > 0 ? Math.min(editSec, uiTimelineEndEditSec) : editSec
+        const v = displayTimelineMapping.mediaToProgramSec(editSec)
         seekEl.value = String(v)
         seekEl.setAttribute('aria-valuenow', String(Math.round(v * 100) / 100))
       }
@@ -2005,7 +1982,7 @@ export default function App(): ReactElement {
 
       waveformPeaksRef.current?.syncPlayheadFromEditSec(editSec)
     },
-    [clampProgramEditSec, uiTimelineEndEditSec]
+    [clampProgramEditSec, uiTimelineEndEditSec, displayTimelineMapping, displayDurationSec]
   )
 
   useLayoutEffect(() => {
@@ -2400,13 +2377,11 @@ export default function App(): ReactElement {
        * `timelineMapping` 은 항등이라 컷 정보를 잃었다. EDL 세그먼트는 `playbackEdlClips`
        * (cut-aware) 또는 단어 기반 (storage media-axis) 으로 계산해 컷 구간을 자연 skip 한다.
        */
-      const segments = USE_WORD_BASED_PLAYBACK_SCHEDULE
-        ? buildScheduledMediaSegmentsFromSubtitleWords(subtitles, startMediaSec, endMediaSec)
-        : buildScheduledMediaSegments(playbackEdlClips, startMediaSec, endMediaSec)
+      const segments = buildScheduledMediaSegments(playbackEdlClips, startMediaSec, endMediaSec)
       activePlaybackScheduleRef.current = segments.length > 0 ? { kind, index: 0, segments } : null
       timelineEditLog('playback', 'EDL schedule armed', {
         kind,
-        scheduleSource: USE_WORD_BASED_PLAYBACK_SCHEDULE ? 'word-intervals' : 'edl-clips',
+        scheduleSource: 'edl-clips',
         startMediaSec,
         endMediaSec,
         segmentCount: segments.length,
@@ -2728,7 +2703,7 @@ export default function App(): ReactElement {
         return
       }
       const run = (): void => {
-        if (!hasPlayableSubtitleWordIntervals(subtitles)) {
+        if (playbackEdlClips.length === 0) {
           timelineEditLog('playback', 'seekAndPlayTo 차단(재생 가능 단어 없음)', {
             requestedStartEditSec: startSec,
             inputTimeBasis,
@@ -2849,7 +2824,7 @@ export default function App(): ReactElement {
         const endInput = Math.max(0, Math.max(startSec, endSec))
         if (!(endInput > startInput + 1e-4)) return
 
-        if (!hasPlayableSubtitleWordIntervals(subtitles)) {
+        if (playbackEdlClips.length === 0) {
           timelineEditLog('playback', 'playEditRange 차단(재생 가능 단어 없음)', {
             requestedStartEditSec: startSec,
             requestedEndEditSec: endSec,
@@ -3126,8 +3101,6 @@ export default function App(): ReactElement {
     ]
   )
 
-  /** 예전: 단어 삭제 시 CutRange 등록 — Phase 4 이후 tombstone 단일 모델이라 no-op (IPC 시그니처 유지) */
-  const registerDeletedAudioRange = useCallback((_startSec: number, _endSec: number) => {}, [])
 
   const onSubtitleCardClick = useCallback(
     (e: MouseEvent<HTMLElement>, startSec: number) => {
@@ -3480,6 +3453,7 @@ export default function App(): ReactElement {
   const [waveformLineIndex, setWaveformLineIndex] = useState<number | null>(null)
   const [waveformWordId, setWaveformWordId] = useState<string | null>(null)
   const [peaksZoomViewRange, setPeaksZoomViewRange] = useState<PeaksZoomViewRange | null>(null)
+
   /**
    * 자르기 성공 직후 한 번 — `vrewRows` 가 새 `subtitles` 로 커밋된 뒤
    *  `focusWaveformWord(line, wordIndexInVrew)` 로 **분할된 왼쪽 조각**(가시 인덱스 동일)을 선택한다.
@@ -3488,7 +3462,7 @@ export default function App(): ReactElement {
   const postSplitWaveformFocusRef = useRef<{ lineIndex: number; wordIndexInVrew: number } | null>(null)
   const [postSplitWaveformFocusCommit, setPostSplitWaveformFocusCommit] = useState(0)
 
-  /** 추출 후: Python RMS + `splitLeadingSilenceInSubtitleLines`만. 파형 기반 전역 단어 재스냅은 끔 */
+  /** 추출 후 음성 단어 경계를 보존하고, 단어 밖의 확인된 저에너지 구간만 무음 표시한다. */
   const AUTO_WORD_REALIGN_BY_WAVEFORM_ENABLED = false
 
   useEffect(() => {
@@ -3966,6 +3940,16 @@ export default function App(): ReactElement {
   /** 파형 편집 중 — 다른 단어·영상·빈 곳 클릭 시 닫기(활성 단어 칩·파형 UI는 유지) */
   useEffect(() => {
     if (waveformLineIndex === null && waveformWordId === null) return
+    let closeTimer: ReturnType<typeof setTimeout> | null = null
+    const cancelClose = (): void => {
+      if (closeTimer != null) clearTimeout(closeTimer)
+      closeTimer = null
+    }
+    const close = (): void => {
+      cancelClose()
+      setWaveformLineIndex(null)
+      setWaveformWordId(null)
+    }
     const onPointerDown = (e: PointerEvent): void => {
       const el = e.target as HTMLElement | null
       if (!el) return
@@ -3976,11 +3960,28 @@ export default function App(): ReactElement {
       if (el.closest('[data-waveform-no-dismiss="1"]')) return
       /** body 포털된 CUT 삭제 버튼 — 클릭 시 파형 닫히면 CUT 확정 전에 줄이 닫혀 삭제가 스킵됨 */
       if (el.closest('[data-waveform-app-portal="1"]')) return
-      setWaveformLineIndex(null)
-      setWaveformWordId(null)
+      // Collapsing here moves other rows between pointerdown and mouseup,
+      // so their click/double-click lands on a different element.
+      if (el.closest('.subtitle-word-chip')) return
+      close()
+    }
+    const onClick = (e: globalThis.MouseEvent): void => {
+      const el = e.target as HTMLElement | null
+      if (!el?.closest('.subtitle-word-chip') || el.closest('[data-waveform-expanded-row-chip="1"]')) return
+      cancelClose()
+      // Match the active chip's single-click delay in SubtitleVirtualList.
+      // Double-click and a new waveform selection cancel this pending close.
+      if (e.detail < 2) closeTimer = setTimeout(close, 280)
     }
     document.addEventListener('pointerdown', onPointerDown, true)
-    return () => document.removeEventListener('pointerdown', onPointerDown, true)
+    document.addEventListener('click', onClick, true)
+    document.addEventListener('dblclick', cancelClose, true)
+    return () => {
+      cancelClose()
+      document.removeEventListener('pointerdown', onPointerDown, true)
+      document.removeEventListener('click', onClick, true)
+      document.removeEventListener('dblclick', cancelClose, true)
+    }
   }, [waveformLineIndex, waveformWordId])
 
   const updateSubtitleAt = useCallback((index: number, text: string) => {
@@ -4087,28 +4088,10 @@ export default function App(): ReactElement {
         if (cardIndex < 0 || cardIndex >= prev.length) return prev
         const cur = prev[cardIndex]
         const words = cur.words ?? []
-        if (wordIndex < 0 || wordIndex >= words.length) return prev
+        if (wordIndex < 0 || wordIndex > words.length) return prev
 
-        // 1) 동일 카드 내: 현재 단어의 왼쪽 단어 삭제 — 비파괴(isDeleted)
         if (wordIndex > 0) {
-          const nextWords = words.map((w, i) =>
-            i === wordIndex - 1 ? ({ ...w, isDeleted: true } as SubtitleWord) : w
-          )
-          const visibleNext = nextWords.filter((w) => !w.isDeleted)
-          if (visibleNext.length === 0) {
-            // 마지막 카드(prev.length === 1)도 비워지면 그대로 제거 — 자막 배열은 []까지 내려갈 수 있음
-            return [...prev.slice(0, cardIndex), ...prev.slice(cardIndex + 1)]
-          }
-          const nextStart = visibleNext[0].start
-          const nextEnd = visibleNext[visibleNext.length - 1].end
-          const updated: SubtitleLine = {
-            ...cur,
-            start: nextStart,
-            end: Math.max(nextStart + 0.1, nextEnd),
-            words: nextWords,
-            text: textFromWords(nextWords, cur.text)
-          }
-          return [...prev.slice(0, cardIndex), updated, ...prev.slice(cardIndex + 1)]
+          return subtitleLinesAfterSoftDeleteWordRange(prev, cardIndex, wordIndex - 1, wordIndex, [])?.lines ?? prev
         }
 
         // 2) 카드 첫 단어: 이전 카드로 모두 이동 + 현재 카드 삭제
@@ -4138,8 +4121,6 @@ export default function App(): ReactElement {
       armDeleteGuard('deleteWordAt')
       logDeletePlaybackSnapshot('deleteWordAt 시작', { deleteOpId, cardIndex, caretIndex })
       setGapFillWhenBuildingVrew(false)
-      let pendingMediaCuts: CutRange[] = []
-      let pendingHint = ''
       applySubtitleChange((prev) => {
         if (cardIndex < 0 || cardIndex >= prev.length) return prev
         const cur = prev[cardIndex]
@@ -4156,18 +4137,7 @@ export default function App(): ReactElement {
             mergedCutRanges
           )
           if (!result) return prev
-          const { lines: next, mediaCutsForVirtual } = result
-          const updatedCard = next[cardIndex]
-          const visible = (updatedCard?.words ?? []).filter((w) => !w.isDeleted)
-          if (visible.length === 0) {
-            // 단어 1개 카드도 동일 경로 — 마지막 카드(next.length === 1)까지 제거 허용
-            pendingMediaCuts = mediaCutsForVirtual
-            pendingHint = words[caretIndex]?.word ?? ''
-            return [...next.slice(0, cardIndex), ...next.slice(cardIndex + 1)]
-          }
-          pendingMediaCuts = mediaCutsForVirtual
-          pendingHint = words[caretIndex]?.word ?? ''
-          return next
+          return result.lines
         }
 
         // 2) 카드 끝(caretIndex===words.length)에서 Delete: 다음 카드와 병합 (리플 없음)
@@ -4186,24 +4156,6 @@ export default function App(): ReactElement {
         // 3) 그 외 — 카드 통째 제거(예: 단일 단어·커서 끝, 다음 카드 없음). 마지막 카드도 허용.
         return [...prev.slice(0, cardIndex), ...prev.slice(cardIndex + 1)]
       })
-      if (pendingMediaCuts.length > 0) {
-        const cuts = pendingMediaCuts
-        const hint = pendingHint
-        /**
-         * 가상 타임라인 갱신은 **같은 핸들러 안에서** 호출 → React 18 자동 batching 으로 `setSentenceTokenTimeline`
-         * 과 한 commit 에 묶인다. 이전엔 `setTimeout(0)` 로 분리했지만, 그 사이에 발생한 Ctrl+Z 가
-         * `virtualTimelineDeletedRef.current` 의 옛 값을 읽고 → 그 후 setTimeout 이 늦게 fire 해서
-         * 가상 삭제가 다시 복원되지 않는 race 가 있었다.
-         *
-         * 파형 픽셀 데이터(`stitchedWaveformJsonComputed`) 는 이미 `useDeferredValue` 로 한 단계 늦춰지므로
-         * 같은 commit 에 묶여도 740k 픽셀 재페인트가 첫 페인트를 막지 않는다.
-         */
-        setVirtualTimelineDeleted((vp) => {
-          let acc = vp
-          for (const r of cuts) acc = mergeDeletedMediaIntoTimeline(acc, r, hint)
-          return acc
-        })
-      }
       deleteProbeTimersRef.current.forEach((id) => window.clearTimeout(id))
       deleteProbeTimersRef.current = [500, 2000, 5000, 10000, 20000, 30000].map((delayMs) =>
         window.setTimeout(() => {
@@ -4224,8 +4176,6 @@ export default function App(): ReactElement {
       armDeleteGuard('deleteWordRangeAt')
       logDeletePlaybackSnapshot('deleteWordRangeAt 시작', { deleteOpId, cardIndex, fromWordIndex, toWordIndex })
       setGapFillWhenBuildingVrew(false)
-      let pendingMediaCuts: CutRange[] = []
-      let pendingHint = ''
       applySubtitleChange((prev) => {
         if (cardIndex < 0 || cardIndex >= prev.length) return prev
         const cur = prev[cardIndex]
@@ -4242,30 +4192,9 @@ export default function App(): ReactElement {
           mergedCutRanges
         )
         if (!result) return prev
-        const { lines: next, mediaCutsForVirtual } = result
-        const updatedCard = next[cardIndex]
-        const visible = (updatedCard?.words ?? []).filter((w) => !w.isDeleted)
-        if (visible.length > 0) {
-          pendingMediaCuts = mediaCutsForVirtual
-          pendingHint = (cur.words?.[start]?.word ?? '').trim()
-          return next
-        }
-
-        // 단어가 전부 없어진 카드는 마지막 카드(next.length === 1)도 제거 — 자막 배열은 []까지 내려갈 수 있음
-        pendingMediaCuts = mediaCutsForVirtual
-        pendingHint = (cur.words?.[start]?.word ?? '').trim()
-        return [...next.slice(0, cardIndex), ...next.slice(cardIndex + 1)]
+        // Keep hidden row/word tombstones as the sole deletion record, including an empty row.
+        return result.lines
       })
-      if (pendingMediaCuts.length > 0) {
-        const cuts = pendingMediaCuts
-        const hint = pendingHint
-        /** 동일 — undo 정합성을 위해 같은 핸들러에 묶고, stitched 픽셀 redraw 는 useDeferredValue 가 처리 */
-        setVirtualTimelineDeleted((vp) => {
-          let acc = vp
-          for (const r of cuts) acc = mergeDeletedMediaIntoTimeline(acc, r, hint)
-          return acc
-        })
-      }
       deleteProbeTimersRef.current.forEach((id) => window.clearTimeout(id))
       deleteProbeTimersRef.current = [500, 2000, 5000, 10000, 20000, 30000].map((delayMs) =>
         window.setTimeout(() => {
@@ -4459,7 +4388,7 @@ export default function App(): ReactElement {
     }
     if (!isOneShotSessionLocked()) clearOneShotSession('togglePlay')
     if (!outputPlaying) {
-      if (!hasPlayableSubtitleWordIntervals(subtitles)) {
+      if (playbackEdlClips.length === 0) {
         timelineEditLog('playback', 'togglePlay 차단(재생 가능 단어 없음)', {
           subtitleLineCount: subtitles.length
         })
@@ -5050,6 +4979,22 @@ export default function App(): ReactElement {
     seekToSubtitleStartFromUserInput(startSec)
   }, [pausePlayback, seekToSubtitleStartFromUserInput])
 
+  const recheckSilence = useCallback(() => {
+    if (!waveformPeaksJsonData || !(rawWaveformTimelineDurationSec > 0)) return
+    if (mergedCutRanges.length || virtualTimelineDeletedRef.current.length || subtitles.some(line =>
+      line.isDeleted || line.words?.some(word => word.isDeleted ||
+        ((word.isSilence || word.word.trim() === '--') && (word.manualStartLocked || word.manualEndLocked))))) {
+      setAlignmentNotice('무음 다시 확인은 컷·삭제·무음 경계 편집이 없는 프로젝트에서 사용할 수 있습니다.')
+      return
+    }
+    pausePlayback('recheck-silence')
+    setWaveformLineIndex(null)
+    setWaveformWordId(null)
+    setGapFillWhenBuildingVrew(false)
+    applySubtitleChange(prev => confirmExtractedSilence(prev, waveformPeaksJsonData, rawWaveformTimelineDurationSec))
+    setAlignmentNotice('말 단어는 유지하고 실제 저에너지 구간만 무음으로 표시했습니다. Ctrl+Z로 되돌릴 수 있습니다.')
+  }, [waveformPeaksJsonData, rawWaveformTimelineDurationSec, mergedCutRanges, subtitles, applySubtitleChange, pausePlayback])
+
   const applyWordReading = useCallback((id: string, reading: string) => {
     applySubtitleChange(lines => lines.map(line => {
       if (!line.words?.some(word => word.id === id)) return line
@@ -5628,7 +5573,7 @@ export default function App(): ReactElement {
     if (!el || !masterAudio) return
     const editV = Number(raw)
     if (!Number.isFinite(editV)) return
-    const editClamped = clampProgramEditSec(editV)
+    const editClamped = clampProgramEditSec(displayTimelineMapping.programToMediaSec(editV))
     const mediaT = toMediaSeekSec(editClamped, el)
     userPauseRequestedRef.current = true
     playbackEnginePhaseRef.current = 'idle'
@@ -5651,9 +5596,9 @@ export default function App(): ReactElement {
 
   const onSeekChange = useCallback(
     (e: ChangeEvent<HTMLInputElement>) => {
-      applySeekValue(e.target.value)
+      applySeekValue(String(displayTimelineMapping.programToMediaSec(Number(e.target.value))))
     },
-    [applySeekValue]
+    [applySeekValue, displayTimelineMapping]
   )
 
   /** 드래그 중(input) — scrubToVirtualMs (낙관적 UI + 비디오 currentTime 스로틀) */
@@ -5661,10 +5606,10 @@ export default function App(): ReactElement {
     (e: FormEvent<HTMLInputElement>) => {
       const editV = Number(e.currentTarget.value)
       if (!Number.isFinite(editV)) return
-      const editClamped = clampProgramEditSec(editV)
+      const editClamped = clampProgramEditSec(displayTimelineMapping.programToMediaSec(editV))
       scrubToVirtualMs(Math.round(editClamped * 1000))
     },
-    [clampProgramEditSec, scrubToVirtualMs]
+    [clampProgramEditSec, scrubToVirtualMs, displayTimelineMapping]
   )
 
   const undoSubtitleChange = useCallback(() => {
@@ -5863,7 +5808,7 @@ export default function App(): ReactElement {
 
       void (async () => {
         const mediaDur = Number((raw as { duration?: unknown }).duration)
-        let finalLines = lines
+        let finalLines = confirmExtractedSilence(lines, null, mediaDur)
         const wp = (raw as { waveform_peaks?: { ok?: boolean; path?: string | null } }).waveform_peaks
 
         try {
@@ -5875,24 +5820,19 @@ export default function App(): ReactElement {
               const j = jr.json as JsonWaveformData
               setWaveformPeaksJsonData(j)
               if (Number.isFinite(mediaDur) && mediaDur > 0) {
-                const peakLines = splitLeadingSilenceInSubtitleLines(lines, j, mediaDur)
-                const wcPeak = peakLines.reduce((a, l) => a + (l.words?.length ?? 0), 0)
-                finalLines = peakLines.map((l) => insertMissingTemporalSilenceGapsInLine(l))
-                const wcGap = finalLines.reduce((a, l) => a + (l.words?.length ?? 0), 0)
-                if (wcGap !== wcPeak) {
-                  wfLog('perf', '추출 후 타임스탬프 구간 무음 삽입', {
-                    wordCountAfterPeakSplit: wcPeak,
-                    wordCountAfterGapFill: wcGap,
-                    insertedWords: wcGap - wcPeak
-                  })
-                }
+                finalLines = confirmExtractedSilence(lines, j, mediaDur)
+                wfLog('perf', '추출 후 실제 저에너지 구간만 무음 표시', {
+                  inputWords: wordCount,
+                  silenceWords: finalLines.flatMap(l => l.words ?? []).filter(w => w.isSilence).length,
+                  speechBoundariesPreserved: true
+                })
               }
             } else {
               setWaveformPeaksJsonData(null)
             }
           }
         } catch (e) {
-          wfLog('perf', '단어 추출 후 선행 무음 분할/피크 로드 실패', {
+          wfLog('perf', '단어 추출 후 무음 확인/피크 로드 실패', {
             message: e instanceof Error ? e.message : String(e),
             ts: new Date().toISOString()
           })
@@ -6119,7 +6059,7 @@ export default function App(): ReactElement {
           subtitles: buildExportCueLines(subtitles, {
             includeWords: exportFormat === 'video' && wordHighlightEnabled
           }),
-          cutRanges,
+          cutRanges: mergedWaveformPeaksStitchCuts,
           subtitleStyle: {
             fontFamily: subtitleFontFamily,
             fontSize: subtitleFontSize,
@@ -6161,7 +6101,7 @@ export default function App(): ReactElement {
       }
     })()
   }, [
-    cutRanges,
+    mergedWaveformPeaksStitchCuts,
     exportFormat,
     isExporting,
     subtitleBgColor,
@@ -6328,7 +6268,7 @@ export default function App(): ReactElement {
       tombstones = virtualTombstonesFromCutRanges(d.cutRanges)
     }
     setVirtualTimelineDeleted(tombstones)
-    setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(d.subtitles))
+    setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline([...d.subtitles].sort((a, b) => a.start - b.start)))
     setGapFillWhenBuildingVrew(false)
     undoStackRef.current = []
     redoStackRef.current = []
@@ -7077,7 +7017,7 @@ export default function App(): ReactElement {
                     className="preview-seek"
                     aria-label="재생 위치"
                     min={0}
-                    max={Math.max(timelineMediaEndHint > 0 ? mapMediaToEditSec(timelineMediaEndHint) : 0, 0.001)}
+                    max={Math.max(displayDurationSec, 0.001)}
                     step={0.01}
                     defaultValue={0}
                     disabled={waveformPeaksJsonLoading}
@@ -7087,7 +7027,7 @@ export default function App(): ReactElement {
                   <span className="preview-time preview-time--total">
                     {waveformPeaksJsonLoading
                       ? '로딩 중…'
-                      : formatClock(timelineMediaEndHint > 0 ? mapMediaToEditSec(timelineMediaEndHint) : 0)}
+                      : formatClock(displayDurationSec)}
                   </span>
                 </div>
               </>
@@ -7145,15 +7085,11 @@ export default function App(): ReactElement {
                       <button
                         type="button"
                         className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
-                        disabled={gapFillWhenBuildingVrew}
-                        onClick={() => setGapFillWhenBuildingVrew(true)}
-                        title={
-                          subtitlesContainDeletedWords
-                            ? '삭제된 단어(tombstone)가 있어 파형에는 무음 더미를 넣지 않습니다. 간격 메우기 플래그만 켭니다.'
-                            : '파형 편집용 줄을 만들 때 단어 사이 간격을 다시 메웁니다(무음 더미 포함).'
-                        }
+                        disabled={!waveformPeaksJsonData || isExtracting || projectIoBusy || realigning}
+                        onClick={recheckSilence}
+                        title="말 단어와 시간을 유지하고 오디오를 확인해 무음 표시를 다시 만듭니다. 컷·삭제·무음 경계 편집이 없는 프로젝트에 사용할 수 있습니다."
                       >
-                        간격 다시 채우기
+                        무음 다시 확인
                       </button>
                     </div>
                   ) : null}
@@ -7214,13 +7150,12 @@ export default function App(): ReactElement {
                           backspaceWordAt={backspaceWordAt}
                           deleteWordAt={deleteWordAt}
                           deleteWordRangeAt={deleteWordRangeAt}
-                          onDeleteAudioRange={registerDeletedAudioRange}
                           onUndo={undoSubtitleChange}
                           onRedo={redoSubtitleChange}
                           updateSubtitleAt={updateSubtitleAt}
                           splitSubtitleAt={splitSubtitleAt}
                           mergeEmptySubtitleAt={mergeEmptySubtitleAt}
-                          formatTimecode={formatTimecode}
+                          formatTimecode={formatEditedTimecode}
                           onTogglePlayback={dispatchTogglePlayIntent}
                           waveformEnabled={Boolean(modelReady)}
                           registerWaveMount={registerWaveMount}

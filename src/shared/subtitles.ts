@@ -1,11 +1,11 @@
 import {
-  CONTINUATION_ELLIPSIS_TOKEN,
   FLOAT_EPS,
   scrubTimelineNoiseFromWordPiece,
   shouldOmitFromSubtitleEditLineText,
   SILENCE_PLACEHOLDER_TEXT
 } from './wordContract'
-import { parseWordAlignmentMeta, type WordAlignmentMeta } from './wordAlignmentMeta'
+import { parseManualBoundaryLocks, parseWordAlignmentMeta, type WordAlignmentMeta } from './wordAlignmentMeta'
+import { subtitlePresentationSpans } from './subtitlePresentation'
 
 /** Python 사이드카(Faster-Whisper) 및 UI 공통 자막 줄 형식 */
 export type SubtitleWord = SubtitleWordCore & WordAlignmentMeta
@@ -149,66 +149,9 @@ export function subtitleLineEditDisplayText(line: {
   return fromTextSanitized
 }
 
-function isGapLikeTimelineToken(w: SubtitleWord): boolean {
-  if (w.isDeleted === true) return false
-  const t = String(w.word ?? '').trim()
-  if (w.isSilence === true || t === SILENCE_PLACEHOLDER_TEXT) return true
-  if (t === CONTINUATION_ELLIPSIS_TOKEN) return true
-  return false
-}
-
-function isDashSilenceToken(w: SubtitleWord): boolean {
-  if (w.isDeleted === true) return false
-  const t = String(w.word ?? '').trim()
-  return w.isSilence === true || t === SILENCE_PLACEHOLDER_TEXT
-}
-
-/**
- * 피크 무음 분할로 생긴 `…` / `--` 가 번갈아 끼인 **쇼트 런**을 하나의 `--` 로 합친다.
- * - `Hello` + `--` + `…`(말 꼬리) 같이 런 길이 2·`--` 1개인 경우는 건드리지 않는다.
- * - `…`,`--`,`…`,`--` 처럼 런 길이 ≥3 이거나 `--` 가 2개 이상이면 전부 합집합 `--` 한 칩으로.
- */
-export function collapseGapLikeRunsInWords(words: readonly SubtitleWord[]): SubtitleWord[] {
-  if (words.length === 0) return []
-  const out: SubtitleWord[] = []
-  let i = 0
-  while (i < words.length) {
-    const w = words[i]!
-    if (w.isDeleted === true || !isGapLikeTimelineToken(w)) {
-      out.push({ ...w })
-      i += 1
-      continue
-    }
-    let j = i + 1
-    while (j < words.length && isGapLikeTimelineToken(words[j]!) && words[j]!.isDeleted !== true) {
-      j += 1
-    }
-    const run = words.slice(i, j)
-    const dashCount = run.filter(isDashSilenceToken).length
-    const collapse = run.length >= 3 || dashCount >= 2
-    if (collapse) {
-      const lo = Math.min(...run.map((x) => Math.min(x.start, x.end)))
-      const hi = Math.max(...run.map((x) => Math.max(x.start, x.end)))
-      out.push({
-        start: lo,
-        end: Math.max(lo + FLOAT_EPS, hi),
-        word: SILENCE_PLACEHOLDER_TEXT,
-        isSilence: true
-      })
-    } else {
-      for (const x of run) out.push({ ...x })
-    }
-    i = j
-  }
-  return out
-}
-
-/** 인접 `--` 병합 + `…`/`--` 쇼트 런 축소를 한 번에(타임라인↔줄 SSOT 공통). */
+/** Only merge touching, explicitly marked quiet spans; token labels cannot prove silence. */
 export function normalizeSilenceWordsForLineWords(words: readonly SubtitleWord[]): SubtitleWord[] {
-  let w = mergeConsecutiveSilenceWords(words)
-  w = collapseGapLikeRunsInWords(w)
-  w = mergeConsecutiveSilenceWords(w)
-  return w
+  return mergeConsecutiveSilenceWords(words)
 }
 
 /** 연속된 무음 단어(`isSilence` 또는 표시 `--`)를 저장 순서대로 하나의 구간으로 합친다. */
@@ -229,7 +172,9 @@ export function mergeConsecutiveSilenceWords(words: readonly SubtitleWord[]): Su
       continue
     }
     const prev = out[out.length - 1]
-    if (prev && prev.isDeleted !== true && isSilBlock(prev)) {
+    if (prev && prev.isDeleted !== true && isSilBlock(prev) &&
+        !prev.manualStartLocked && !prev.manualEndLocked && !w.manualStartLocked && !w.manualEndLocked &&
+        w.start <= prev.end + 1e-9 && prev.start <= w.end + 1e-9) {
       prev.start = Math.min(prev.start, w.start)
       prev.end = Math.max(prev.end, w.end)
       prev.word = SILENCE_PLACEHOLDER_TEXT
@@ -334,20 +279,20 @@ export function subtitleCueLinesForExport(
   lines: readonly SubtitleLine[]
 ): SubtitleCueLineForExport[] {
   const out: SubtitleCueLineForExport[] = []
-  for (const line of lines) {
+  for (const span of subtitlePresentationSpans(lines)) {
+    const line = lines[span.index]
     const hasWords = Array.isArray(line.words) && line.words.length > 0
     if (hasWords) {
       const vis = visibleSubtitleWords(line.words)
       if (vis.length === 0) continue
-      const start = Math.min(...vis.map((w) => w.start))
-      const end = Math.max(...vis.map((w) => w.end))
+      const { start, end } = span
       const text = displayTextFromSubtitleWords(line.words) || (line.text ?? '').trim()
       if (text.length === 0) continue
       out.push({ start, end, text })
     } else {
       const text = (line.text ?? '').trim()
       if (text.length === 0) continue
-      out.push({ start: line.start, end: line.end, text })
+      out.push({ start: line.start, end: span.end, text })
     }
   }
   return out
@@ -393,6 +338,7 @@ export function parseSubtitleLines(raw: unknown): SubtitleLine[] {
       if (isDeleted) entry.isDeleted = true
       // 무음 더미는 정렬 상태를 갖지 않는다.
       if (!isSilence) Object.assign(entry, parseWordAlignmentMeta(w))
+      else Object.assign(entry, parseManualBoundaryLocks(w))
       words.push(entry)
     }
     if (!Number.isFinite(start) || !Number.isFinite(end)) continue

@@ -25,6 +25,38 @@ function mkLine(start: number, end: number, words: Array<[number, number, string
   }
 }
 
+describe('waveform trim metadata', () => {
+  it('locks committed edges on speech and silence while leaving preview metadata unchanged', () => {
+    const subtitles: SubtitleLine[] = [{ start: 0, end: 2, text: '말', words: [
+      { id: 'speech', start: 0, end: 1, word: '말', alignmentStatus: 'aligned', sourceStart: 0, sourceEnd: 1 },
+      { start: 1, end: 2, word: '--', isSilence: true }
+    ] }]
+    const input = { subtitles, target: { lineIndex: 0, wordIndex: 0 }, edge: 'end' as const, newSec: 1.2 }
+    const preview = applyWordEdgeDrag(input).subtitles[0].words!
+    expect(preview[0].alignmentStatus).toBe('aligned')
+    expect(preview[0].manualEndLocked).toBeUndefined()
+    expect(preview[1].manualStartLocked).toBeUndefined()
+    const committed = applyWordEdgeDrag({ ...input, commitMode: true }).subtitles[0].words!
+    expect(committed[0]).toMatchObject({ end: 1.2, manualEndLocked: true, alignmentStatus: 'manual', sourceEnd: 1 })
+    expect(committed[1]).toMatchObject({ start: 1.2, manualStartLocked: true, isSilence: true })
+    expect(committed[1].alignmentStatus).toBeUndefined()
+  })
+
+  it('keeps absorbed speech visible when a silence chip grows across it', () => {
+    for (const edge of ['start', 'end'] as const) {
+      const words = [{ start: 0, end: 1, word: '말' }, { start: 1, end: 2, word: '--', isSilence: true }]
+      if (edge === 'end') { words[0] = { ...words[0], word: '--', isSilence: true }; words[1] = { ...words[1], word: '말', isSilence: false } }
+      const subtitles: SubtitleLine[] = [{ start: 0, end: 2, text: '말', words }]
+      const target = { lineIndex: 0, wordIndex: edge === 'start' ? 1 : 0 }
+      const result = applyWordEdgeDrag({ subtitles, target, edge, newSec: edge === 'start' ? 0 : 2, commitMode: true })
+      const word = result.subtitles[0].words![target.wordIndex]
+      expect(word.word).toBe('말')
+      expect(word.isSilence).toBeFalsy()
+      expect(word.alignmentStatus).toBe('manual')
+    }
+  })
+})
+
 describe('subtitleWordEdgeDrag — flatten/filter/link', () => {
   it('flattens with metadata and filters tombstones', () => {
     const subs: SubtitleLine[] = [
@@ -537,6 +569,14 @@ describe('subtitleWordEdgeDrag — guards', () => {
 })
 
 describe('subtitleWordEdgeDrag — revive (de-merge) of tombstoned neighbors', () => {
+  it('never revives explicitly deleted words when either neighboring handle is shortened', () => {
+    const subtitles = [mkLine(0, 3, [[0, 1, '앞'], [1, 2, '삭제', true], [2, 3, '뒤']])]
+    for (const [wordIndex, edge, newSec] of [[0, 'end', .5], [2, 'start', 2.5]] as const) {
+      const result = applyWordEdgeDrag({ subtitles, target: { lineIndex: 0, wordIndex }, edge, newSec, commitMode: true })
+      expect(result.subtitles[0].words![1]).toMatchObject({ word: '삭제', start: 1, end: 2, isDeleted: true })
+    }
+  })
+
   it('shrinking right edge through a tombstoned next-neighbor revives it fully', () => {
     const merged: SubtitleLine[] = [
       mkLine(0, 1.0, [
@@ -545,6 +585,7 @@ describe('subtitleWordEdgeDrag — revive (de-merge) of tombstoned neighbors', (
         [1.0, 1.5, '셋']
       ])
     ]
+    merged[0].words![1].mergedByEdgeTrim = true
     const { subtitles: next, mutated } = applyWordEdgeDrag({
       subtitles: merged,
       target: { lineIndex: 0, wordIndex: 0 },
@@ -569,6 +610,7 @@ describe('subtitleWordEdgeDrag — revive (de-merge) of tombstoned neighbors', (
         [0.5, 1.0, '둘', true]
       ])
     ]
+    merged[0].words![1].mergedByEdgeTrim = true
     const { subtitles: next } = applyWordEdgeDrag({
       subtitles: merged,
       target: { lineIndex: 0, wordIndex: 0 },
@@ -589,6 +631,7 @@ describe('subtitleWordEdgeDrag — revive (de-merge) of tombstoned neighbors', (
         [0.0, 1.0, '하나 둘']
       ])
     ]
+    merged[0].words![0].mergedByEdgeTrim = true
     const { subtitles: next } = applyWordEdgeDrag({
       subtitles: merged,
       target: { lineIndex: 0, wordIndex: 1 },

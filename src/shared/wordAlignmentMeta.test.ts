@@ -154,6 +154,8 @@ describe('markWordEdited', () => {
     const next = markWordEdited(silence, { start: 0, end: 1.5, word: '--' })
     expect(next.alignmentStatus).toBeUndefined()
     expect(next.end).toBe(1.5)
+    expect(next.manualEndLocked).toBe(true)
+    expect(next.manualStartLocked).toBeUndefined()
   })
 
   it('keeps an unaligned word unaligned on text edit', () => {

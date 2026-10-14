@@ -4,6 +4,7 @@
  */
 import type { SubtitleLine } from './subtitles'
 import { subtitleCueLinesForExport, subtitleWordPiecesForExport } from './subtitles'
+import { subtitlePresentationSpans } from './subtitlePresentation'
 
 export type ExportCueWord = {
   start: number
@@ -33,7 +34,8 @@ export function buildExportCueLines(
   if (!options?.includeWords) return cues
   // subtitleCueLinesForExport 는 tombstone·빈 텍스트 줄을 건너뛰므로 같은 규칙으로 줄을 다시 고른다.
   const kept: SubtitleLine[] = []
-  for (const line of lines) {
+  for (const span of subtitlePresentationSpans(lines)) {
+    const line = lines[span.index]
     if (subtitleCueLinesForExport([line]).length > 0) kept.push(line)
   }
   return cues.map((cue, i) => {

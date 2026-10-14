@@ -46,6 +46,12 @@ describe('slicePeaksJsonToRmsChunk', () => {
 })
 
 describe('slicePeaksJsonToRmsChunkCached', () => {
+  it('does not reuse another media waveform with the same length and duration', () => {
+    const a = makeJson(100, 100, 8000)
+    const b = { ...a, data: Array(200).fill(0) }
+    slicePeaksJsonToRmsChunkCached(a, .25, .75)
+    expect(slicePeaksJsonToRmsChunkCached(b, .25, .75)).toEqual(slicePeaksJsonToRmsChunk(b, .25, .75))
+  })
   it('동일 인자면 비캐시와 동일 배열', () => {
     const sr = 8000
     const spp = 100

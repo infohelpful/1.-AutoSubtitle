@@ -17,7 +17,7 @@ import type { RowComponentProps } from 'react-window'
 import type { MouseEvent } from 'react'
 
 import { subtitleLineEditDisplayText, type SubtitleLine } from '../../shared/subtitles'
-import { deleteTextGrapheme } from './utils/deleteTextGrapheme'
+import { subtitlePresentationEnd, subtitlePresentationStart } from '../../shared/subtitlePresentation'
 import {
   DISPLAY_CROSS_CARD_GAP_ABSORB_MS,
   DISPLAY_GAP_ABSORB_MS,
@@ -91,7 +91,6 @@ export type SubtitleVirtualListProps = {
   backspaceWordAt: (index: number, wordIndex: number) => void
   deleteWordAt: (index: number, wordIndex: number) => void
   deleteWordRangeAt: (index: number, fromWordIndex: number, toWordIndex: number) => void
-  onDeleteAudioRange: (startSec: number, endSec: number) => void
   onUndo: () => void
   onRedo: () => void
   updateSubtitleAt: (index: number, text: string) => void
@@ -136,7 +135,6 @@ export type SubtitleListRowProps = {
   backspaceWordAt: SubtitleVirtualListProps['backspaceWordAt']
   deleteWordAt: SubtitleVirtualListProps['deleteWordAt']
   deleteWordRangeAt: SubtitleVirtualListProps['deleteWordRangeAt']
-  onDeleteAudioRange: SubtitleVirtualListProps['onDeleteAudioRange']
   onUndo: SubtitleVirtualListProps['onUndo']
   onRedo: SubtitleVirtualListProps['onRedo']
   updateSubtitleAt: SubtitleVirtualListProps['updateSubtitleAt']
@@ -175,9 +173,6 @@ export type SubtitleListRowProps = {
   setGlobalHoveredRow: (idx: number | null) => void
 }
 
-const shouldDeleteAudioForWords = (words: Array<{ isSilence?: boolean }> | undefined): boolean =>
-  Boolean(words && words.length > 0 && words.every((w) => Boolean(w.isSilence)))
-
 /**
  * 사용자가 칩/줄을 직접 눌러서 재생을 멈춘 직후에는 '멈춘 재생 위치의 캐럿으로 포커스 복귀' 동기화를 건너뛴다.
  * 행마다 ref 가 따로라서(재생 중이던 줄 ≠ 클릭한 줄) 모듈 전역 시각으로 공유한다.
@@ -206,7 +201,6 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     backspaceWordAt,
     deleteWordAt,
     deleteWordRangeAt,
-    onDeleteAudioRange,
     onUndo,
     onRedo,
     updateSubtitleAt,
@@ -312,18 +306,8 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     return out
   }, [row.words])
 
-  /**
-   * 카드 헤더와 마지막 단어 툴팁이 **동일한 끝 시각** 을 쓰도록 한 곳에서 계산.
-   *
-   * - 카드↔카드 사이 짧은 갭(≤ `DISPLAY_CROSS_CARD_GAP_ABSORB_MS`) 은 다음 카드 시작으로 흡수.
-   * - 단어↔단어 / 마지막 단어↔카드 끝 사이 짧은 갭(≤ `DISPLAY_GAP_ABSORB_MS`) 은 칩 툴팁에서 흡수.
-   * - 데이터(`row.end`, `rw.end`) 자체는 불변 — 본 값은 **표시 전용**.
-   */
-  const effectiveCardEndSec = resolveDisplayEndSec(
-    row.end,
-    subtitles[index + 1]?.start ?? null,
-    DISPLAY_CROSS_CARD_GAP_ABSORB_MS
-  )
+  /** Card text stays visible until the next live row; source word times are untouched. */
+  const effectiveCardEndSec = subtitlePresentationEnd(subtitles, index)
 
   /**
    * row.words 변경 시 캐럿/선택 앵커의 **단일 소유자는 명시적 액션(`requestFocusCaret`)** 이다.
@@ -1270,19 +1254,6 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     }
     const subs = row.words ?? []
     const ci = renderableCaretToStorageCaret(subs, renderableCi)
-    if ((e.key === 'Backspace' || e.key === 'Delete') && !hasSelection) {
-      const adjacent = e.key === 'Backspace' ? visibleWordStorageIndices(subs).filter(i => i < ci).at(-1)
-        : visibleWordStorageIndices(subs).find(i => i >= ci)
-      // Silence blocks remain timeline edits; spoken text uses a character caret.
-      if (adjacent != null && !subs[adjacent]?.isSilence) {
-        e.preventDefault()
-        const result = deleteTextGrapheme(lineEditDisplay, textOffsetForStorageCaret(subs, ci), e.key)
-        setSubtitleTextDraft(result.text)
-        updateSubtitleAt(index, result.text)
-        requestFocusRow(index, result.caret)
-        return
-      }
-    }
     if (e.key === ' ' || e.code === 'Space') {
       e.preventDefault()
       if (isPlaying) {
@@ -1436,9 +1407,6 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
         const to = Math.max(selStart, selEnd)
         const words = row.words ?? []
         const seekSec = words[Math.max(0, Math.min(from, words.length - 1))]?.start ?? row.start
-        if (to > from && words[from] && words[to - 1] && shouldDeleteAudioForWords(words.slice(from, to))) {
-          onDeleteAudioRange(words[from].start, words[to - 1].end)
-        }
         deleteWordRangeAt(index, from, to)
         clearSelection()
         showKeyboardCaret()
@@ -1455,9 +1423,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       while (leftIdx >= 0 && words[leftIdx]?.isDeleted === true) leftIdx -= 1
       const seekSec = words[Math.max(0, leftIdx)]?.start ?? row.start
       if (leftIdx >= 0) {
-        const leftWord = words[leftIdx]
-        if (leftWord?.isSilence) onDeleteAudioRange(leftWord.start, leftWord.end)
-        backspaceWordAt(index, leftIdx + 1)
+        deleteWordRangeAt(index, leftIdx, leftIdx + 1)
         onCardNavigate(seekSec)
         registerCardFocus(index)
         window.setTimeout(() => requestFocusCaret(index, leftIdx), 0)
@@ -1477,9 +1443,6 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
         const to = Math.max(selStart, selEnd)
         const words = row.words ?? []
         const seekSec = words[Math.max(0, Math.min(from, words.length - 1))]?.start ?? row.start
-        if (to > from && words[from] && words[to - 1] && shouldDeleteAudioForWords(words.slice(from, to))) {
-          onDeleteAudioRange(words[from].start, words[to - 1].end)
-        }
         deleteWordRangeAt(index, from, to)
         clearSelection()
         showKeyboardCaret()
@@ -1496,9 +1459,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       while (rightIdx < words.length && words[rightIdx]?.isDeleted === true) rightIdx += 1
       const seekSec = words[Math.min(rightIdx, Math.max(0, words.length - 1))]?.start ?? row.start
       if (rightIdx < words.length) {
-        const targetWord = words[rightIdx]
-        if (targetWord?.isSilence) onDeleteAudioRange(targetWord.start, targetWord.end)
-        deleteWordAt(index, rightIdx)
+        deleteWordRangeAt(index, rightIdx, rightIdx + 1)
         onCardNavigate(seekSec)
         registerCardFocus(index)
         window.setTimeout(() => requestFocusCaret(index, rightIdx), 0)
@@ -1726,7 +1687,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       >
         <div className="subtitle-card-head">
           <div className="subtitle-card-times" aria-label="자막 구간">
-            <span className="subtitle-time">{formatTimecode(row.start)}</span>
+            <span className="subtitle-time">{formatTimecode(subtitlePresentationStart(subtitles, index))}</span>
             <span className="subtitle-time-sep">→</span>
             <span className="subtitle-time">{formatTimecode(effectiveCardEndSec)}</span>
           </div>
@@ -1816,6 +1777,17 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                       data-waveform-active-word-chip={isActiveWaveformChip ? '1' : undefined}
                       data-waveform-expanded-row-chip={waveformExpandedThisRow ? '1' : undefined}
                       className={`subtitle-word-chip subtitle-word-chip--proportional${rw.isSilence ? ' subtitle-word-chip--silence' : ''}`}
+                      onKeyDown={(e) => {
+                        // Expanded waveform rows have no caret buttons. Delete the focused
+                        // chip directly instead of losing the keystroke on the parent card.
+                        if (e.key !== 'Delete' && e.key !== 'Backspace') return
+                        e.preventDefault()
+                        e.stopPropagation()
+                        deleteWordRangeAt(index, storageWi, storageWi + 1)
+                        onCardNavigate(rw.start)
+                        clearSelection()
+                        window.setTimeout(() => requestFocusCaret(index, storageWi), 0)
+                      }}
                       onMouseEnter={() => {
                         // 칩 앞 caret 슬롯 — storage 축 = storageWi
                         setCaretIndex(storageWi)
@@ -1860,6 +1832,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                           onWordBlockClick(rw.start)
                           clearSelection()
                           activateCaretAt(storageWi, true)
+                          e.currentTarget.focus({ preventScroll: true })
                           return
                         }
                         onWordBlockClick(rw.start)
@@ -1886,6 +1859,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                         e.stopPropagation()
                         /** visible 인덱스(`wi`) — focusWaveformWord 가 vrewRows.words(visible-filtered) 인덱싱 */
                         onWaveformWordDoubleClick(index, wi)
+                        e.currentTarget.focus({ preventScroll: true })
                       }}
                       title={(() => {
                         const isLastChip = wi === wordRail.length - 1
@@ -2157,7 +2131,9 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     const rc = storageCaretToRenderableCaret(targetWords, safe)
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        const el = document.getElementById(`subtitle-caret-${cardIndex}-${rc}`) as HTMLButtonElement | null
+        const el = (document.getElementById(`subtitle-caret-${cardIndex}-${rc}`)
+          ?? document.getElementById(`subtitle-word-${cardIndex}-${safe}`)
+          ?? document.getElementById(`subtitle-card-${cardIndex}`)) as HTMLElement | null
         if (!el) return
         el.focus({ preventScroll: true })
       })
@@ -2230,7 +2206,6 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       backspaceWordAt: props.backspaceWordAt,
       deleteWordAt: props.deleteWordAt,
       deleteWordRangeAt: props.deleteWordRangeAt,
-      onDeleteAudioRange: props.onDeleteAudioRange,
       onUndo: props.onUndo,
       onRedo: props.onRedo,
       updateSubtitleAt: props.updateSubtitleAt,
@@ -2274,7 +2249,6 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.backspaceWordAt,
       props.deleteWordAt,
       props.deleteWordRangeAt,
-      props.onDeleteAudioRange,
       props.onUndo,
       props.onRedo,
       props.updateSubtitleAt,

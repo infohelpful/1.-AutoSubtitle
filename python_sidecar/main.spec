@@ -8,7 +8,7 @@ from pathlib import Path
 
 datas = collect_data_files("faster_whisper")
 # Executed by the separate interpreter; these must be physical source files.
-for name in ("align_worker.py", "forced_align.py", "alignment_contract.py", "alignment_text.py", "alignment_windows.py"):
+for name in ("align_worker.py", "forced_align.py", "alignment_audio.py", "alignment_contract.py", "alignment_text.py", "alignment_windows.py"):
     datas.append((str(Path(SPECPATH) / name), "."))
 
 a = Analysis(

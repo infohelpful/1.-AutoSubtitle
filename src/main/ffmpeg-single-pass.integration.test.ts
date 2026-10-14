@@ -19,6 +19,33 @@ function run(args: string[]): Buffer {
 }
 
 describe.skipIf(!ffmpeg || !existsSync(ffmpeg))('real FFmpeg source-to-program export', () => {
+  it('exports video and audio without captions when every row is hidden', async () => {
+    mkdirSync(output, { recursive: true })
+    const source = join(output, 'hidden-captions-source.mkv')
+    const target = join(output, 'hidden-captions-result.mp4')
+    run(['-f', 'lavfi', '-i', 'color=blue:s=64x64:r=30:d=2',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
+      '-c:v', 'libx264', '-c:a', 'pcm_s16le', source])
+    const media = probeMediaTiming(ffprobe, source)
+    await runSinglePassSubtitleBurnIn({
+      ffmpegPath: ffmpeg, inputVideoPath: source, outputPath: target,
+      fullVideoWidth: 64, fullVideoHeight: 64, renderWidth: 64, renderHeight: 64,
+      overlayDurationSec: 2, h264Encoder: 'libx264',
+      overlayStates: async function* () {},
+      clipPlan: clipPlanFromCuts(2, []), sourceDurationSec: 2,
+      sourceOriginSec: media.sourceOriginSec, hasAudio: true
+    })
+    const result = probeMediaTiming(ffprobe, target)
+    expect(result.duration).toBeCloseTo(2, 1)
+    expect(result.hasAudio).toBe(true)
+    const pixel = [...run(['-ss', '1', '-i', target, '-frames:v', '1', '-vf', 'scale=1:1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])]
+    expect(pixel[2]).toBeGreaterThan(200)
+    expect(pixel[0]).toBeLessThan(30)
+    const audio = run(['-i', target, '-vn', '-f', 's16le', '-ac', '1', '-ar', '48000', '-'])
+    expect(audio.length / (48000 * 2)).toBeCloseTo(2, 1)
+    expect(audio.some(byte => byte !== 0)).toBe(true)
+  }, 30_000)
+
   it.each([[2, 0], [2, 90], [8/9, 90]])('matches display pixels and overlay placement for SAR=%s and rotation=%s', async (sar, rotation) => {
     mkdirSync(output, { recursive: true })
     const base = join(output, `sar-base-${sar}-${rotation}.mp4`)

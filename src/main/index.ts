@@ -1528,7 +1528,8 @@ if (ownsProfile) app.whenReady().then(async () => {
     const win = dialogParentWindow(event)
     if (!win) throw new Error('윈도우를 찾지 못했습니다.')
     prepareDialogParent(win)
-    if (!Array.isArray(req?.subtitles) || req.subtitles.length === 0) throw new Error('내보낼 자막 데이터가 없습니다.')
+    // An empty cue list is valid when all captions are hidden; media and cuts still export.
+    if (!Array.isArray(req?.subtitles)) throw new Error('내보낼 자막 데이터가 없습니다.')
     const format = normalizeExportFormat(req.format)
     const requiresFfmpeg = format === 'video' || format === 'mp3' || format === 'wav'
     if (requiresFfmpeg && !ffmpegReadyForUse()) {
@@ -1583,7 +1584,6 @@ if (ownsProfile) app.whenReady().then(async () => {
     const mappedSubtitles = explicitPlan
       ? req.subtitles.flatMap((cue) => mapSourceIntervalToProgram(cue.start, cue.end, explicitPlan).map((time) => ({ ...time, text: cue.text }))).sort((a, b) => a.start - b.start)
       : normalizeMappedSubtitles(buildMappedSubtitles(req.subtitles, cuts))
-    if (mappedSubtitles.length === 0) throw new Error('내보낼 유효 자막이 없습니다.')
 
     if (format === 'srt') {
       writeUtf8TextFile(outputPath, buildSrtText(mappedSubtitles, req.subtitleStyle))
@@ -1633,7 +1633,6 @@ if (ownsProfile) app.whenReady().then(async () => {
           fps: EXPORT_FPS,
           highlightWords: highlightColor !== undefined
         })
-        if (schedule.length === 0) throw new Error('내보낼 유효 자막이 없습니다.')
         sendExportProgress(win, { percent: 6, label: '해상도 확인 중…', encoderName: encDisplay })
         const fullW = media.width
         const fullH = media.height

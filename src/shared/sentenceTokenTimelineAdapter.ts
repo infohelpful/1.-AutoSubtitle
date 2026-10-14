@@ -54,12 +54,14 @@ function buildSentenceFromLine(line: SubtitleLine, li: number): TimelineSentence
     })
     return {
       id: sentenceIdForLineIndex(li),
+      isHidden: line.isHidden,
       tokens,
       is_deleted: line.isDeleted === true ? true : false
     }
   }
   return {
     id: sentenceIdForLineIndex(li),
+    isHidden: line.isHidden,
     tokens: [
       {
         id: tokenIdFor(li, 0),
@@ -111,6 +113,7 @@ function buildLineFromSentence(sentence: TimelineSentence): SubtitleLine | null 
     words
   }
   if (sentence.is_deleted === true) line.isDeleted = true
+  if (sentence.isHidden === true) line.isHidden = true
   return line
 }
 

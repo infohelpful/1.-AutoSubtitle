@@ -104,6 +104,7 @@ function parseProjectSubtitles(raw: unknown, legacy: boolean): SubtitleLine[] | 
     if (!isRecord(item) || !time(item.start) || !time(item.end) || item.end < item.start || typeof item.text !== 'string') return null
     const line: SubtitleLine = { start: item.start, end: item.end, text: item.text }
     if (item.isDeleted === true) line.isDeleted = true
+    if (item.isHidden === true) line.isHidden = true
     if (item.words !== undefined) {
       if (!Array.isArray(item.words)) return null
       line.words = []

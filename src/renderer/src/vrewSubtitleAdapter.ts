@@ -250,7 +250,7 @@ export function mergeVrewRowsIntoSubtitleLines(
     if (prevWords.length === 0 || visiblePrev.length !== row.words.length) {
       // 줄 단위로 폴백: 이 줄만 전면 교체
       const replaced = vrewRowsToSubtitleLines([row], options)[0]
-      if (replaced) merged.push(replaced)
+      if (replaced) merged.push({ ...replaced, ...(prevLine.isHidden ? {isHidden: true} : {}) })
       else merged.push(prevLine)
       continue
     }

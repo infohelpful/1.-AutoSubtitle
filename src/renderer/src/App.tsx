@@ -113,6 +113,7 @@ import {
   type ScheduledMediaSegment
 } from './timeline/playbackSchedule'
 import { pickActiveSubtitleIndex } from '../../shared/subtitlePresentation'
+import { setSubtitleVisibility, subtitlePreviewText } from '../../shared/subtitleVisibility'
 import { resolveHighlightWordIndex } from '../../shared/activeWordResolver'
 import { WebAudioMasterPlayback } from './timeline/webAudioMasterPlayback'
 import { videoFollowRate } from './timeline/audioOutputClock'
@@ -887,15 +888,17 @@ export default function App(): ReactElement {
     }
   }
   /** 미리보기(영상) 폭 % — 낮을수록 자막·파형 패널이 넓어져 단어 행 가로 스크롤이 줄어듦 */
-  const SPLIT_MIN = 35
+  const SPLIT_MIN = 20
   const SPLIT_MAX = 65
   const [previewWidthPct, setPreviewWidthPct] = useState(() => {
-    const raw = window.localStorage.getItem('autosubtitle:split-preview-width-pct')
+    const raw = window.localStorage.getItem('autosubtitle:editor-preview-width-pct')
     const parsed = Number(raw)
-    if (!Number.isFinite(parsed)) return 50
+    if (raw === null || !Number.isFinite(parsed)) return 28
     return Math.max(SPLIT_MIN, Math.min(SPLIT_MAX, parsed))
   })
   const [busy, setBusy] = useState(false)
+  const [editorTab, setEditorTab] = useState<'home' | 'subtitles' | 'format'>('home')
+  const [selectedSubtitleRows, setSelectedSubtitleRows] = useState<Set<number>>(() => new Set())
   const [videoPath, setVideoPath] = useState<string | null>(null)
   const [preparedSource, setPreparedSource] = useState<{ path: string; media: PreparedMedia } | null>(null)
   const [mediaPrepareError, setMediaPrepareError] = useState('')
@@ -1931,7 +1934,7 @@ export default function App(): ReactElement {
 
       const previewTextEl = previewSubtitleTextRef.current
       if (previewTextEl) {
-        previewTextEl.textContent = ai !== null && subsNow[ai] ? subsNow[ai].text : ''
+        previewTextEl.textContent = subtitlePreviewText(subsNow, editSec)
       }
 
       const t = editSec
@@ -6604,7 +6607,7 @@ export default function App(): ReactElement {
     subtitleY
   ])
   useEffect(() => {
-    window.localStorage.setItem('autosubtitle:split-preview-width-pct', String(previewWidthPct))
+    window.localStorage.setItem('autosubtitle:editor-preview-width-pct', String(previewWidthPct))
   }, [previewWidthPct])
   useEffect(() => {
     const payload = {
@@ -6716,8 +6719,23 @@ export default function App(): ReactElement {
 
   const projectFileUiDisabled = !modelReady || busy || isExtracting || projectIoBusy
 
+  useEffect(() => { setSelectedSubtitleRows(new Set()) }, [subtitles, videoPath])
+  const toggleSubtitleSelection = useCallback((index: number, checked: boolean) => {
+    setSelectedSubtitleRows(prev => {
+      const next = new Set(prev)
+      if (checked) next.add(index)
+      else next.delete(index)
+      return next
+    })
+  }, [])
+  const visibleRowIndices = useMemo(() => subtitles.flatMap((line, index) =>
+    line.isDeleted || (line.words?.length && line.words.every(w => w.isDeleted)) ? [] : [index]), [subtitles])
+  const changeSelectedVisibility = (hidden: boolean) => {
+    applySubtitleChange(lines => setSubtitleVisibility(lines, selectedSubtitleRows, hidden))
+  }
+
   return (
-    <div className="app">
+    <div className={`app editor-tab-${editorTab}`}>
       {projectMediaNotice ? <div className="app-gpu-install-banner" role="status" data-testid="project-media-notice">
         <p className="app-gpu-install-banner-text">{projectMediaNotice}</p>
         {!videoPath && projectMediaRef.current.path ? <button type="button" disabled={projectIoBusy} onClick={relinkProjectMedia}>원본 영상 연결</button> : null}
@@ -6737,6 +6755,10 @@ export default function App(): ReactElement {
       >
         <header className="app-topbar">
           <h1 className="app-title">AutoSubtitle</h1>
+          <nav className="editor-tabs" aria-label="편집 도구">
+            {([['home','홈'],['subtitles','자막'],['format','서식']] as const).map(([tab,label]) =>
+              <button key={tab} type="button" aria-pressed={editorTab === tab} onClick={() => setEditorTab(tab)}>{label}</button>)}
+          </nav>
           <div className="app-topbar-actions">
             <label className="preview-export-word-highlight">추출 싱크
               <select aria-label="추출 싱크 정밀도" value={alignmentMode} disabled={isExtracting || busy}
@@ -6795,6 +6817,13 @@ export default function App(): ReactElement {
 
         <div className="preview-subtitle-controls-bar" data-waveform-no-dismiss="1">
           <div className="preview-subtitle-controls">
+            <div className="editor-home-tools">
+              <button type="button" onClick={undoSubtitleChange} disabled={!subtitles.length}>↶<span>실행 취소</span></button>
+              <button type="button" onClick={redoSubtitleChange} disabled={!subtitles.length}>↷<span>다시 실행</span></button>
+              <span className="editor-tool-divider" />
+              <button type="button" onClick={() => setEditorTab('subtitles')}>▤<span>자막 편집</span></button>
+              <button type="button" onClick={() => setEditorTab('format')}>Aa<span>자막 서식</span></button>
+            </div>
             <div className="preview-subtitle-controls-rows">
               <div className="preview-subtitle-controls-line">
                 <label className="preview-subtitle-control-row preview-subtitle-control-row--font">
@@ -7308,6 +7337,16 @@ export default function App(): ReactElement {
                   </p>
                 ) : null}
               </header>
+              <div className="subtitle-selection-toolbar" role="group" aria-label="자막 줄 선택 및 표시">
+                <label><input type="checkbox" aria-label="모든 자막 줄 선택"
+                  checked={visibleRowIndices.length > 0 && selectedSubtitleRows.size === visibleRowIndices.length}
+                  ref={el => { if(el) el.indeterminate = selectedSubtitleRows.size > 0 && selectedSubtitleRows.size < visibleRowIndices.length }}
+                  disabled={!visibleRowIndices.length}
+                  onChange={e => setSelectedSubtitleRows(new Set(e.target.checked ? visibleRowIndices : []))} />전체 선택</label>
+                <span className="subtitle-selection-count" aria-live="polite">{selectedSubtitleRows.size ? `${selectedSubtitleRows.size}줄 선택` : `${visibleRowIndices.length}개의 자막`}</span>
+                <button type="button" disabled={!selectedSubtitleRows.size || isExtracting || projectIoBusy} onClick={() => changeSelectedVisibility(true)}>선택 자막 숨기기</button>
+                <button type="button" disabled={!selectedSubtitleRows.size || isExtracting || projectIoBusy} onClick={() => changeSelectedVisibility(false)}>선택 자막 표시</button>
+              </div>
               <div className="subtitle-panel-body">
                 {subtitles.length === 0 ? (
                   <div className="subtitle-empty-placeholder" aria-live="polite">
@@ -7321,6 +7360,8 @@ export default function App(): ReactElement {
                     <div ref={subtitleListRootRef} className="subtitle-list-stack">
                       <SubtitleDataProvider subtitles={subtitles}>
                         <SubtitleVirtualList
+                          selectedRows={selectedSubtitleRows}
+                          onSelectRow={toggleSubtitleSelection}
                           subtitles={subtitlesForSubtitleVirtualList}
                           activeSubtitleIndexRef={activeSubtitleIndexRef}
                           playheadSecRef={playheadEditSecRef}

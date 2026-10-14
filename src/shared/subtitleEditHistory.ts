@@ -6,6 +6,7 @@ export function subtitleLinesMeaningfullyChanged(next: SubtitleLine[], prev: Sub
   for (let i = 0; i < next.length; i++) {
     const n = next[i], p = prev[i]
     if (n === p) continue
+    if (!!n.isHidden !== !!p.isHidden) return true
     if (n.start !== p.start || n.end !== p.end || n.text !== p.text || !!n.isDeleted !== !!p.isDeleted) return true
     const nw = n.words ?? [], pw = p.words ?? []
     if (nw.length !== pw.length) return true

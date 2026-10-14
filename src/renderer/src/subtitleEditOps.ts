@@ -103,8 +103,8 @@ export function splitSubtitleLine(
 
   const left = text.slice(0, clampedCursor)
   const right = text.slice(clampedCursor)
-  const first: SubtitleLine = { start, end: splitTime, text: left }
-  const second: SubtitleLine = { start: splitTime, end, text: right }
+  const first: SubtitleLine = { ...line, start, end: splitTime, text: left }
+  const second: SubtitleLine = { ...line, start: splitTime, end, text: right }
   return [...lines.slice(0, index), first, second, ...lines.slice(index + 1)]
 }
 

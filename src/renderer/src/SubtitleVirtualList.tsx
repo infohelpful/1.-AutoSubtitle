@@ -77,6 +77,8 @@ function wordChipSlotStyle(w: { start: number; end: number }, tw: LineZoomWindow
 }
 
 export type SubtitleVirtualListProps = {
+  selectedRows: ReadonlySet<number>
+  onSelectRow: (index: number, checked: boolean) => void
   subtitles: SubtitleLine[]
   activeSubtitleIndexRef: MutableRefObject<number | null>
   playheadSecRef: MutableRefObject<number>
@@ -122,6 +124,9 @@ export type SubtitleVirtualListProps = {
 
 /** `List` 의 `rowProps` — `index` / `style` / `ariaAttributes` 는 List가 주입 */
 export type SubtitleListRowProps = {
+  selectedRows: ReadonlySet<number>
+  onSelectRow: SubtitleVirtualListProps['onSelectRow']
+  rowNumbers: readonly number[]
   subtitles: SubtitleLine[]
   activeSubtitleIndexRef: MutableRefObject<number | null>
   playheadSecRef: MutableRefObject<number>
@@ -1624,10 +1629,11 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       <article
         ref={articleRef}
         id={`subtitle-card-${index}`}
-        className="subtitle-card subtitle-card--virtual"
+        className={`subtitle-card subtitle-card--virtual ${props.selectedRows.has(index) ? 'subtitle-card--selected' : ''} ${row.isHidden ? 'subtitle-card--hidden-caption' : ''}`}
         tabIndex={0}
         onMouseDownCapture={(e) => {
           const t = e.target as HTMLElement
+          if (t.closest('.subtitle-row-index')) return
           if (t.closest('textarea') || t.closest('[data-subtitle-edit]')) return
           if (t.closest('.subtitle-waveform-mount')) return
           if (t.closest('.subtitle-word-chip') || t.closest('.subtitle-word-caret')) return
@@ -1665,9 +1671,10 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
             articleRef.current?.focus()
           })
         }}
-        onClick={(e) => onSubtitleCardClick(e, row.start)}
+        onClick={(e) => { if (!(e.target as HTMLElement).closest('.subtitle-row-index')) onSubtitleCardClick(e, row.start) }}
         onKeyDown={onCardKeyDown}
-        onFocusCapture={() => {
+        onFocusCapture={(e) => {
+          if ((e.target as HTMLElement).closest('.subtitle-row-index')) return
           registerCardFocus(index)
           setRowHasFocus(true)
           setHoveredCaretIndex(null)
@@ -1689,12 +1696,19 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
           }, 0)
         }}
       >
+        <div className="subtitle-row-index" onKeyDown={e => e.stopPropagation()}>
+          <span aria-label={`자막 ${props.rowNumbers[index]}번`}>{props.rowNumbers[index]}</span>
+          <input type="checkbox" aria-label={`${props.rowNumbers[index]}번 자막 선택`}
+            checked={props.selectedRows.has(index)} onChange={e => props.onSelectRow(index, e.target.checked)} />
+        </div>
         <div className="subtitle-card-head">
+          <span className="subtitle-row-kind">▣ <span>영상 · 자막</span></span>
           <div className="subtitle-card-times" aria-label="자막 구간">
             <span className="subtitle-time">{formatTimecode(subtitlePresentationStart(subtitles, index))}</span>
             <span className="subtitle-time-sep">→</span>
             <span className="subtitle-time">{formatTimecode(effectiveCardEndSec)}</span>
           </div>
+          {row.isHidden ? <span className="subtitle-hidden-badge">자막 숨김</span> : null}
         </div>
         {wordRail.length > 0 ? (
           <div className="subtitle-card-media-rail flex w-full min-w-0 flex-col">
@@ -2197,6 +2211,13 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
   const rowProps = useMemo(
     () => ({
       subtitles,
+      selectedRows: props.selectedRows,
+      onSelectRow: props.onSelectRow,
+      rowNumbers: subtitles.reduce<number[]>((numbers, line) => {
+        const last = numbers.at(-1) ?? 0
+        numbers.push(line.isDeleted || (line.words?.length && line.words.every(w => w.isDeleted)) ? last : last + 1)
+        return numbers
+      }, []),
       activeSubtitleIndexRef: props.activeSubtitleIndexRef,
       playheadSecRef: props.playheadSecRef,
       isPlaying: props.isPlaying,
@@ -2239,6 +2260,8 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     }),
     [
       subtitles,
+      props.selectedRows,
+      props.onSelectRow,
       props.activeSubtitleIndexRef,
       props.playheadSecRef,
       props.isPlaying,

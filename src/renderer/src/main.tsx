@@ -8,6 +8,7 @@ import App from './App'
 import { ErrorBoundary } from './ErrorBoundary'
 import './tailwind.css'
 import './App.css'
+import './editorChrome.css'
 
 createRoot(document.getElementById('root')!).render(
   <ErrorBoundary>

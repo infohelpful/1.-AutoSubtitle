@@ -23,6 +23,7 @@ export interface TimelineToken {
 
 /** 문장 = 토큰 배열 */
 export interface TimelineSentence {
+  isHidden?: boolean
   id: string
   tokens: TimelineToken[]
   is_deleted?: boolean

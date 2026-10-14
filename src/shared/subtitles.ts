@@ -40,6 +40,8 @@ type SubtitleWordCore = {
 }
 
 export type SubtitleLine = {
+  /** Hide caption output only; keep the row, words and media duration intact. */
+  isHidden?: boolean
   start: number
   end: number
   text: string
@@ -281,6 +283,7 @@ export function subtitleCueLinesForExport(
   const out: SubtitleCueLineForExport[] = []
   for (const span of subtitlePresentationSpans(lines)) {
     const line = lines[span.index]
+    if (line.isHidden) continue
     const hasWords = Array.isArray(line.words) && line.words.length > 0
     if (hasWords) {
       const vis = visibleSubtitleWords(line.words)

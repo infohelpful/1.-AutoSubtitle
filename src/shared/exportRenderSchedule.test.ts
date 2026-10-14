@@ -70,12 +70,13 @@ describe('buildRenderSchedule', () => {
     ])
   })
 
-  it('lights the first word before it starts when the cue appears earlier', () => {
+  it('shows the caption without highlighting a word before its speech starts', () => {
     const cues: ScheduleCue[] = [
       { start: 1, end: 3, text: 'a b', words: [{ start: 1.4, end: 1.8, text: 'a' }, { start: 1.8, end: 2.2, text: 'b' }] }
     ]
     const states = buildRenderSchedule({ cues, clips: whole, fps: 30, highlightWords: true })
-    expect(states[0]).toMatchObject({ startFrame: 30, activeIndex: 0 })
+    expect(states[0]).toMatchObject({ startFrame: 30, endFrame: 42, activeIndex: -1 })
+    expect(states[1]).toMatchObject({ startFrame: 42, activeIndex: 0 })
   })
 
   it('drops a word shorter than one frame without breaking its neighbours', () => {

@@ -20,7 +20,7 @@ function startDesktop() {
   }
   const env = { ...process.env }
   delete env.ELECTRON_RUN_AS_NODE
-  const child = spawn(exe, [root], { cwd: root, env, detached: true, windowsHide: true, stdio: 'ignore' })
+  const child = spawn(exe, [root], { cwd: root, env, detached: true, windowsHide: false, stdio: 'ignore' })
   child.once('error', error => { console.error(`앱 실행 실패: ${error.message}`); process.exitCode = 1 })
   child.unref()
   console.log('AutoSubtitle을 일반 권한으로 실행합니다.')

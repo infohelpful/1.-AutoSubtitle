@@ -92,15 +92,15 @@ const MIN_WORD_SEC = 0.01
 function wordsFromTokens(tokens: readonly string[], start: number, end: number, engine: string): SubtitleWord[] {
   const weights = tokens.map((t) => Math.max(0.5, textDisplayUnits(t)))
   const total = weights.reduce((a, b) => a + b, 0)
-  const span = Math.max(end - start, MIN_WORD_SEC * tokens.length)
+  const span = end - start
   let cursor = start
   return tokens.map((word, i) => {
     const wordStart = cursor
-    const wordEnd = i === tokens.length - 1 ? start + span : cursor + (span * weights[i]!) / total
+    const wordEnd = i === tokens.length - 1 ? end : Math.min(end, cursor + (span * weights[i]!) / total)
     cursor = wordEnd
     return {
       start: wordStart,
-      end: Math.max(wordEnd, wordStart + MIN_WORD_SEC),
+      end: wordEnd,
       word,
       alignmentStatus: 'estimated' as const,
       engine
@@ -115,7 +115,7 @@ export function srtCuesToSubtitleLines(cues: readonly ScriptCue[]): SubtitleLine
     const tokens = cue.text.split(/\s+/).filter((t) => t.length > 0)
     if (tokens.length === 0) continue
     const words = wordsFromTokens(tokens, cue.start, cue.end, 'srt-import')
-    lines.push({ start: cue.start, end: Math.max(cue.end, words[words.length - 1]!.end), text: tokens.join(' '), words })
+    lines.push({ start: cue.start, end: cue.end, text: tokens.join(' '), words })
   }
   return lines
 }
@@ -335,6 +335,7 @@ export function alignScriptToTimedLines(
   const secPerUnit = Math.min(0.4, Math.max(0.05, speeds.length > 0 ? median(speeds) : 0.18))
 
   let interpolated = 0
+  const overlapping = new Set<number>()
   for (let i = 0; i < script.length; ) {
     if (times[i]) {
       i += 1
@@ -353,10 +354,17 @@ export function alignScriptToTimedLines(
       // 사이 공간이 충분히 넓으면 자연 속도로 앞 단어 뒤에 붙이고, 좁으면 공간에 맞춰 압축한다.
       const avail = Math.max(0, after - before)
       from = before
-      span = avail > naturalSpan * 1.5 ? naturalSpan : Math.max(avail, weights.length * MIN_WORD_SEC)
+      span = Math.min(avail, naturalSpan)
+      if (span <= 0) {
+        // There is no unclaimed audio for these words. Keep the measured anchors
+        // fixed and flag this local estimate for acoustic realignment.
+        from = Math.max(0, after - weights.length * MIN_WORD_SEC)
+        span = after - from
+        for (let k = i; k < j; k += 1) overlapping.add(k)
+      }
     } else if (after !== null) {
-      span = naturalSpan
       from = Math.max(0, after - naturalSpan)
+      span = after - from
     } else {
       from = before ?? 0
       span = naturalSpan
@@ -364,26 +372,21 @@ export function alignScriptToTimedLines(
     let cursor = from
     for (let k = i; k < j; k += 1) {
       const dur = (span * weights[k - i]!) / total
-      times[k] = { start: cursor, end: cursor + Math.max(dur, MIN_WORD_SEC) }
+      // At source time zero a positive estimate must overlap the first anchor.
+      // Keep that ambiguity local rather than shifting every subsequent word.
+      if (span === 0) overlapping.add(k)
+      times[k] = { start: cursor, end: k === j - 1 ? from + span : cursor + dur }
+      if (span === 0) times[k] = { start: from, end: from + MIN_WORD_SEC }
       cursor += dur
       interpolated += 1
     }
     i = j
   }
 
-  // 시간 순서 보장(겹침은 뒤 단어를 밀어낸다)
-  let clock = 0
-  const finalTimes = times.map((tm) => {
-    const start = Math.max(tm!.start, clock)
-    const end = Math.max(tm!.end, start + MIN_WORD_SEC)
-    clock = end
-    return { start, end }
-  })
-
   const byLine = new Map<number, SubtitleWord[]>()
   script.forEach((t, i) => {
     const a = matchedAsr[i]!
-    const { start, end } = finalTimes[i]!
+    const { start, end } = times[i]!
     const word: SubtitleWord = {
       start,
       end,
@@ -396,6 +399,7 @@ export function alignScriptToTimedLines(
       word.rawEnd = asr[a]!.end
     } else {
       word.reviewReasons = ['script_time_interpolated']
+      if (overlapping.has(i)) word.reviewReasons.push('script_time_overlap')
     }
     const list = byLine.get(t.lineIndex) ?? []
     list.push(word)
@@ -405,8 +409,8 @@ export function alignScriptToTimedLines(
   const lines: SubtitleLine[] = []
   for (const [, words] of [...byLine.entries()].sort((a, b) => a[0] - b[0])) {
     lines.push({
-      start: words[0]!.start,
-      end: words[words.length - 1]!.end,
+      start: Math.min(...words.map(w => w.start)),
+      end: Math.max(...words.map(w => w.end)),
       text: displayTextFromSubtitleWords(words),
       words
     })

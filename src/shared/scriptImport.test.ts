@@ -71,6 +71,11 @@ describe('parseSubtitleCues', () => {
 })
 
 describe('srtCuesToSubtitleLines', () => {
+  it('does not extend a short cue into the next cue to fit estimated words', () => {
+    const [line] = srtCuesToSubtitleLines([{ start: 300, end: 300.02, text: '하나 둘 셋 넷 다섯' }])
+    expect(line.end).toBe(300.02)
+    expect(line.words!.every(w => w.start >= 300 && w.end <= 300.02 && w.end > w.start)).toBe(true)
+  })
   it('keeps cue times and spreads word times inside the cue', () => {
     const lines = srtCuesToSubtitleLines([{ start: 1, end: 3, text: '가나 다라마바' }])
     expect(lines).toHaveLength(1)
@@ -114,6 +119,25 @@ function timedLine(tokens: Array<[string, number, number]>): SubtitleLine {
 }
 
 describe('alignScriptToTimedLines', () => {
+  it('preserves matched speech anchors when inserted words have no free gap', () => {
+    const source = [timedLine([['컴퓨터', 300, 300.5], ['확인하세요', 300.5, 301], ['끝입니다', 301, 302]])]
+    const result = alignScriptToTimedLines(['컴퓨터 새로운 단어를 확인하세요 끝입니다'], source)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const words = result.lines[0].words!
+    expect(words.find(w => w.word === '확인하세요')).toMatchObject({ start: 300.5, end: 301 })
+    expect(words.find(w => w.word === '끝입니다')).toMatchObject({ start: 301, end: 302 })
+    expect(words.filter(w => !w.rawStart).every(w => w.end <= 300.5)).toBe(true)
+    expect(words.find(w => w.word === '새로운')?.reviewReasons).toContain('script_time_overlap')
+  })
+
+  it('bounds leading interpolations by the first recognized anchor', () => {
+    const result = alignScriptToTimedLines(['추가 문장입니다 컴퓨터 확인하세요'], [timedLine([['컴퓨터', .01, .5], ['확인하세요', .5, 1]])])
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.lines[0].words!.find(w => w.word === '컴퓨터')).toMatchObject({ start: .01, end: .5 })
+    expect(result.lines[0].words!.slice(0, 2).every(w => w.end <= .01)).toBe(true)
+  })
   // 음성 인식 결과(오인식 포함) — "오늘은 날씨가 정말 좋습니다 산책을 합니다"
   const asr = [
     timedLine([

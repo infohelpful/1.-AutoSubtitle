@@ -851,23 +851,23 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     const mount = articleRef.current
     if (!mount) return
     // App.commitEditSecToUi 와 같은 규칙(틈에서는 직전 단어 유지)으로, 행이 (재)마운트될 때 강조를 맞춘다.
-    const chips: Array<{ el: HTMLElement; start: number; end: number }> = []
+    const chips: Array<{ el: HTMLElement; start: number; end: number; isSilence: boolean }> = []
     mount.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
       const s = parseFloat(el.dataset.wordStart ?? el.getAttribute('data-word-start') ?? 'NaN')
       const e = parseFloat(el.dataset.wordEnd ?? el.getAttribute('data-word-end') ?? 'NaN')
       if (!Number.isFinite(s) || !Number.isFinite(e)) return
-      chips.push({ el, start: s, end: e })
+      chips.push({ el, start: s, end: e, isSilence: el.classList.contains('subtitle-word-chip--silence') })
     })
-    const hit = playing ? resolveHighlightWordIndex(chips, t, { skipDeleted: false, skipSilence: false }) : -1
+    const hit = playing && activeSubtitleIndexRef.current === index ? resolveHighlightWordIndex(chips, t) : -1
     chips.forEach((chip, i) => chip.el.classList.toggle('subtitle-word-chip--active', i === hit))
-  }, [wordRail, index, playheadSecRef])
+  }, [wordRail, index, playheadSecRef, isPlaying, activeSubtitleIndexRef])
 
   useEffect(() => {
     if (!isPlaying || keyboardPauseCaret) return
     const id = window.setInterval(() => {
       const playheadSec = playheadSecRef.current
       const words = wordRail
-      const wi = resolveHighlightWordIndex(words, playheadSec, { skipDeleted: false, skipSilence: false })
+      const wi = resolveHighlightWordIndex(words, playheadSec)
 
       const root = articleRef.current
       const focused = document.activeElement as HTMLElement | null
@@ -878,7 +878,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
 
       setCaretVisible(false)
       setCaretBlink(false)
-      if (wi >= 0) setCaretIndex(wi)
+      if (wi >= 0 && activeSubtitleIndexRef.current === index) setCaretIndex(wordRail[wi].storageIndex)
       const activeEl = document.activeElement as HTMLElement | null
       if (activeEl?.id?.startsWith(`subtitle-caret-${index}-`)) activeEl.blur()
     }, 32)

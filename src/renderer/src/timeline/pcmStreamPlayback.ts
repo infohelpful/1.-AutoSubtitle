@@ -1,5 +1,6 @@
 import { PCM_BLOCK_SECONDS, PCM_MAX_RANGES, type PcmAudioBlock, type PcmRange, type PcmReader } from '../../../shared/pcmAudio'
 import type { ScheduledMediaSegment } from './playbackSchedule'
+import { audioOutputTime, waitForAudioOutput } from './audioOutputClock'
 
 type Fragment = { ctxStart: number; mediaStartSec: number; durationSec: number }
 type Piece = PcmRange
@@ -10,11 +11,11 @@ export class PcmStreamPlayback {
   private sources = new Set<AudioBufferSourceNode>()
   private timeline: Fragment[] = []
   private playing = false
+  private cancelDrain: (() => void) | null = null
   constructor(private ctx: AudioContext, private destination: AudioNode, private reader: PcmReader) {}
   isPlaying(): boolean { return this.playing }
-  currentMediaSec(): number | null {
+  currentMediaSec(now = audioOutputTime(this.ctx)): number | null {
     if (!this.playing) return null
-    const now=this.ctx.currentTime
     for (const piece of this.timeline) {
       if (now<piece.ctxStart) return null
       if (now<piece.ctxStart+piece.durationSec) return piece.mediaStartSec+(now-piece.ctxStart)
@@ -24,6 +25,8 @@ export class PcmStreamPlayback {
   }
   stop(): void {
     this.generation++
+    this.cancelDrain?.()
+    this.cancelDrain=null
     if (this.timer) clearInterval(this.timer)
     this.timer=null
     for (const source of this.sources) {
@@ -106,15 +109,19 @@ export class PcmStreamPlayback {
         source.disconnect()
         source.buffer=null
         if (!this.sources.size && !hasMore() && !filling) {
-          this.playing=false
           if (this.timer) clearInterval(this.timer)
           this.timer=null
-          onEnd()
+          this.cancelDrain=waitForAudioOutput(this.ctx,end,()=>{
+            if (!current()) return
+            this.playing=false
+            onEnd()
+          })
         } else if (!this.sources.size && (hasMore() || filling)) {
           fail(new Error('오디오 구간을 읽는 중 재생이 중단됐습니다. 다시 재생해 주세요.'))
         }
-        // Keep only the currently playing/future source-clock fragments.
-        this.timeline=this.timeline.filter(piece=>piece.ctxStart+piece.durationSec>end+1e-7)
+        // Released buffers may still be audible in the output device's queue.
+        const heard=audioOutputTime(this.ctx)
+        this.timeline=this.timeline.filter(piece=>piece.ctxStart+piece.durationSec>heard+1e-7)
       }
       source.start(nextTime,0,count/rate)
       nextTime=end

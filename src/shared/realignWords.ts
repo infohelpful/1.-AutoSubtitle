@@ -5,8 +5,7 @@ export type PreparedRealignCue = SubtitleLine & {
   wordGroups: Array<{ sourceIndex: number; ids: string[] }>
 }
 
-export function prepareRealignCue(line: SubtitleLine, requestId: string): PreparedRealignCue {
-  const seen = new Set<string>()
+export function prepareRealignCue(line: SubtitleLine, requestId: string, seen = new Set<string>()): PreparedRealignCue {
   const wordGroups: PreparedRealignCue['wordGroups'] = []
   const words = (line.words ?? []).flatMap((w, sourceIndex) => {
     if (w.isDeleted || w.isSilence || !w.word.trim()) return []
@@ -35,6 +34,29 @@ export function prepareRealignCue(line: SubtitleLine, requestId: string): Prepar
   })
   if (!words.length) throw new Error('재정렬할 발화 단어가 없습니다.')
   return { ...line, words, wordGroups }
+}
+
+export type RealignBatchEntry = { index: number; cue: PreparedRealignCue }
+
+/** Respect the worker's 100-cue/10,000-word limits and keep IDs unique across rows. */
+export function prepareRealignBatches(lines: readonly SubtitleLine[], requestId: string, targetIndex?: number): RealignBatchEntry[][] {
+  const batches: RealignBatchEntry[][] = []
+  const seen = new Set<string>()
+  let batch: RealignBatchEntry[] = [], count = 0
+  lines.forEach((line, index) => {
+    if (targetIndex !== undefined && targetIndex !== index) return
+    if (line.isDeleted || !line.words?.some(w => !w.isDeleted && !w.isSilence && w.word.trim())) return
+    const cue = prepareRealignCue(line, `${requestId}:line:${index}`, seen)
+    const size = cue.words!.length
+    if (size > 10000) throw new Error('한 줄의 단어가 너무 많습니다. 줄을 나눈 뒤 다시 정렬해 주세요.')
+    if (batch.length >= 100 || count + size > 10000) {
+      batches.push(batch); batch = []; count = 0
+    }
+    batch.push({ index, cue }); count += size
+  })
+  if (batch.length) batches.push(batch)
+  if (!batches.length) throw new Error('재정렬할 발화 단어가 없습니다.')
+  return batches
 }
 
 /** A whole response is accepted once or rejected. It must never overwrite new user edits. */

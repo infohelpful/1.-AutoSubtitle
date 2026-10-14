@@ -1,6 +1,7 @@
 import type { ScheduledMediaSegment } from './playbackSchedule'
 import type { PcmAudioBlock, PcmReader } from '../../../shared/pcmAudio'
 import { PcmStreamPlayback } from './pcmStreamPlayback'
+import { audioOutputTime, waitForAudioOutput } from './audioOutputClock'
 
 const EPS = 1e-4
 const SCHEDULE_LOOKAHEAD_SEC = 0.02
@@ -28,6 +29,7 @@ export class WebAudioMasterPlayback {
   private activeSources: AudioBufferSourceNode[] = []
   private timeline: WebAudioSchedulePiece[] = []
   private playingFlag = false
+  private cancelDrain: (() => void) | null = null
   private scheduleSeq = 0
   private playbackRequest = 0
   private loadRequest = 0
@@ -190,9 +192,12 @@ export class WebAudioMasterPlayback {
              * 마지막 BufferSource 종료 — 이 스케줄이 자연 종료된 경우(외부 `stopPlayback` 으로 갈아탄
              * 것이 아닌 경우)에만 콜백 1회 통지. `scheduleSeq` 가 그대로면 stop 도 새 스케줄도 안 일어났다.
              */
-            this.playingFlag = false
-            const cb = this.onScheduleEnded
-            if (cb) cb(thisScheduleId, 'natural')
+            const last = this.timeline.at(-1)!
+            this.cancelDrain = waitForAudioOutput(ctx, last.ctxStart + last.durationSec, () => {
+              if (this.scheduleSeq !== thisScheduleId) return
+              this.playingFlag = false
+              this.onScheduleEnded?.(thisScheduleId, 'natural')
+            })
           }
         }
         wall += dur
@@ -204,12 +209,12 @@ export class WebAudioMasterPlayback {
     }
   }
 
-  /** AudioContext 현재 시각 기준 재생 중이면 해당 미디어 타임(sec), 아니면 null */
+  /** Output device clock mapped back to source-media seconds. */
   getCurrentMediaSec(ctxNow?: number): number | null {
-    if (this.stream) return this.stream.currentMediaSec()
+    if (this.stream) return this.stream.currentMediaSec(ctxNow)
     const ctx = this.ctx
     if (!ctx || !this.playingFlag || this.timeline.length === 0) return null
-    const now = ctxNow ?? ctx.currentTime
+    const now = ctxNow ?? audioOutputTime(ctx)
     for (const frag of this.timeline) {
       const fragEnd = frag.ctxStart + frag.durationSec
       if (now + 1e-4 < frag.ctxStart) return null
@@ -221,7 +226,9 @@ export class WebAudioMasterPlayback {
 
   stopPlayback(): void {
     this.playbackRequest += 1
-    const hadActive = this.activeSources.length > 0 || this.stream?.isPlaying() === true
+    this.cancelDrain?.()
+    this.cancelDrain = null
+    const hadActive = this.playingFlag || this.activeSources.length > 0 || this.stream?.isPlaying() === true
     this.stream?.stop()
     this.stream=null
     const stoppedScheduleId = this.scheduleSeq

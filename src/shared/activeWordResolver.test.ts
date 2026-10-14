@@ -100,7 +100,7 @@ describe('resolveHighlightWordIndex (화면에 보이는 하이라이트)', () =
 
   it('keeps the last word highlighted after it ends, but only for the hold time', () => {
     expect(resolveHighlightWordIndex(words, 5)).toBe(2)
-    expect(resolveHighlightWordIndex(words, 5 + HIGHLIGHT_HOLD_SEC)).toBe(2)
+    expect(resolveHighlightWordIndex(words, 5 + HIGHLIGHT_HOLD_SEC)).toBe(-1)
     expect(resolveHighlightWordIndex(words, 5 + HIGHLIGHT_HOLD_SEC + 0.01)).toBe(-1)
   })
 
@@ -115,10 +115,11 @@ describe('resolveHighlightWordIndex (화면에 보이는 하이라이트)', () =
     expect(resolveHighlightWordIndex(sparse, 4.9)).toBe(-1)
   })
 
-  it('lights the first word slightly early when nothing precedes it', () => {
+  it('does not highlight an unspoken first word, even when its row is already visible', () => {
     const line = [{ start: 10, end: 10.5 }, { start: 10.5, end: 11 }]
-    expect(resolveHighlightWordIndex(line, 10 - HIGHLIGHT_LEAD_SEC + 0.01)).toBe(0)
-    expect(resolveHighlightWordIndex(line, 10 - HIGHLIGHT_LEAD_SEC - 0.01)).toBe(-1)
+    expect(resolveHighlightWordIndex(line, 9.5)).toBe(-1)
+    expect(resolveHighlightWordIndex(line, 9.999)).toBe(-1)
+    expect(resolveHighlightWordIndex(line, 10)).toBe(0)
   })
 
   it('prefers the most recently started word when words overlap', () => {
@@ -129,16 +130,16 @@ describe('resolveHighlightWordIndex (화면에 보이는 하이라이트)', () =
     ]
     expect(resolveHighlightWordIndex(overlap, 0.5)).toBe(0)
     expect(resolveHighlightWordIndex(overlap, 1.5)).toBe(1)
-    // 겹친 단어가 끝난 뒤에는 아직 남은 긴 단어로 돌아간다.
-    expect(resolveHighlightWordIndex(overlap, 2.5)).toBe(0)
+    // An old overlong ASR span must not take the highlight back.
+    expect(resolveHighlightWordIndex(overlap, 2.5)).toBe(1)
   })
 
-  it('holds the word that ended last, not the one listed last', () => {
+  it('does not revive an earlier word after the later word hold expires', () => {
     const mixed = [
       { start: 0, end: 4 },
       { start: 1, end: 2 }
     ]
-    expect(resolveHighlightWordIndex(mixed, 4.3)).toBe(0)
+    expect(resolveHighlightWordIndex(mixed, 4.3)).toBe(-1)
   })
 
   it('skips deleted and silence words by default and can opt in', () => {

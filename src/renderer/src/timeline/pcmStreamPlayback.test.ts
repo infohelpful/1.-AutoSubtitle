@@ -29,6 +29,28 @@ function setup() {
   return {stream,ctx,nodes,buffers,reader,ended,error}
 }
 afterEach(()=>vi.useRealTimers())
+it('keeps the audible tail and cut position after the render head releases a buffer', async () => {
+  const s=setup()
+  Object.assign(s.ctx,{outputLatency:.08})
+  await s.stream.start('pcm',info,[{clipId:0,startMediaSec:300,endMediaSec:306},{clipId:1,startMediaSec:310,endMediaSec:311}],300,null,s.ended,s.error)
+  await vi.advanceTimersByTimeAsync(0)
+  s.ctx.currentTime=6.03
+  s.nodes[0].onended!()
+  expect(s.nodes[0].buffer).toBeNull()
+  expect(s.stream.currentMediaSec()).toBeCloseTo(305.93)
+  s.ctx.currentTime=6.11
+  expect(s.stream.currentMediaSec()).toBeCloseTo(310.01)
+  s.ctx.currentTime=7.02
+  s.nodes[1].onended!()
+  expect(s.stream.isPlaying()).toBe(true)
+  expect(s.stream.currentMediaSec()).toBeCloseTo(310.92)
+  expect(s.ended).not.toHaveBeenCalled()
+  s.ctx.currentTime=7.10
+  await vi.advanceTimersByTimeAsync(100)
+  expect(s.ended).toHaveBeenCalledOnce()
+  s.stream.stop()
+  expect(vi.getTimerCount()).toBe(0)
+})
 it('concatenates cuts at exact samples while its clock follows source positions',async () => {
   const s=setup()
   await s.stream.start('pcm',info,[{clipId:0,startMediaSec:0,endMediaSec:2},{clipId:1,startMediaSec:4,endMediaSec:20}],.5,9,s.ended,s.error)

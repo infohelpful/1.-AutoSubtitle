@@ -15,7 +15,7 @@ import {
 } from 'react'
 import type { JsonWaveformData } from 'peaks.js'
 import { editSubtitleText } from '../../shared/editSubtitleText'
-import { prepareRealignCue, mergeRealignedCue } from '../../shared/realignWords'
+import { prepareRealignBatches, mergeRealignedCue } from '../../shared/realignWords'
 import { ensureWordIdentities } from '../../shared/wordIdentity'
 import { setWordReading } from '../../shared/wordReading'
 import { subtitleLinesMeaningfullyChanged } from '../../shared/subtitleEditHistory'
@@ -115,6 +115,7 @@ import {
 import { pickActiveSubtitleIndex } from '../../shared/subtitlePresentation'
 import { resolveHighlightWordIndex } from '../../shared/activeWordResolver'
 import { WebAudioMasterPlayback } from './timeline/webAudioMasterPlayback'
+import { videoFollowRate } from './timeline/audioOutputClock'
 import { useVideoSeekUi } from './sync/useVideoSeekUi'
 
 type OverlayPhase = 'working' | 'success' | 'error'
@@ -1048,7 +1049,7 @@ export default function App(): ReactElement {
    */
   const wordHighlightChipsCacheRef = useRef<{
     cardIdx: number | null
-    chips: Array<{ el: HTMLElement; s: number; e: number; start: number; end: number }>
+    chips: Array<{ el: HTMLElement; s: number; e: number; start: number; end: number; isSilence: boolean }>
   }>({ cardIdx: null, chips: [] })
   /**
    * **재생 세션 perf 측정** — 한 번의 단어 재생(`isPlaying` true→false) 단위로
@@ -1971,19 +1972,19 @@ export default function App(): ReactElement {
           cache.cardIdx !== ai || cache.chips.length === 0 || !cache.chips[0]!.el.isConnected
         if (cacheStale) {
           const cardEl = document.getElementById(`subtitle-card-${ai}`)
-          const collected: Array<{ el: HTMLElement; s: number; e: number; start: number; end: number }> = []
+          const collected: Array<{ el: HTMLElement; s: number; e: number; start: number; end: number; isSilence: boolean }> = []
           if (cardEl) {
             cardEl.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
               const s = parseFloat(el.dataset.wordStart ?? 'NaN')
               const e = parseFloat(el.dataset.wordEnd ?? 'NaN')
-              if (Number.isFinite(s) && Number.isFinite(e)) collected.push({ el, s, e, start: s, end: e })
+              if (Number.isFinite(s) && Number.isFinite(e)) collected.push({ el, s, e, start: s, end: e, isSilence: el.classList.contains('subtitle-word-chip--silence') })
             })
           }
           cache = { cardIdx: ai, chips: collected }
           wordHighlightChipsCacheRef.current = cache
         }
         // 목록·번인 내보내기와 같은 규칙: 틈에서는 직전 단어 강조를 잠시 유지한다.
-        const hit = resolveHighlightWordIndex(cache.chips, t, { skipDeleted: false, skipSilence: false })
+        const hit = resolveHighlightWordIndex(cache.chips, t)
         const nextChip: HTMLElement | null = hit >= 0 ? cache.chips[hit]!.el : null
         const prevChip = wordHighlightActiveChipElRef.current
         if (prevChip !== nextChip) {
@@ -2142,6 +2143,7 @@ export default function App(): ReactElement {
         return false
       }
       const editStart = clampProgramEditSec(targetEditSec)
+      el.playbackRate = 1
       const targetMediaSec = mapEditToMediaSec(editStart)
       commitEditSecToUi(editStart)
       userPauseRequestedRef.current = false
@@ -4819,6 +4821,7 @@ export default function App(): ReactElement {
       }
 
       const targetMediaSec = mapEditToMediaSec(editResolved)
+      el.playbackRate = 1
       let videoT = Math.max(0, targetMediaSec)
       if (Number.isFinite(el.duration) && el.duration > 0) {
         videoT = Math.min(videoT, Math.max(0, el.duration - 0.001))
@@ -5042,8 +5045,13 @@ export default function App(): ReactElement {
    */
   const importScriptFile = useCallback(async () => {
     if (!videoPath || isExtracting || projectIoBusy || realigning) return
+    const snapshot = subtitlesRef.current
     const file = await window.api.openScriptFile()
     if (file.canceled) return
+    if (alignmentMediaRef.current !== videoPath || subtitlesRef.current !== snapshot) {
+      setAlignmentNotice('파일을 여는 동안 영상이나 자막이 바뀌었습니다. 다시 가져와 주세요.')
+      return
+    }
     if (!file.ok) {
       setAlignmentNotice(`파일을 읽지 못했습니다: ${file.reason}`)
       return
@@ -5063,7 +5071,7 @@ export default function App(): ReactElement {
     let summary: string
     if (cues.length > 0) {
       nextLines = srtCuesToSubtitleLines(cues)
-      summary = `자막 ${nextLines.length}줄을 가져왔습니다. 단어 시간은 줄 시간 안에서 추정한 값이므로 필요하면 "현재 줄 싱크 재정렬"로 다듬어 주세요.`
+      summary = `자막 ${nextLines.length}줄을 가져왔습니다. 단어 시간은 추정값입니다. "전체 자막 싱크 재정렬"로 음성에 맞출 수 있습니다.`
     } else {
       const sentences = splitScriptText(file.text, scriptSplit)
       const aligned = alignScriptToTimedLines(sentences, current)
@@ -5073,7 +5081,7 @@ export default function App(): ReactElement {
       }
       nextLines = aligned.lines
       const { matched, scriptTokens, interpolated } = aligned.stats
-      summary = `대본 ${nextLines.length}줄을 가져왔습니다 (단어 ${scriptTokens}개 중 ${matched}개는 음성 인식 시간 사용, ${interpolated}개는 보간). 검토가 필요한 단어는 "현재 줄 싱크 재정렬"로 맞춰 주세요.`
+      summary = `대본 ${nextLines.length}줄을 가져왔습니다 (단어 ${scriptTokens}개 중 ${matched}개는 음성 인식 시간 사용, ${interpolated}개는 보간). "전체 자막 싱크 재정렬"로 음성에 맞출 수 있습니다.`
     }
     if (nextLines.length === 0) {
       setAlignmentNotice('가져올 자막이 없습니다.')
@@ -5117,36 +5125,47 @@ export default function App(): ReactElement {
     }
   }, [videoPath])
 
-  const realignCurrentLine = useCallback(async (targetIndex?: number, wordIds?: string[]) => {
-    if (!videoPath || realigning || isExtracting) return
+  const realignCurrentLine = useCallback(async (targetIndex?: number | 'all', wordIds?: string[]) => {
+    if (!videoPath || realigning || alignmentRequestRef.current || isExtracting || projectIoBusy) return
     const snapshot = subtitlesRef.current
-    const index = targetIndex ?? waveformLineIndex ?? activeSubtitleIndexRef.current ?? 0
-    const line = snapshot[index]
-    if (!line) return
+    const index = targetIndex === 'all' ? undefined : targetIndex ?? waveformLineIndex ?? activeSubtitleIndexRef.current ?? 0
+    if (index !== undefined && !snapshot[index]) return
     pausePlayback('realign')
     const requestId = crypto.randomUUID()
     const revision = ++alignmentRevisionRef.current
     alignmentRequestRef.current = requestId
     setRealigning(true)
-    setAlignmentNotice(`${index + 1}번 줄${wordIds ? '의 선택 단어' : ''} 싱크를 다시 맞추고 있습니다…`)
     try {
-      const cue = prepareRealignCue(line, requestId)
-      const result = await window.api.realignWords({ requestId, revision, timelineId: videoPath, path: videoPath, cues: [cue] })
-      if (alignmentRequestRef.current !== requestId) return
-      if (!result.ok) throw new Error(result.reason)
-      if (result.requestId !== requestId || result.revision !== revision || result.timelineId !== videoPath ||
-          alignmentMediaRef.current !== videoPath || subtitlesRef.current !== snapshot) {
-        setAlignmentNotice('정렬 중 자막이나 영상이 바뀌어 결과를 적용하지 않았습니다.')
-        return
-      }
-      if (result.subtitles.length !== 1) throw new Error('정렬 결과 줄 수가 다릅니다.')
+      const batches = prepareRealignBatches(snapshot, requestId, index)
+      const total = batches.reduce((sum, batch) => sum + batch.length, 0)
       const selectedIds = wordIds ? new Set(wordIds) : undefined
-      const nextLine = mergeRealignedCue(line, cue, result.subtitles[0], selectedIds)
+      const next = [...snapshot]
+      let completed = 0, reviewWords = 0
+      for (const batch of batches) {
+        setAlignmentNotice(index === undefined
+          ? `전체 자막 싱크 정렬 중 · ${completed}/${total}줄 완료…`
+          : `${index + 1}번 줄${wordIds ? '의 선택 단어' : ''} 싱크를 다시 맞추고 있습니다…`)
+        const result = await window.api.realignWords({ requestId, revision, timelineId: videoPath, path: videoPath,
+          cues: batch.map(entry => entry.cue) })
+        if (alignmentRequestRef.current !== requestId) return
+        if (!result.ok) throw new Error(result.reason)
+        if (result.requestId !== requestId || result.revision !== revision || result.timelineId !== videoPath ||
+            alignmentMediaRef.current !== videoPath || subtitlesRef.current !== snapshot) {
+          setAlignmentNotice('정렬 중 자막이나 영상이 바뀌어 결과를 적용하지 않았습니다.')
+          return
+        }
+        if (result.subtitles.length !== batch.length) throw new Error('정렬 결과 줄 수가 다릅니다.')
+        batch.forEach(({index: row, cue}, i) => {
+          next[row] = mergeRealignedCue(snapshot[row], cue, result.subtitles[i], selectedIds)
+          reviewWords += (next[row].words ?? []).filter(word => !word.isDeleted && !word.isSilence && word.reviewReasons?.length &&
+            (!selectedIds || selectedIds.has(word.id ?? '') || selectedIds.has(word.parentWordId ?? ''))).length
+        })
+        completed += batch.length
+      }
+      // A cancelled/failed batch never leaves a partly realigned project behind.
       applySubtitleChange(prev => prev.length === snapshot.length && prev.every((item, i) => item === snapshot[i])
-        ? prev.map((item, i) => i === index ? nextLine : item) : prev)
-      const reviewWords = (nextLine.words ?? []).filter(word => !word.isDeleted && !word.isSilence && word.reviewReasons?.length &&
-        (!selectedIds || selectedIds.has(word.id ?? '') || selectedIds.has(word.parentWordId ?? ''))).length
-      setAlignmentNotice(`정렬 완료 · 검토 필요 ${reviewWords}개. 실행 취소로 되돌릴 수 있습니다.`)
+        ? next : prev)
+      setAlignmentNotice(`${total}줄 정렬 완료 · 검토 필요 ${reviewWords}개. 실행 취소로 되돌릴 수 있습니다.`)
     } catch (error) {
       if (alignmentRequestRef.current === requestId) setAlignmentNotice(error instanceof Error ? error.message : String(error))
     } finally {
@@ -5155,7 +5174,7 @@ export default function App(): ReactElement {
         setRealigning(false)
       }
     }
-  }, [videoPath, realigning, isExtracting, waveformLineIndex, pausePlayback, applySubtitleChange])
+  }, [videoPath, realigning, isExtracting, projectIoBusy, waveformLineIndex, pausePlayback, applySubtitleChange])
 
   /**
    * **재생 세션 perf 초기화 / emit** — isPlaying 만 의존하므로 mid-playback 의 viewWin /
@@ -5372,6 +5391,7 @@ export default function App(): ReactElement {
             timelineEditLog('playback', 'Master Sync (RAF)', { delta: vd, wa: true })
             el.currentTime = tWa
           }
+          el.playbackRate = el.seeking ? 1 : videoFollowRate(tWa, el.currentTime)
           const editWa = mapMediaToEditSec(tWa)
           wrappedCommit('wa-master', editWa)
           maybePlaybackTrace('wa-master', tWa, editWa, { wm: wm != null ? r4(wm) : null })
@@ -5394,6 +5414,7 @@ export default function App(): ReactElement {
       }
 
       if (masterAudio.paused) {
+        el.playbackRate = 1
         if (perfTick.active) {
           perfTick.branches['masterPaused'] =
             (perfTick.branches['masterPaused'] ?? 0) + 1
@@ -5681,6 +5702,7 @@ export default function App(): ReactElement {
     syncPausedMasterToEdit(editClamped)
   }, [
     clampProgramEditSec,
+    displayTimelineMapping,
     toMediaSeekSec,
     syncPausedMasterToEdit,
     clearPlaybackSession,
@@ -5692,9 +5714,9 @@ export default function App(): ReactElement {
 
   const onSeekChange = useCallback(
     (e: ChangeEvent<HTMLInputElement>) => {
-      applySeekValue(String(displayTimelineMapping.programToMediaSec(Number(e.target.value))))
+      applySeekValue(e.target.value)
     },
-    [applySeekValue, displayTimelineMapping]
+    [applySeekValue]
   )
 
   /** 드래그 중(input) — scrubToVirtualMs (낙관적 UI + 비디오 currentTime 스로틀) */
@@ -7162,6 +7184,11 @@ export default function App(): ReactElement {
                   <button type="button" className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
                     disabled={!videoPath || !subtitles.length || isExtracting || projectIoBusy} onClick={realigning ? cancelRealignment : () => void realignCurrentLine()}>
                     {realigning ? '정렬 취소' : '현재 줄 싱크 재정렬'}
+                  </button>
+                  <button type="button" className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
+                    disabled={!videoPath || !subtitles.length || isExtracting || projectIoBusy || realigning}
+                    onClick={() => void realignCurrentLine('all')}>
+                    전체 자막 싱크 재정렬
                   </button>
                   <button type="button" className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
                     disabled={!subtitles.length || isExtracting || projectIoBusy}

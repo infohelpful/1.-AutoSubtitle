@@ -1,5 +1,6 @@
-import { HIGHLIGHT_LEAD_SEC } from './activeWordResolver'
 import type { SubtitleLine } from './subtitles'
+
+const SUBTITLE_ROW_LEAD_SEC = 0.6
 
 export type SubtitlePresentationSpan = { index: number; start: number; end: number }
 const cache = new WeakMap<readonly SubtitleLine[], SubtitlePresentationSpan[]>()
@@ -39,7 +40,7 @@ export function subtitlePresentationSpans(lines: readonly SubtitleLine[]): Subti
       return [{ index, silenceOnly, start: Math.min(...visible.map(word => word.start)), end: Math.max(...visible.map(word => word.end)) }]
     }
     // 줄 시작(Whisper 구간 시작)이 첫 발화 단어보다 훨씬 앞서면, 말하기 전 침묵 동안 다음 문장 자막이 먼저 떠 있게 된다.
-    // 첫 발화 단어 바로 앞(HIGHLIGHT_LEAD_SEC)부터 보이게 한다.
+    // 첫 발화 단어 바로 앞(SUBTITLE_ROW_LEAD_SEC)부터 보이게 한다.
     if (!silenceOnly) {
       const speechStarts = line.words
         ?.filter(word => !word.isDeleted && !word.isSilence && word.word.trim() !== '' && word.word.trim() !== '--')
@@ -47,8 +48,8 @@ export function subtitlePresentationSpans(lines: readonly SubtitleLine[]): Subti
         .filter(Number.isFinite)
       if (speechStarts?.length) {
         const first = Math.min(...speechStarts)
-        if (line.start < first - HIGHLIGHT_LEAD_SEC) {
-          return [{ index, silenceOnly, start: first - HIGHLIGHT_LEAD_SEC, end: line.end }]
+        if (line.start < first - SUBTITLE_ROW_LEAD_SEC) {
+          return [{ index, silenceOnly, start: first - SUBTITLE_ROW_LEAD_SEC, end: line.end }]
         }
       }
     }

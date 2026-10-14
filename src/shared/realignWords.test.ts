@@ -1,10 +1,23 @@
 import { expect, it } from 'vitest'
-import { prepareRealignCue, mergeRealignedCue } from './realignWords'
+import { prepareRealignCue, prepareRealignBatches, mergeRealignedCue } from './realignWords'
 const line = { start: 0, end: 3, text: '말', words: [
   { start: 0, end: 1, word: '--', isSilence: true },
   { start: 1, end: 2, word: '말', manualStartLocked: true },
   { start: 2, end: 3, word: '삭제', isDeleted: true }
 ] }
+it('batches a whole project with unique IDs while skipping quiet and deleted rows', () => {
+  const lines = Array.from({length: 201}, (_, i) => ({start: i, end: i + 1, text: '말',
+    words: [{id: 'duplicate', start: i, end: i + 1, word: '말'}]}))
+  const batches = prepareRealignBatches([...lines, {...line, isDeleted: true},
+    {start: 202, end: 203, text: '', words: [{start: 202, end: 203, word: '--', isSilence: true}]}], 'job')
+  expect(batches.map(b => b.length)).toEqual([100, 100, 1])
+  const entries = batches.flat()
+  expect(entries.map(e => e.index)).toEqual(Array.from({length: 201}, (_, i) => i))
+  const ids = entries.flatMap(e => e.cue.words!.map(w => w.id))
+  expect(new Set(ids).size).toBe(201)
+  expect(lines.every(l => l.words[0].id === 'duplicate')).toBe(true)
+  expect(prepareRealignBatches(lines, 'single', 200).flat().map(e => e.index)).toEqual([200])
+})
 it('preserves silence/deleted slots and locked edges while assigning stable identity', () => {
   const request = prepareRealignCue(line, 'r1')
   const returned = { ...request, words: request.words!.map(w => ({ ...w, end: 1.8 })) }

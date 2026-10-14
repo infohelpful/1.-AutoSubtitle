@@ -53,6 +53,7 @@ import type { PcmRange } from '../shared/pcmAudio'
 import { fingerprintMedia, saveProjectDocument } from './projectStorage'
 import { clipPlanFromCuts, mapSourceIntervalToProgram, programDuration, validateClipPlan } from '../shared/clipPlan'
 import { randomUUID } from 'node:crypto'
+import { decodeTextBuffer } from '../shared/scriptImport'
 import type {
   CutRange,
   ExportFormat,
@@ -61,8 +62,12 @@ import type {
   ExportSubtitleStyle,
   FfmpegCapabilities,
   RealignRequest,
-  RealignResult
+  RealignResult,
+  ScriptOpenResult
 } from '../shared/ipc'
+
+/** 대본·SRT 파일 읽기 상한(바이트) */
+const SCRIPT_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 let mainWindow: BrowserWindow | null = null
 let sidecar: PythonSidecar | null = null
@@ -1132,6 +1137,32 @@ if (ownsProfile) app.whenReady().then(async () => {
     const abs = filePaths[0]
     const content = readFileSync(abs, 'utf8')
     return { canceled: false as const, path: abs, content }
+  })
+
+  ipcMain.handle('script:open', async (event): Promise<ScriptOpenResult> => {
+    const win = dialogParentWindow(event)
+    if (!win) throw new Error('윈도우를 찾지 못했습니다.')
+    prepareDialogParent(win)
+    const { canceled, filePaths } = await dialog.showOpenDialog(win ?? undefined, {
+      title: '대본 또는 자막 파일 가져오기',
+      properties: ['openFile'],
+      filters: [
+        { name: '대본·자막', extensions: ['txt', 'srt', 'vtt'] },
+        { name: '모든 파일', extensions: ['*'] }
+      ]
+    })
+    if (canceled || !filePaths?.[0]) return { canceled: true }
+    const abs = filePaths[0]
+    try {
+      const buf = await readFile(abs)
+      if (buf.byteLength > SCRIPT_FILE_MAX_BYTES) {
+        return { canceled: false, ok: false, reason: '파일이 너무 큽니다(최대 8MB).' }
+      }
+      const { text, encoding } = decodeTextBuffer(buf)
+      return { canceled: false, ok: true, path: abs, name: parse(abs).base, text, encoding }
+    } catch (e) {
+      return { canceled: false, ok: false, reason: e instanceof Error ? e.message : String(e) }
+    }
   })
 
   ipcMain.handle('project:save', async (_event, payload: unknown) => {

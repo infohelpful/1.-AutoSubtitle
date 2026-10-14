@@ -36,7 +36,7 @@ import {
 import type { SubtitleRow } from './components/vrewPeaksEditor/types'
 import { computeLineZoomWindowFromCardBounds, type LineZoomWindowResult } from './lineZoomWindow'
 import type { PeaksZoomViewRange } from './SubtitleWaveformPeaks'
-import { isTimeInWordSpan, resolveActiveWordIndex } from '../../shared/activeWordResolver'
+import { isTimeInWordSpan, resolveHighlightWordIndex } from '../../shared/activeWordResolver'
 import { displayTextFromSubtitleWords } from '../../shared/subtitles'
 import { SILENCE_PLACEHOLDER_TEXT, scrubTimelineNoiseFromWordPiece } from '../../shared/wordContract'
 import { useSubtitleData } from './subtitleDataContext'
@@ -850,12 +850,16 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     const playing = isPlaying
     const mount = articleRef.current
     if (!mount) return
+    // App.commitEditSecToUi 와 같은 규칙(틈에서는 직전 단어 유지)으로, 행이 (재)마운트될 때 강조를 맞춘다.
+    const chips: Array<{ el: HTMLElement; start: number; end: number }> = []
     mount.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
       const s = parseFloat(el.dataset.wordStart ?? el.getAttribute('data-word-start') ?? 'NaN')
       const e = parseFloat(el.dataset.wordEnd ?? el.getAttribute('data-word-end') ?? 'NaN')
       if (!Number.isFinite(s) || !Number.isFinite(e)) return
-      el.classList.toggle('subtitle-word-chip--active', playing && isTimeInWordSpan(t, s, e))
+      chips.push({ el, start: s, end: e })
     })
+    const hit = playing ? resolveHighlightWordIndex(chips, t, { skipDeleted: false, skipSilence: false }) : -1
+    chips.forEach((chip, i) => chip.el.classList.toggle('subtitle-word-chip--active', i === hit))
   }, [wordRail, index, playheadSecRef])
 
   useEffect(() => {
@@ -863,7 +867,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     const id = window.setInterval(() => {
       const playheadSec = playheadSecRef.current
       const words = wordRail
-      const wi = resolveActiveWordIndex(words, playheadSec, { skipDeleted: false, skipSilence: false })
+      const wi = resolveHighlightWordIndex(words, playheadSec, { skipDeleted: false, skipSilence: false })
 
       const root = articleRef.current
       const focused = document.activeElement as HTMLElement | null

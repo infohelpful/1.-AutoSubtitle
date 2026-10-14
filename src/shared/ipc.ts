@@ -138,6 +138,12 @@ export type ProjectOpenResult =
   | { canceled: true }
   | { canceled: false; path: string; content: string }
 
+/** 대본(.txt)·자막(.srt/.vtt) 파일 열기 — 인코딩은 메인에서 감지해 디코드한다 */
+export type ScriptOpenResult =
+  | { canceled: true }
+  | { canceled: false; ok: true; path: string; name: string; text: string; encoding: string }
+  | { canceled: false; ok: false; reason: string }
+
 /** 다른 이름으로 저장 대화상자 후 저장 */
 export type ProjectSaveAsResult =
   | { canceled: true }
@@ -209,6 +215,8 @@ export type SidecarApi = {
   notifySubtitleRenderReady: () => void
   /** `.autosub` JSON 열기 */
   openProjectFile: () => Promise<ProjectOpenResult>
+  /** 대본(.txt) 또는 자막(.srt/.vtt) 파일 선택·읽기 */
+  openScriptFile: () => Promise<ScriptOpenResult>
   /** 현재 경로에 덮어쓰기 (UTF-8, BOM 없음) */
   saveProjectFile: (path: string, content: string) => Promise<ProjectSaveResult>
   /** 저장 대화상자로 새 경로에 저장 */

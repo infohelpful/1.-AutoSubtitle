@@ -43,3 +43,8 @@ node scripts/e2e-cdp/character-edit.mjs        # 글자 삭제·textarea focus·
 - `node scripts/e2e-cdp/cache-startup.mjs`: build 후 실행. 포트 9334의 새 격리 프로필을 생성하고 시작 시 오래된 캐시/work 정리·무관한 파일 보존·중복 앱 종료·활성 캐시 보존을 확인한 뒤 종료한다. `real-video-fixture.autosub`가 필요하다. 용량/LRU·변경 감지·링크 제외는 `mediaCacheRetention.test.ts`의 작은 파일 예산으로 검사한다.
 - `python -B scripts/rms-stream-bench.py --media <영상> --ffmpeg <실행 파일>`: 모델 없이 RMS 전체 길이를 블록 처리하고 frame/kernel 크기·추적 메모리를 출력한다. 짧은 fixture에만 `--compare`를 추가하면 이전 전체 오디오 mask와 비교한다. 추적 수치는 앱/모델/FFmpeg 전체 RSS가 아니다.
 - `scripts/frozen-sidecar-smoke.py`: 실제 패키징된 helper에서 로컬 모델을 사용한 전사/파형/빠른 보정/선택적인 외부 정밀 정렬을 검증한다. 인자/환경/한계는 `docs/sidecar-packaging.md` 참조.
+
+자막 줄바꿈·가져오기 / 하이라이트 연속성:
+
+- `linebreak-import.mjs [포트]`: `launch-test-app.cjs` 를 `AUTOSUBTITLE_E2E_OPEN_QUEUE=[프로젝트, .srt, 대본.txt]` 로 띄운 뒤 실행한다. 자동 줄바꿈, SRT(UTF-8 BOM) 가져오기, 대본(CP949) 가져오기를 실제 UI 로 검사한다.
+- `highlight-continuity.mjs [포트] [재생초] [시작초]`: 지정한 위치부터 재생하면서 "자막이 보이는데 단어 하이라이트가 없는 시간"을 40ms 간격으로 잰다. 목록은 재생 위치를 따라가지 않으므로 스크립트가 활성 카드를 미리 마운트한다. `AUTOSUBTITLE_E2E_PROJECT` 의 줄 구간으로 카드 위치를 추정한다.

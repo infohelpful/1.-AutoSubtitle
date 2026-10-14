@@ -3,12 +3,12 @@
  *
  * - 시간 축: 입력 cue/word 는 원본(source) 초, 출력은 program 프레임이다. 컷·순서·반복은 `ProgramClip` 으로만 표현한다.
  * - 프레임 n 의 상태는 `t = n / fps`(프레임 시작 시각)에서 판정한다. FFmpeg raw 오버레이의 프레임 선택과 같다.
- * - 단어 활성은 `activeWordResolver` 를 그대로 쓴다. 줄 표시 구간(cue)과 발화 구간(word)은 분리되어
- *   마지막 단어 뒤·단어 사이 무음에서는 줄은 보이고 강조만 꺼진다.
+ * - 단어 강조는 `resolveHighlightWordIndex` 를 쓴다(목록 칩 강조와 같은 규칙). 단어 사이 틈·마지막 단어 뒤에서는
+ *   직전 단어 강조를 `HIGHLIGHT_HOLD_SEC` 까지 유지하고, 그보다 긴 침묵에서만 줄은 보이고 강조만 꺼진다.
  * - 프레임에 닿지 않는 짧은 구간은 상태로 만들지 않는다. 동일 상태를 여러 번 캡처하지 않도록 구간을 합친다.
  */
 import type { ProgramClip } from './clipPlan'
-import { resolveActiveWordIndex } from './activeWordResolver'
+import { HIGHLIGHT_HOLD_SEC, HIGHLIGHT_LEAD_SEC, resolveHighlightWordIndex } from './activeWordResolver'
 
 /** 부동소수 경계 보정(초). 1µs 이하 오차는 같은 시각으로 본다. */
 const EDGE_EPS_SEC = 1e-6
@@ -114,14 +114,20 @@ export function buildRenderSchedule(args: BuildRenderScheduleArgs): RenderState[
 
     const boundaries = new Set<number>([first])
     for (const w of words) {
-      for (const f of [toProgramFrame(w.start), toProgramFrame(w.end)]) {
+      // 단어 시작·끝, 그리고 끝난 뒤 유지가 풀리는 시각(끝 + 유지 시간)에서 상태가 바뀔 수 있다.
+      for (const f of [
+        toProgramFrame(w.start - HIGHLIGHT_LEAD_SEC),
+        toProgramFrame(w.start),
+        toProgramFrame(w.end),
+        toProgramFrame(w.end + HIGHLIGHT_HOLD_SEC)
+      ]) {
         if (f > first && f < last) boundaries.add(f)
       }
     }
     const starts = [...boundaries].sort((a, b) => a - b)
     const activeAt = (frame: number): number => {
       const sourceSec = clip.sourceStart + (frame / fps + EDGE_EPS_SEC - clip.programStart)
-      return resolveActiveWordIndex(words, sourceSec)
+      return resolveHighlightWordIndex(words, sourceSec)
     }
     let run: RenderState | null = null
     for (let i = 0; i < starts.length; i += 1) {

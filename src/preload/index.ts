@@ -17,7 +17,8 @@ import {
   type ProjectSaveResult,
   type WaveformPeaksCachePathResult,
   type RealignRequest,
-  type RealignResult
+  type RealignResult,
+  type ScriptOpenResult
 } from '../shared/ipc'
 
 const CH_PROGRESS = 'model:download-progress'
@@ -141,6 +142,7 @@ contextBridge.exposeInMainWorld('api', {
   },
   fingerprintMedia: (path: string) => ipcRenderer.invoke('project:fingerprint', path),
   openProjectFile: () => ipcRenderer.invoke('project:open') as Promise<ProjectOpenResult>,
+  openScriptFile: () => ipcRenderer.invoke('script:open') as Promise<ScriptOpenResult>,
   saveProjectFile: (path: string, content: string) =>
     ipcRenderer.invoke('project:save', { path, content }) as Promise<ProjectSaveResult>,
   saveProjectFileAs: (content: string, defaultPath?: string) =>

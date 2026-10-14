@@ -63,6 +63,14 @@ import { buildExportCueLines } from '../../shared/exportCuePipeline'
 import { applyProgramTimeRangeTombstoneCutToSubtitleLines } from '../../shared/subtitleTombstoneCut'
 import { getSubtitleBoxChromeInline } from '../../shared/subtitleBoxChrome'
 import { splitWordTextAtMediaCut } from '../../shared/subtitleWordTextSplit'
+import { DEFAULT_MAX_LINE_UNITS, breakSubtitleLines } from '../../shared/lineBreak'
+import {
+  alignScriptToTimedLines,
+  parseSubtitleCues,
+  splitScriptText,
+  srtCuesToSubtitleLines,
+  type ScriptSplitOptions
+} from '../../shared/scriptImport'
 import { mergeEmptySubtitleWithPrevious, splitSubtitleLine } from './subtitleEditOps'
 import { SubtitleVirtualList } from './SubtitleVirtualList'
 import { SubtitleDataProvider } from './subtitleDataContext'
@@ -105,6 +113,7 @@ import {
   type ScheduledMediaSegment
 } from './timeline/playbackSchedule'
 import { pickActiveSubtitleIndex } from '../../shared/subtitlePresentation'
+import { resolveHighlightWordIndex } from '../../shared/activeWordResolver'
 import { WebAudioMasterPlayback } from './timeline/webAudioMasterPlayback'
 import { useVideoSeekUi } from './sync/useVideoSeekUi'
 
@@ -1039,7 +1048,7 @@ export default function App(): ReactElement {
    */
   const wordHighlightChipsCacheRef = useRef<{
     cardIdx: number | null
-    chips: Array<{ el: HTMLElement; s: number; e: number }>
+    chips: Array<{ el: HTMLElement; s: number; e: number; start: number; end: number }>
   }>({ cardIdx: null, chips: [] })
   /**
    * **재생 세션 perf 측정** — 한 번의 단어 재생(`isPlaying` true→false) 단위로
@@ -1556,6 +1565,18 @@ export default function App(): ReactElement {
   const [alignmentMode, setAlignmentMode] = useState<'accurate' | 'fast'>(() =>
     window.localStorage.getItem('autosubtitle.alignmentMode') === 'fast' ? 'fast' : 'accurate')
   useEffect(() => { window.localStorage.setItem('autosubtitle.alignmentMode', alignmentMode) }, [alignmentMode])
+  /** 자동 줄바꿈 — 한 줄 최대 글자 수(전각 기준) */
+  const [lineBreakUnits, setLineBreakUnits] = useState<number>(() => {
+    const saved = Number(window.localStorage.getItem('autosubtitle.lineBreakUnits'))
+    return Number.isFinite(saved) && saved >= 4 && saved <= 80 ? Math.round(saved) : DEFAULT_MAX_LINE_UNITS
+  })
+  useEffect(() => { window.localStorage.setItem('autosubtitle.lineBreakUnits', String(lineBreakUnits)) }, [lineBreakUnits])
+  /** 대본(.txt) 가져오기 분할 기준 */
+  const [scriptSplit, setScriptSplit] = useState<Required<ScriptSplitOptions>>({
+    atLinebreak: true,
+    atPunctuation: false,
+    atSlash: false
+  })
   const [isExporting, setIsExporting] = useState(false)
   const [exportNotice, setExportNotice] = useState('')
   const [exportProgress, setExportProgress] = useState(0)
@@ -1944,28 +1965,26 @@ export default function App(): ReactElement {
          * 활성 chip 발견 시 즉시 break — 단어 chip 은 비중첩 시간 구간이라 첫 hit 이 곧 정답.
          */
         let cache = wordHighlightChipsCacheRef.current
-        if (cache.cardIdx !== ai) {
+        // 카드가 바뀌었거나, 캐시가 비어 있거나(그때 카드가 아직 마운트 전이었음), 캐시된 요소가 DOM 에서 떨어졌으면
+        // (목록 가상화로 행이 재마운트됨) 다시 수집한다. 그렇지 않으면 카드가 바뀔 때까지 하이라이트가 꺼진 채로 남는다.
+        const cacheStale =
+          cache.cardIdx !== ai || cache.chips.length === 0 || !cache.chips[0]!.el.isConnected
+        if (cacheStale) {
           const cardEl = document.getElementById(`subtitle-card-${ai}`)
-          const collected: Array<{ el: HTMLElement; s: number; e: number }> = []
+          const collected: Array<{ el: HTMLElement; s: number; e: number; start: number; end: number }> = []
           if (cardEl) {
             cardEl.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
               const s = parseFloat(el.dataset.wordStart ?? 'NaN')
               const e = parseFloat(el.dataset.wordEnd ?? 'NaN')
-              if (Number.isFinite(s) && Number.isFinite(e)) collected.push({ el, s, e })
+              if (Number.isFinite(s) && Number.isFinite(e)) collected.push({ el, s, e, start: s, end: e })
             })
           }
           cache = { cardIdx: ai, chips: collected }
           wordHighlightChipsCacheRef.current = cache
         }
-        let nextChip: HTMLElement | null = null
-        const arr = cache.chips
-        for (let i = 0; i < arr.length; i++) {
-          const c = arr[i]
-          if (t >= c.s && t < c.e) {
-            nextChip = c.el
-            break
-          }
-        }
+        // 목록·번인 내보내기와 같은 규칙: 틈에서는 직전 단어 강조를 잠시 유지한다.
+        const hit = resolveHighlightWordIndex(cache.chips, t, { skipDeleted: false, skipSilence: false })
+        const nextChip: HTMLElement | null = hit >= 0 ? cache.chips[hit]!.el : null
         const prevChip = wordHighlightActiveChipElRef.current
         if (prevChip !== nextChip) {
           prevChip?.classList.remove('subtitle-word-chip--active')
@@ -4995,6 +5014,83 @@ export default function App(): ReactElement {
     setAlignmentNotice('말 단어는 유지하고 실제 저에너지 구간만 무음으로 표시했습니다. Ctrl+Z로 되돌릴 수 있습니다.')
   }, [waveformPeaksJsonData, rawWaveformTimelineDurationSec, mergedCutRanges, subtitles, applySubtitleChange, pausePlayback])
 
+  /** 긴 자막 줄을 단어 경계에서 자동으로 나눈다(시간·텍스트·단어 ID 유지, 실행 취소 가능). */
+  const applyAutoLineBreak = useCallback(() => {
+    const snapshot = subtitlesRef.current
+    if (!snapshot.length) return
+    const options = { maxUnits: lineBreakUnits }
+    const { stats } = breakSubtitleLines(snapshot, options)
+    if (stats.brokenLineCount === 0) {
+      setAlignmentNotice(`나눌 줄이 없습니다. 모든 줄이 ${lineBreakUnits}자 이내이거나 단어 정보가 없습니다.`)
+      return
+    }
+    pausePlayback('auto-linebreak')
+    setWaveformLineIndex(null)
+    setWaveformWordId(null)
+    setGapFillWhenBuildingVrew(false)
+    applySubtitleChange(prev => breakSubtitleLines(prev, options).lines)
+    setAlignmentNotice(
+      `${stats.brokenLineCount}줄을 ${stats.brokenLineCount + stats.addedLineCount}줄로 나눴습니다 (줄당 ${lineBreakUnits}자). Ctrl+Z로 되돌릴 수 있습니다.`
+    )
+  }, [lineBreakUnits, pausePlayback, applySubtitleChange])
+
+  /**
+   * 대본(.txt) 또는 자막(.srt/.vtt) 가져오기.
+   * - SRT/VTT: 큐 시간을 그대로 쓰고 단어 시간만 추정한다.
+   * - 대본: 이미 추출된 자막의 단어 시간과 서열 정렬해 대본 문장에 시간을 입힌다(추출 선행 필요).
+   * 컷·삭제 편집이 있는 프로젝트는 단어 매핑이 어긋나므로 막는다.
+   */
+  const importScriptFile = useCallback(async () => {
+    if (!videoPath || isExtracting || projectIoBusy || realigning) return
+    const file = await window.api.openScriptFile()
+    if (file.canceled) return
+    if (!file.ok) {
+      setAlignmentNotice(`파일을 읽지 못했습니다: ${file.reason}`)
+      return
+    }
+    const current = subtitlesRef.current
+    const hasEdits =
+      cutRangesRef.current.length > 0 ||
+      virtualTimelineDeletedRef.current.length > 0 ||
+      current.some(line => line.isDeleted || line.words?.some(word => word.isDeleted))
+    if (hasEdits) {
+      setAlignmentNotice('컷·삭제 편집이 있는 프로젝트에서는 가져오기를 쓸 수 없습니다. 편집을 되돌리거나 새로 추출한 뒤 사용해 주세요.')
+      return
+    }
+
+    const { cues } = parseSubtitleCues(file.text)
+    let nextLines: SubtitleLine[]
+    let summary: string
+    if (cues.length > 0) {
+      nextLines = srtCuesToSubtitleLines(cues)
+      summary = `자막 ${nextLines.length}줄을 가져왔습니다. 단어 시간은 줄 시간 안에서 추정한 값이므로 필요하면 "현재 줄 싱크 재정렬"로 다듬어 주세요.`
+    } else {
+      const sentences = splitScriptText(file.text, scriptSplit)
+      const aligned = alignScriptToTimedLines(sentences, current)
+      if (!aligned.ok) {
+        setAlignmentNotice(aligned.message)
+        return
+      }
+      nextLines = aligned.lines
+      const { matched, scriptTokens, interpolated } = aligned.stats
+      summary = `대본 ${nextLines.length}줄을 가져왔습니다 (단어 ${scriptTokens}개 중 ${matched}개는 음성 인식 시간 사용, ${interpolated}개는 보간). 검토가 필요한 단어는 "현재 줄 싱크 재정렬"로 맞춰 주세요.`
+    }
+    if (nextLines.length === 0) {
+      setAlignmentNotice('가져올 자막이 없습니다.')
+      return
+    }
+    if (current.length > 0 &&
+        !window.confirm(`현재 자막 ${current.length}줄을 "${file.name}"에서 가져온 ${nextLines.length}줄로 바꿉니다.\n실행 취소(Ctrl+Z)로 되돌릴 수 있습니다. 계속할까요?`)) {
+      return
+    }
+    pausePlayback('import-script')
+    setWaveformLineIndex(null)
+    setWaveformWordId(null)
+    setGapFillWhenBuildingVrew(false)
+    applySubtitleChange(() => nextLines)
+    setAlignmentNotice(`${summary} Ctrl+Z로 되돌릴 수 있습니다.`)
+  }, [videoPath, isExtracting, projectIoBusy, realigning, scriptSplit, pausePlayback, applySubtitleChange])
+
   const applyWordReading = useCallback((id: string, reading: string) => {
     applySubtitleChange(lines => lines.map(line => {
       if (!line.words?.some(word => word.id === id)) return line
@@ -7072,8 +7168,70 @@ export default function App(): ReactElement {
                     onClick={() => { pausePlayback('reading'); setReadingLineIndex(waveformLineIndex ?? activeSubtitleIndexRef.current ?? 0) }}>
                     발음 입력
                   </button>
+                  <div className="subtitle-panel-actions" role="group" aria-label="대본·자막 가져오기">
+                    <button
+                      type="button"
+                      className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
+                      disabled={!videoPath || isExtracting || projectIoBusy || realigning}
+                      onClick={() => void importScriptFile()}
+                      title="SRT/VTT 는 큐 시간을 그대로 가져오고, 대본(.txt)은 이미 추출된 자막의 단어 시간과 맞춰 대본 문장에 시간을 입힙니다. 대본은 먼저 자막을 추출해야 합니다."
+                    >
+                      대본/SRT 가져오기
+                    </button>
+                    <details className="subtitle-import-options">
+                      <summary>대본 분할 기준</summary>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={scriptSplit.atLinebreak}
+                          onChange={e => setScriptSplit(prev => ({ ...prev, atLinebreak: e.target.checked }))}
+                        />
+                        줄바꿈
+                      </label>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={scriptSplit.atPunctuation}
+                          onChange={e => setScriptSplit(prev => ({ ...prev, atPunctuation: e.target.checked }))}
+                        />
+                        문장부호
+                      </label>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={scriptSplit.atSlash}
+                          onChange={e => setScriptSplit(prev => ({ ...prev, atSlash: e.target.checked }))}
+                        />
+                        슬래시(/)
+                      </label>
+                    </details>
+                  </div>
                   {subtitles.length > 0 ? (
                     <div className="subtitle-panel-actions" role="group" aria-label="자막 일괄 편집">
+                      <span className="subtitle-linebreak-ctl">
+                        <input
+                          type="number"
+                          min={4}
+                          max={80}
+                          step={1}
+                          value={lineBreakUnits}
+                          aria-label="줄당 최대 글자 수"
+                          title="한 줄 최대 글자 수(한글 기준, 영문·숫자는 0.5자)"
+                          onChange={e => {
+                            const n = Math.round(Number(e.target.value))
+                            if (Number.isFinite(n)) setLineBreakUnits(Math.min(80, Math.max(4, n)))
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
+                          disabled={isExtracting || projectIoBusy || realigning}
+                          onClick={applyAutoLineBreak}
+                          title="입력한 글자 수를 넘는 줄을 문장 끝·쉼·균형을 고려해 단어 경계에서 나눕니다. 시간과 텍스트는 바뀌지 않습니다."
+                        >
+                          자동 줄바꿈
+                        </button>
+                      </span>
                       <button
                         type="button"
                         className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"

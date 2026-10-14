@@ -759,6 +759,40 @@ body {
   font-size: 0.72rem;
 }
 
+.subtitle-linebreak-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.subtitle-linebreak-ctl input[type='number'] {
+  width: 3.2rem;
+  padding: 0.22rem 0.3rem;
+  font-size: 0.72rem;
+  color: #dbe4f5;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+}
+
+.subtitle-import-options {
+  font-size: 0.72rem;
+  color: #b8c4dc;
+}
+
+.subtitle-import-options > summary {
+  cursor: pointer;
+  padding: 0.28rem 0.2rem;
+  user-select: none;
+}
+
+.subtitle-import-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-right: 0.6rem;
+}
+
 .subtitle-panel-title {
   margin: 0;
   font-size: 1rem;

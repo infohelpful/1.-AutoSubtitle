@@ -37,7 +37,7 @@ describe('buildRenderSchedule', () => {
     ])
   })
 
-  it('switches the highlight off in a silent gap while the line stays visible', () => {
+  it('keeps the previous word highlighted through a short gap while the line stays visible', () => {
     const cues: ScheduleCue[] = [
       {
         start: 1,
@@ -50,24 +50,32 @@ describe('buildRenderSchedule', () => {
       }
     ]
     const states = buildRenderSchedule({ cues, clips: whole, fps: 30, highlightWords: true })
+    // 틈(1.2~1.5)에서도 a 를 유지하고, 마지막 단어 뒤(1.8~2.0, 유지 시간 이내)에도 b 를 유지한다.
     expect(states.map((s) => [s.startFrame, s.endFrame, s.activeIndex])).toEqual([
-      [30, 36, 0],
-      [36, 45, -1],
-      [45, 54, 1],
-      [54, 60, -1]
+      [30, 45, 0],
+      [45, 60, 1]
     ])
     expect(states.every((s) => s.text === 'a b')).toBe(true)
   })
 
-  it('does not stretch the last word to the end of the displayed cue', () => {
+  it('turns the highlight off only after the hold time has passed', () => {
     const cues: ScheduleCue[] = [
-      { start: 1, end: 3, text: 'a', words: [{ start: 1, end: 1.5, text: 'a' }] }
+      { start: 1, end: 4, text: 'a', words: [{ start: 1, end: 1.5, text: 'a' }] }
     ]
     const states = buildRenderSchedule({ cues, clips: whole, fps: 30, highlightWords: true })
+    // 1.5초에 끝난 단어를 1초(=2.5초)까지 유지한 뒤 꺼진다. 줄은 4초까지 보인다.
     expect(states.map((s) => [s.startFrame, s.endFrame, s.activeIndex])).toEqual([
-      [30, 45, 0],
-      [45, 90, -1]
+      [30, 75, 0],
+      [75, 120, -1]
     ])
+  })
+
+  it('lights the first word before it starts when the cue appears earlier', () => {
+    const cues: ScheduleCue[] = [
+      { start: 1, end: 3, text: 'a b', words: [{ start: 1.4, end: 1.8, text: 'a' }, { start: 1.8, end: 2.2, text: 'b' }] }
+    ]
+    const states = buildRenderSchedule({ cues, clips: whole, fps: 30, highlightWords: true })
+    expect(states[0]).toMatchObject({ startFrame: 30, activeIndex: 0 })
   })
 
   it('drops a word shorter than one frame without breaking its neighbours', () => {

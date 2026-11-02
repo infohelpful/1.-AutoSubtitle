@@ -1,8 +1,32 @@
 import { describe, expect, it } from 'vitest'
 import { pickActiveSubtitleIndex, subtitlePresentationEnd, subtitlePresentationStart } from './subtitlePresentation'
 import { subtitlePreviewText } from './subtitleVisibility'
+import { subtitleCueLinesForExport } from './subtitles'
 
 describe('continuous subtitle presentation', () => {
+  it('keeps row 26 visible until its final word ends when the next alignment overlaps', () => {
+    const lines = [
+      { start: 52.164, end: 54.236, text: '1년 동안 월간 업데이터를 통해', words: [
+        { start: 52.164, end: 52.386, word: '1년' },
+        { start: 53.512, end: 54.015, word: '업데이터를' },
+        { start: 54.095, end: 54.236, word: '통해' }
+      ] },
+      { start: 53.9, end: 56.443, text: '기능을 조금씩 미리 배포하되', words: [
+        { start: 53.9, end: 54.363, word: '기능을' },
+        { start: 54.383, end: 55.391, word: '조금씩' }
+      ] }
+    ]
+    expect(subtitlePreviewText(lines, 54.1)).toBe('1년 동안 월간 업데이터를 통해')
+    expect(pickActiveSubtitleIndex(lines, 54.235)).toBe(0)
+    expect(pickActiveSubtitleIndex(lines, 54.236)).toBe(1)
+    expect(subtitlePresentationEnd(lines, 0)).toBe(54.236)
+    expect(subtitlePresentationStart(lines, 1)).toBe(54.236)
+    expect(subtitleCueLinesForExport(lines).map(cue => [cue.start, cue.end])).toEqual([
+      [52.164, 54.236], [54.236, 56.443]
+    ])
+    expect(lines[1].words?.[0]?.start).toBe(53.9)
+  })
+
   it('shows the entire previous line through its trailing audio and joins the next row boundary', () => {
     const lines = [
       { start: 0, end: 3.623, text: '앞 자막 전체', words: [

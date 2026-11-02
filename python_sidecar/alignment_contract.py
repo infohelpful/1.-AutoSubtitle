@@ -23,6 +23,51 @@ def finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def reconcile_alignment_word_overlaps(cues: list[dict]) -> list[dict]:
+    """Reject conflicting acoustic times at cue seams using ordered ASR anchors.
+
+    Each cue is aligned independently with overlapping audio context. An early
+    match in the preceding cue can otherwise make the next caption appear while
+    the previous sentence is still being spoken. Raw ASR times are an estimate,
+    so reverted words are explicitly marked unaligned for review.
+    """
+    output = copy.deepcopy(cues)
+    words = [word for cue in output for word in cue.get('words', [])
+             if word.get('word') and not word.get('isSilence') and not word.get('isDeleted')]
+
+    def revert(word: dict) -> None:
+        word['start'], word['end'] = word['rawStart'], word['rawEnd']
+        word['sourceStart'] = word['sourceEnd'] = word['alignmentScore'] = None
+        word['alignmentStatus'] = 'unaligned'
+        word['reviewReasons'] = sorted(set(word.get('reviewReasons') or []) |
+                                       {'alignment_overlap_reverted_to_asr'})
+        word.pop('charSpans', None)
+
+    i = 1
+    while i < len(words):
+        previous, current = words[i - 1], words[i]
+        if previous['end'] <= current['start'] + 1e-6:
+            i += 1
+            continue
+        anchors = all(finite(word.get(key)) for word in (previous, current)
+                      for key in ('rawStart', 'rawEnd'))
+        ordered = anchors and (previous['rawStart'] < previous['rawEnd'] <=
+                               current['rawStart'] < current['rawEnd'])
+        editable = all(not word.get('manualStartLocked') and not word.get('manualEndLocked')
+                       for word in (previous, current))
+        if ordered and editable:
+            if previous['end'] > current['rawStart'] + 1e-6:
+                revert(previous)
+            revert(current)
+            i = max(1, i - 1)
+            continue
+        for word in (previous, current):
+            word['reviewReasons'] = sorted(set(word.get('reviewReasons') or []) |
+                                           {'alignment_overlap_unresolved'})
+        i += 1
+    return output
+
+
 def clamp_stretched_end(start: float, end: float, raw_end: Any) -> float | None:
     """다음 발화까지 끝이 늘어난 단어를 ASR 원본 끝 근처로 자른다. 자를 필요가 없으면 None.
 

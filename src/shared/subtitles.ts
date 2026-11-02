@@ -132,7 +132,9 @@ export function subtitleLineEditDisplayText(line: {
   captionText?: string
   words?: readonly SubtitleWord[] | undefined
 }): string {
-  if (line.captionText !== undefined) return line.captionText
+  // Structural word edits may recompute `text` while an older caption override
+  // is still present on a copied row. The newly computed text wins in that case.
+  if (line.captionText !== undefined && line.captionText === line.text) return line.captionText
   const words = line.words
   const fromWords =
     words && words.length > 0 ? displayTextFromSubtitleWords(words) : ''

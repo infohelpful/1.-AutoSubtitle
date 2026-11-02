@@ -38,7 +38,7 @@ const sentenceToLine: WeakMap<TimelineSentence, SubtitleLine> = new WeakMap()
 function buildSentenceFromLine(line: SubtitleLine, li: number): TimelineSentence {
   const words = line.words
   if (words && words.length > 0) {
-    const captionText = line.captionText ??
+    const captionText = (line.captionText === line.text ? line.captionText : undefined) ??
       (line.text !== displayTextFromSubtitleWords(words) ? line.text : undefined)
     const tokens: TimelineToken[] = words.map((w, wi) => {
       const t: TimelineToken = {
@@ -66,7 +66,7 @@ function buildSentenceFromLine(line: SubtitleLine, li: number): TimelineSentence
   return {
     id: sentenceIdForLineIndex(li),
     isHidden: line.isHidden,
-    captionText: line.captionText,
+    captionText: line.captionText === line.text ? line.captionText : undefined,
     tokens: [
       {
         id: tokenIdFor(li, 0),

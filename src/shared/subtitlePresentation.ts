@@ -65,6 +65,10 @@ export function subtitlePresentationSpans(lines: readonly SubtitleLine[]): Subti
   for (let i = 0; i + 1 < captionRows.length; i++) {
     const current = captionRows[i]!
     const next = captionRows[i + 1]!
+    // Forced alignment can place the first word of the next row before the
+    // previous row's final spoken word. Keep the current caption through its
+    // stored end; the word timestamps remain available for chip review.
+    if (next.start < current.end && current.end < next.end) next.start = current.end
     const blocked = lines.some((line, index) => index !== current.index && index !== next.index &&
       (line.isDeleted || isSilenceOnlyRow(line)) && line.start < next.start && line.end > current.end)
     if (!blocked && !lines[next.index].isHidden && next.start > current.start) current.end = next.start

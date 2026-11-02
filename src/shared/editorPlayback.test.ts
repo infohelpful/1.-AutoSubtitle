@@ -21,6 +21,22 @@ it('prioritizes actual speech over overlapping gap markers, without resurrecting
   expect(isRemovedSubtitleRow({start:0,end:1,text:'',isHidden:true})).toBe(false)
 })
 
+it('keeps the active word-chip row aligned with the caption across overlapping speech timings', () => {
+  const lines = [
+    { start: 52.164, end: 54.236, text: '월간 업데이터를 통해', words: [
+      { start: 53.17, end: 53.472, word: '월간' },
+      { start: 53.512, end: 54.015, word: '업데이터를' },
+      { start: 54.095, end: 54.236, word: '통해' }
+    ] },
+    { start: 53.9, end: 56.443, text: '기능을 조금씩 미리 배포하되', words: [
+      { start: 53.9, end: 54.363, word: '기능을' }
+    ] }
+  ]
+  expect(pickActiveEditorRow(lines, 54.1)).toBe(0)
+  expect(pickActiveEditorRow(lines, 54.235)).toBe(0)
+  expect(pickActiveEditorRow(lines, 54.236)).toBe(1)
+})
+
 it('uses the full video duration despite truncated or padded peaks and early-ending captions', () => {
   expect(sourceTimelineDuration(684.8,680,660)).toBe(684.8)
   expect(sourceTimelineDuration(684.8,685,660)).toBe(684.8)

@@ -2,7 +2,7 @@ import { expect, it } from 'vitest'
 import { editSubtitleText } from './editSubtitleText'
 import { sentenceTokenTimelineToSubtitleLines, subtitleLinesToSentenceTokenTimeline } from './sentenceTokenTimelineAdapter'
 import { buildExportCueLines } from './exportCuePipeline'
-import type { SubtitleLine } from './subtitles'
+import { subtitleLineEditDisplayText, type SubtitleLine } from './subtitles'
 
 const line: SubtitleLine = { start: 0, end: 2, text: '오늘 날씨', words: [
   { id: 'a', start: 0, end: 1, word: '오늘', alignmentStatus: 'aligned' },
@@ -44,4 +44,25 @@ it('exports a rewritten caption with a different word count without changing sou
   expect(cue.words?.map(word => word.text).join(' ')).toBe(cue.text)
   expect(cue.words?.[0].start).toBe(0)
   expect(cue.words?.at(-1)?.end).toBe(2)
+})
+
+it('uses the moved chips and new row text when a split copied an older caption override', () => {
+  const moved: SubtitleLine = {
+    start: 4, end: 5.5,
+    text: '확인할 수 있는데요.',
+    captionText: '이 기능은 설정 - 시스템 - 복구 메뉴로 들어가시면 확인할 수 있는데요.',
+    words: [
+      { start: 4, end: 4.5, word: '확인할' },
+      { start: 4.5, end: 4.8, word: '수' },
+      { start: 4.8, end: 5.5, word: '있는데요.' }
+    ]
+  }
+  expect(subtitleLineEditDisplayText(moved)).toBe('확인할 수 있는데요.')
+  expect(buildExportCueLines([moved])).toEqual([{ start: 4, end: 5.5, text: '확인할 수 있는데요.' }])
+  const stored = JSON.parse(JSON.stringify(subtitleLinesToSentenceTokenTimeline([moved])))
+  const [restored] = sentenceTokenTimelineToSubtitleLines(stored)
+  expect(restored.text).toBe('확인할 수 있는데요.')
+  expect(restored.captionText).toBeUndefined()
+  const reapplied = editSubtitleText(moved, moved.captionText!)
+  expect(reapplied.text).toBe(moved.captionText)
 })

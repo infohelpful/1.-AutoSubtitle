@@ -254,21 +254,21 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
   const skipPlayheadCaretSyncOnPauseRef = useRef(false)
   /** 재생 중 방향키로 일시정지하며 캐럿 편집 UI를 잠깐 허용할 때 true */
   const [keyboardPauseCaret, setKeyboardPauseCaret] = useState(false)
-  /** Local composition draft; committed text also updates word labels. */
+  /** Local composition draft; source word labels stay independent of caption edits. */
   const subtitleTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const [subtitleTextDraft, setSubtitleTextDraft] = useState<string | null>(null)
   const textComposingRef = useRef(false)
-  const lineEditDisplay = useMemo(() => subtitleLineEditDisplayText(row), [row.text, row.words])
+  const lineEditDisplay = useMemo(() => subtitleLineEditDisplayText(row), [row.text, row.captionText, row.words])
   const subtitleTextDisplay = subtitleTextDraft ?? lineEditDisplay
 
   useEffect(() => {
     if (textComposingRef.current) return
     if (subtitleTextareaRef.current === document.activeElement) {
-      setSubtitleTextDraft(row.text)
+      setSubtitleTextDraft(lineEditDisplay)
       return
     }
     setSubtitleTextDraft(null)
-  }, [lineEditDisplay, row.text, row.start, row.end, index])
+  }, [lineEditDisplay, row.start, row.end, index])
 
   /**
    * 렌더링 단위 레일 — **tombstone(`isDeleted`) 제외**, 각 칩은 원본 `row.words` 의 `storageIndex` 보존.
@@ -1994,14 +1994,14 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
             updateSubtitleAt(index, e.currentTarget.value)
           }}
           onFocus={() => {
-            setSubtitleTextDraft(row.text)
+            setSubtitleTextDraft(lineEditDisplay)
             setCaretVisible(false)
             setCaretBlink(false)
           }}
           onBlur={() => {
             const el = subtitleTextareaRef.current
             const cur = subtitleTextDraft !== null ? subtitleTextDraft : el?.value ?? lineEditDisplay
-            if (cur !== row.text) {
+            if (cur !== lineEditDisplay) {
               updateSubtitleAt(index, cur)
             }
             setSubtitleTextDraft(null)

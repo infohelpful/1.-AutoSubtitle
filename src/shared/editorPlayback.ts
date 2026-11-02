@@ -17,7 +17,13 @@ export function pickActiveEditorRow(lines: readonly SubtitleLine[], time: number
       else if (word.start >= latest) { latest = word.start; speech = index }
     }
   })
-  return speech ?? gap ?? pickActiveSubtitleIndex(lines, time)
+  const presented = pickActiveSubtitleIndex(lines, time)
+  // Two rows can contain overlapping forced-alignment words. While a caption
+  // row is on screen, keep its chips active until the shared row boundary.
+  if (speech !== null && presented !== null && speech !== presented &&
+      time < lines[presented].end && !lines[presented].isHidden &&
+      lines[presented].words?.some(word => !word.isDeleted && !word.isSilence)) return presented
+  return speech ?? gap ?? presented
 }
 
 /** A trailing unknown-audio chip keeps the preceding spoken word highlighted. */

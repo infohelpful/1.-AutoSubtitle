@@ -132,6 +132,7 @@ export function partitionLineAtSpeechBoundaries(
       start,
       end,
       text: displayTextFromSubtitleWords(group),
+      captionText: undefined,
       words: group
     }
   })

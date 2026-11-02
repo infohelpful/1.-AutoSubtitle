@@ -34,6 +34,14 @@ describe('textDisplayUnits', () => {
 })
 
 describe('breakSubtitleLine', () => {
+  it('does not copy the unsplit edited caption onto both resulting rows', () => {
+    const line = { ...lineOf(['확인할', '수', '있는데요.']),
+      captionText: '앞 문장 확인할 수 있는데요.' }
+    const parts = partitionLineAtSpeechBoundaries(line, [1])!
+    expect(parts.map(part => part.text)).toEqual(['확인할', '수 있는데요.'])
+    expect(parts.map(part => part.captionText)).toEqual([undefined, undefined])
+  })
+
   it('keeps a short line as the same reference', () => {
     const line = lineOf(['안녕하세요', '여러분'])
     const out = breakSubtitleLine(line, { maxUnits: 20 })

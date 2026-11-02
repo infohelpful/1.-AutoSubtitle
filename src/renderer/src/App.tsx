@@ -75,7 +75,7 @@ import {
   srtCuesToSubtitleLines,
   type ScriptSplitOptions
 } from '../../shared/scriptImport'
-import { mergeEmptySubtitleWithPrevious, splitSubtitleLine } from './subtitleEditOps'
+import { mergeEmptySubtitleWithPrevious, splitSubtitleAtWordBoundary, splitSubtitleLine } from './subtitleEditOps'
 import { SubtitleVirtualList } from './SubtitleVirtualList'
 import { SubtitleDataProvider } from './subtitleDataContext'
 import {
@@ -4036,8 +4036,8 @@ export default function App(): ReactElement {
       const leftText = leftWords.length > 0 ? displayTextFromSubtitleWords(leftWords) : cur.text
       const rightText = rightWords.length > 0 ? displayTextFromSubtitleWords(rightWords) : ''
 
-      const first: SubtitleLine = { ...cur, end: splitTime, text: leftText, words: leftWords }
-      const second: SubtitleLine = { ...cur, start: splitTime, end: cur.end, text: rightText, words: rightWords }
+      const first: SubtitleLine = { ...cur, end: splitTime, text: leftText, captionText: undefined, words: leftWords }
+      const second: SubtitleLine = { ...cur, start: splitTime, end: cur.end, text: rightText, captionText: undefined, words: rightWords }
       return [...prev.slice(0, index), first, second, ...prev.slice(index + 1)]
     })
   }, [applySubtitleChange])
@@ -4060,39 +4060,7 @@ export default function App(): ReactElement {
 
   const splitSubtitleAtWord = useCallback(
     (index: number, wordIndex: number) => {
-      applySubtitleChange((prev) => {
-        if (index < 0 || index >= prev.length) return prev
-        const cur = prev[index]
-        const words = cur.words ?? []
-        if (wordIndex <= 0 || wordIndex >= words.length) return prev
-
-        const leftWords = words.slice(0, wordIndex)
-        const rightWords = words.slice(wordIndex)
-        if (leftWords.length === 0 || rightWords.length === 0) return prev
-
-        const leftEndRaw = leftWords[leftWords.length - 1].end
-        const rightStartRaw = rightWords[0].start
-        // 단어 타임스탬프가 겹치거나 역전돼도 분할이 되도록 안전한 경계값 계산
-        let splitTime = (leftEndRaw + rightStartRaw) / 2
-        if (!Number.isFinite(splitTime)) splitTime = rightStartRaw
-        splitTime = Math.max(cur.start + 0.1, Math.min(cur.end - 0.1, splitTime))
-        if (!(splitTime > cur.start && splitTime < cur.end)) return prev
-
-        const first: SubtitleLine = {
-          ...cur,
-          end: splitTime,
-          words: leftWords,
-          text: textFromWords(leftWords, cur.text)
-        }
-        const second: SubtitleLine = {
-          ...cur,
-          start: splitTime,
-          end: cur.end,
-          words: rightWords,
-          text: textFromWords(rightWords, cur.text)
-        }
-        return [...prev.slice(0, index), first, second, ...prev.slice(index + 1)]
-      })
+      applySubtitleChange((prev) => splitSubtitleAtWordBoundary(prev, index, wordIndex))
     },
     [applySubtitleChange]
   )

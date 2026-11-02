@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { displayTextFromSubtitleWords, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
-import { splitLineAtCaretOnWordBoundary, splitSubtitleLine } from './subtitleEditOps'
+import { splitLineAtCaretOnWordBoundary, splitSubtitleAtWordBoundary, splitSubtitleLine } from './subtitleEditOps'
+import { buildExportCueLines } from '../../shared/exportCuePipeline'
 
 function lineWithWords(tokens: Array<[string, number, number]>): SubtitleLine {
   const words: SubtitleWord[] = tokens.map(([word, start, end], i) => ({ word, start, end, id: `w${i}` }))
@@ -17,6 +18,28 @@ const line = lineWithWords([
   ['여러분', 1.2, 1.8],
   ['반갑습니다', 2.5, 3.4]
 ])
+
+it('moves the final chips down without repeating the edited caption in the new row', () => {
+  const source = lineWithWords([
+    ['이', 0, .3], ['기능은', .3, .8], ['설정,', .8, 1.3],
+    ['시스템,', 1.3, 1.8], ['복구', 1.8, 2.2], ['메뉴로', 2.2, 2.7],
+    ['들어가시면', 2.7, 3.3], ['확인할', 3.3, 3.8], ['수', 3.8, 4], ['있는데요.', 4, 4.6]
+  ])
+  const edited = { ...source,
+    text: '이 기능은 설정 - 시스템 - 복구 메뉴로 들어가시면 확인할 수 있는데요.',
+    captionText: '이 기능은 설정 - 시스템 - 복구 메뉴로 들어가시면 확인할 수 있는데요.' }
+  const result = splitSubtitleAtWordBoundary([edited], 0, 7)
+  expect(result.map(row => row.words?.filter(word => !word.isSilence).map(word => word.word))).toEqual([
+    ['이', '기능은', '설정,', '시스템,', '복구', '메뉴로', '들어가시면'],
+    ['확인할', '수', '있는데요.']
+  ])
+  expect(result[0].text).toBe('이 기능은 설정 - 시스템 - 복구 메뉴로 들어가시면')
+  expect(result[1].text).toBe('확인할 수 있는데요.')
+  expect(result[1].captionText).toBeUndefined()
+  expect(buildExportCueLines(result).map(cue => cue.text)).toEqual([
+    '이 기능은 설정 - 시스템 - 복구 메뉴로 들어가시면', '확인할 수 있는데요.'
+  ])
+})
 
 describe('splitSubtitleLine — word boundary snapping', () => {
   it('snaps a caret inside a word to the nearest word boundary', () => {

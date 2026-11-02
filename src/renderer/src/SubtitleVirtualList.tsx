@@ -1999,6 +1999,10 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
             updateSubtitleAt(index, e.currentTarget.value)
           }}
           onFocus={() => {
+            if (isPlaying) {
+              markUserClickPause()
+              onRequestPausePlayback('caption-textarea-focus')
+            }
             setSubtitleTextDraft(lineEditDisplay)
             setCaretVisible(false)
             setCaretBlink(false)
@@ -2051,6 +2055,11 @@ const subtitleVirtualRowAreEqual = (
   const isExpanded = next.waveformExpandedLineIndex === next.index
   if (wasExpanded !== isExpanded) return false
   if (isExpanded && prev.waveformActiveWordId !== next.waveformActiveWordId) return false
+  // Hover/selection/numbering are list-wide props; a row only cares about its own slice.
+  const otherRowHovered = (p: typeof prev) => p.globalHoveredRowIndex !== null && p.globalHoveredRowIndex !== p.index
+  if (otherRowHovered(prev) !== otherRowHovered(next)) return false
+  if (prev.selectedRows.has(prev.index) !== next.selectedRows.has(next.index)) return false
+  if (prev.rowNumbers[prev.index] !== next.rowNumbers[next.index]) return false
   // 나머지 prop 은 reference 비교 (subtitles/vrewRows/펼침 관련은 위에서 처리)
   for (const key of Object.keys(next) as Array<keyof typeof next>) {
     if (
@@ -2059,7 +2068,10 @@ const subtitleVirtualRowAreEqual = (
       key === 'index' ||
       key === 'style' ||
       key === 'waveformExpandedLineIndex' ||
-      key === 'waveformActiveWordId'
+      key === 'waveformActiveWordId' ||
+      key === 'globalHoveredRowIndex' ||
+      key === 'selectedRows' ||
+      key === 'rowNumbers'
     )
       continue
     if ((prev as unknown as Record<string, unknown>)[key as string] !==
@@ -2098,6 +2110,24 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     lastCardFocusRef.current = cardIndex
   }, [])
 
+  /** Focus now when the target is mounted; otherwise wait for the virtual list to render it. */
+  const focusWhenMounted = useCallback((
+    find: () => HTMLElement | null, after?: (el: HTMLElement) => void, deferFirst = false
+  ) => {
+    const run = (): boolean => {
+      const el = find()
+      if (!el) return false
+      el.focus({ preventScroll: true })
+      after?.(el)
+      return true
+    }
+    if (!deferFirst && run()) return
+    window.requestAnimationFrame(() => {
+      if (run()) return
+      window.requestAnimationFrame(() => { run() })
+    })
+  }, [])
+
   const requestFocusRow = useCallback((index: number, caret: number | 'end') => {
     if (index < 0) return
     const row = subtitles[index]
@@ -2106,21 +2136,12 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.onCardNavigate(row.start)
     }
     lastCardFocusRef.current = index
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        const ta = document.getElementById(`subtitle-v-${index}`) as HTMLTextAreaElement | null
-        if (!ta) return
-        ta.focus({ preventScroll: true })
-        if (caret === 'end') {
-          const len = ta.value.length
-          ta.setSelectionRange(len, len)
-        } else {
-          const c = Math.max(0, Math.min(caret, ta.value.length))
-          ta.setSelectionRange(c, c)
-        }
-      })
-    })
-  }, [subtitles, props.onCardNavigate])
+    focusWhenMounted(() => document.getElementById(`subtitle-v-${index}`), (el) => {
+      const ta = el as HTMLTextAreaElement
+      const c = caret === 'end' ? ta.value.length : Math.max(0, Math.min(caret, ta.value.length))
+      ta.setSelectionRange(c, c)
+    }, true) // split/merge callers focus right after a structural edit; let it commit first
+  }, [subtitles, props.onCardNavigate, focusWhenMounted])
 
   const navigateSubtitleField = useCallback(
     (fromIndex: number, delta: number) => {
@@ -2147,16 +2168,10 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     const targetWords = row?.words ?? []
     const safe = nearestValidStorageCaret(targetWords, storageCaret)
     const rc = storageCaretToRenderableCaret(targetWords, safe)
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        const el = (document.getElementById(`subtitle-caret-${cardIndex}-${rc}`)
-          ?? document.getElementById(`subtitle-word-${cardIndex}-${safe}`)
-          ?? document.getElementById(`subtitle-card-${cardIndex}`)) as HTMLElement | null
-        if (!el) return
-        el.focus({ preventScroll: true })
-      })
-    })
-  }, [subtitles, props.onCardNavigate])
+    focusWhenMounted(() => document.getElementById(`subtitle-caret-${cardIndex}-${rc}`)
+      ?? document.getElementById(`subtitle-word-${cardIndex}-${safe}`)
+      ?? document.getElementById(`subtitle-card-${cardIndex}`))
+  }, [subtitles, props.onCardNavigate, focusWhenMounted])
 
   const requestFocusCard = useCallback((cardIndex: number) => {
     if (cardIndex < 0) return
@@ -2165,11 +2180,8 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       props.onCardNavigate(row.start)
     }
     lastCardFocusRef.current = cardIndex
-    window.requestAnimationFrame(() => {
-      const el = document.getElementById(`subtitle-card-${cardIndex}`) as HTMLElement | null
-      el?.focus()
-    })
-  }, [subtitles, props.onCardNavigate])
+    focusWhenMounted(() => document.getElementById(`subtitle-card-${cardIndex}`))
+  }, [subtitles, props.onCardNavigate, focusWhenMounted])
 
   useEffect(() => {
     const el = containerRef.current
@@ -2208,16 +2220,18 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     return () => window.removeEventListener('keydown', onGlobalArrow)
   }, [props.activeSubtitleIndexRef, props.playheadSecRef, props.isPlaying, props.onRequestPausePlayback, requestFocusCaret, subtitles])
 
+  const rowNumbers = useMemo(() => subtitles.reduce<number[]>((numbers, line) => {
+    const last = numbers.at(-1) ?? 0
+    numbers.push(line.isDeleted || (line.words?.length && line.words.every(w => w.isDeleted)) ? last : last + 1)
+    return numbers
+  }, []), [subtitles])
+
   const rowProps = useMemo(
     () => ({
       subtitles,
       selectedRows: props.selectedRows,
       onSelectRow: props.onSelectRow,
-      rowNumbers: subtitles.reduce<number[]>((numbers, line) => {
-        const last = numbers.at(-1) ?? 0
-        numbers.push(line.isDeleted || (line.words?.length && line.words.every(w => w.isDeleted)) ? last : last + 1)
-        return numbers
-      }, []),
+      rowNumbers,
       activeSubtitleIndexRef: props.activeSubtitleIndexRef,
       playheadSecRef: props.playheadSecRef,
       isPlaying: props.isPlaying,
@@ -2299,7 +2313,8 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       requestFocusCaret,
       requestFocusCard,
       registerCardFocus,
-      globalHoveredRowIndex
+      globalHoveredRowIndex,
+      rowNumbers
     ]
   )
 

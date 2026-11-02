@@ -10,7 +10,7 @@
  */
 
 import type { SubtitleLine } from './subtitles'
-import { displayTextFromSubtitleWords, visibleSubtitleWords } from './subtitles'
+import { displayTextFromSubtitleWords } from './subtitles'
 
 /** 편집으로 단어 배열을 바꾼 뒤 자동 gap-fill 을 하지 않는다는 정책(문서용). */
 export const NO_AUTO_GAP_FILL_AFTER_EDIT = true
@@ -32,9 +32,9 @@ export function shouldFillGapsWhenBuildingVrewRows(
 export function removeSilenceWordsFromSubtitleLines(lines: SubtitleLine[]): SubtitleLine[] {
   const out: SubtitleLine[] = []
   for (const line of lines) {
-    const words = (line.words ?? []).filter((w) => !w.isSilence)
+    const words = (line.words ?? []).filter((w) => !w.isSilence || w.gapKind === 'unclassified')
     if (words.length === 0) continue
-    const vis = visibleSubtitleWords(words)
+    const vis = words.filter(word => !word.isDeleted)
     if (vis.length === 0) continue
     const start = Math.min(...vis.map((w) => w.start))
     const end = Math.max(...vis.map((w) => w.end))

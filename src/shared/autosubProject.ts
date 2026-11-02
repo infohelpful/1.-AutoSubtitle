@@ -116,6 +116,7 @@ function parseProjectSubtitles(raw: unknown, legacy: boolean): SubtitleLine[] | 
         }
         if (typeof rawWord.splitChain === 'string' && /^[12]+$/.test(rawWord.splitChain)) word.splitChain = rawWord.splitChain
         if (word.isSilence) Object.assign(word, parseManualBoundaryLocks(rawWord))
+        if (word.isSilence && rawWord.gapKind === 'unclassified') word.gapKind = 'unclassified'
         if (!word.isSilence) {
           Object.assign(word, parseWordAlignmentMeta(rawWord))
           if (legacy && !word.alignmentStatus) {

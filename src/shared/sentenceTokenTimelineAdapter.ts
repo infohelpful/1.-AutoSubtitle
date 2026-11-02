@@ -49,6 +49,7 @@ function buildSentenceFromLine(line: SubtitleLine, li: number): TimelineSentence
       if (w.mergedByEdgeTrim === true) t.mergedByEdgeTrim = true
       if (w.isDeleted === true) t.is_deleted = true
       if (w.isSilence === true) t.isSilence = true
+      if (w.gapKind === 'unclassified') t.gapKind = w.gapKind
       if (w.splitChain) t.splitChain = w.splitChain
       return t
     })
@@ -88,6 +89,7 @@ function buildLineFromSentence(sentence: TimelineSentence): SubtitleLine | null 
     if (t.is_deleted === true) w.isDeleted = true
     if (t.mergedByEdgeTrim === true) w.mergedByEdgeTrim = true
     if (t.isSilence === true) w.isSilence = true
+    if (t.gapKind === 'unclassified') w.gapKind = t.gapKind
     if (t.splitChain) w.splitChain = t.splitChain
     return w
   })

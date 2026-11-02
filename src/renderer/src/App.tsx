@@ -15,11 +15,14 @@ import {
 } from 'react'
 import type { JsonWaveformData } from 'peaks.js'
 import { editSubtitleText } from '../../shared/editSubtitleText'
-import { prepareRealignBatches, mergeRealignedCue } from '../../shared/realignWords'
+import { prepareRealignBatches, mergeRealignedCue, reconcileRealignedGaps, preserveRealignmentCuts } from '../../shared/realignWords'
 import { ensureWordIdentities } from '../../shared/wordIdentity'
 import { setWordReading } from '../../shared/wordReading'
 import { subtitleLinesMeaningfullyChanged } from '../../shared/subtitleEditHistory'
 import { WordReadingEditor } from './components/WordReadingEditor'
+import { SubtitleFormatToolbar } from './components/SubtitleFormatToolbar'
+import { SubtitleActionsToolbar } from './components/SubtitleActionsToolbar'
+import { EditorToolIcon } from './components/EditorToolIcon'
 import { sameMedia, type MediaFingerprint, type MediaFingerprintResult } from '../../shared/projectMedia'
 import type { PreparedMedia } from '../../shared/preparedMedia'
 import { seekVideoElementTo } from './timeline/seekVideo'
@@ -43,6 +46,7 @@ import {
   subtitleLinesToSentenceTokenTimeline
 } from '../../shared/sentenceTokenTimelineAdapter'
 import { confirmExtractedSilence } from './utils/confirmedSilenceAfterExtract'
+import { completeMediaCoverage } from './utils/mediaCoverage'
 import {
   buildActiveBlocksSnapshotFromSubtitles,
   deriveVisibleSubtitleLinesForUi,
@@ -112,9 +116,8 @@ import {
   buildScheduledMediaSegments,
   type ScheduledMediaSegment
 } from './timeline/playbackSchedule'
-import { pickActiveSubtitleIndex } from '../../shared/subtitlePresentation'
+import { pickActiveEditorRow, resolveEditorHighlight, sourceTimelineDuration } from '../../shared/editorPlayback'
 import { setSubtitleVisibility, subtitlePreviewText } from '../../shared/subtitleVisibility'
-import { resolveHighlightWordIndex } from '../../shared/activeWordResolver'
 import { WebAudioMasterPlayback } from './timeline/webAudioMasterPlayback'
 import { videoFollowRate } from './timeline/audioOutputClock'
 import { useVideoSeekUi } from './sync/useVideoSeekUi'
@@ -160,13 +163,9 @@ const SUBTITLE_FONT_PRESETS = [
 ] as const
 
 const EXPORT_OPTIONS: Array<{ value: ExportFormat; label: string }> = [
-  { value: 'video', label: '영상으로 내보내기' },
+  { value: 'video', label: '자막 입힌 영상' },
   { value: 'srt', label: '자막 (.srt)' },
-  { value: 'vtt', label: '자막 WebVTT (.vtt) · 가운데 정렬' },
-  { value: 'ass', label: '자막 ASS (.ass) · 스타일·정렬' },
-  { value: 'txt', label: '텍스트 (.txt)' },
-  { value: 'mp3', label: '오디오 (.mp3)' },
-  { value: 'wav', label: '오디오 (.wav)' }
+  { value: 'txt', label: '대본 (.txt)' }
 ]
 
 function filePathFromDrop(file: File): string | null {
@@ -291,7 +290,7 @@ const SUBTITLE_BG_PADDING_PCT_MIN = 30
 const SUBTITLE_BG_PADDING_PCT_MAX = 150
 
 const SUBTITLE_FONT_SIZE_MIN = 14
-const SUBTITLE_FONT_SIZE_MAX = 100
+const SUBTITLE_FONT_SIZE_MAX = 300
 
 function clampSubtitleFontSize(n: number): number {
   if (!Number.isFinite(n)) return 26
@@ -887,17 +886,17 @@ export default function App(): ReactElement {
       return []
     }
   }
-  /** 미리보기(영상) 폭 % — 낮을수록 자막·파형 패널이 넓어져 단어 행 가로 스크롤이 줄어듦 */
+  /** 자막 전용 작업 공간의 왼쪽 영상 미리보기 폭. */
   const SPLIT_MIN = 20
   const SPLIT_MAX = 65
   const [previewWidthPct, setPreviewWidthPct] = useState(() => {
     const raw = window.localStorage.getItem('autosubtitle:editor-preview-width-pct')
     const parsed = Number(raw)
-    if (raw === null || !Number.isFinite(parsed)) return 28
+    if (raw === null || !Number.isFinite(parsed)) return 48
     return Math.max(SPLIT_MIN, Math.min(SPLIT_MAX, parsed))
   })
   const [busy, setBusy] = useState(false)
-  const [editorTab, setEditorTab] = useState<'home' | 'subtitles' | 'format'>('home')
+  const [editorTab, setEditorTab] = useState<'home' | 'subtitles' | 'format'>('subtitles')
   const [selectedSubtitleRows, setSelectedSubtitleRows] = useState<Set<number>>(() => new Set())
   const [videoPath, setVideoPath] = useState<string | null>(null)
   const [preparedSource, setPreparedSource] = useState<{ path: string; media: PreparedMedia } | null>(null)
@@ -1232,6 +1231,9 @@ export default function App(): ReactElement {
   const [cutRanges, setCutRanges] = useState<CutRange[]>([])
   /** 가상 타임라인: 삭제 tombstone(isDeleted)만 상태로 유지 — 저장 시 활성 스냅샷과 합쳐 JSON 기록 */
   const [virtualTimelineDeleted, setVirtualTimelineDeleted] = useState<VirtualTimelineBlock[]>([])
+  // Complete saved projects once the matching source duration is known, never
+  // after every edit (that could restore a region the user just trimmed).
+  const pendingProjectCoverageRef = useRef<string | null>(null)
   const cutRangesRef = useRef<CutRange[]>([])
   useEffect(() => {
     cutRangesRef.current = cutRanges
@@ -1566,9 +1568,7 @@ export default function App(): ReactElement {
   const [progress, setProgress] = useState(0)
   const [transcribeMode, setTranscribeMode] = useState<TranscribeMode | null>(null)
   const [transcribeDiagnostics, setTranscribeDiagnostics] = useState<string[]>([])
-  const [alignmentMode, setAlignmentMode] = useState<'accurate' | 'fast'>(() =>
-    window.localStorage.getItem('autosubtitle.alignmentMode') === 'fast' ? 'fast' : 'accurate')
-  useEffect(() => { window.localStorage.setItem('autosubtitle.alignmentMode', alignmentMode) }, [alignmentMode])
+  const alignmentMode = 'accurate' as const
   /** 자동 줄바꿈 — 한 줄 최대 글자 수(전각 기준) */
   const [lineBreakUnits, setLineBreakUnits] = useState<number>(() => {
     const saved = Number(window.localStorage.getItem('autosubtitle.lineBreakUnits'))
@@ -1591,7 +1591,7 @@ export default function App(): ReactElement {
   const videoBurnExportRef = useRef(false)
   const [exportFormat, setExportFormat] = useState<ExportFormat>('video')
   /** 영상 번인에서 현재 발화 단어를 강조 — 줄 단위 자막은 그대로 유지(기본 꺼짐) */
-  const [wordHighlightEnabled, setWordHighlightEnabled] = useState(false)
+  const [wordHighlightEnabled, setWordHighlightEnabled] = useState(true)
   const [wordHighlightColor, setWordHighlightColor] = useState('#ffd54a')
   /** false면 subtitleLinesToVrewRows 가 단어 간 gap-fill(무음 더미)을 넣지 않음 — 편집 후 타임라인 덮어쓰기 방지 */
   const [gapFillWhenBuildingVrew, setGapFillWhenBuildingVrew] = useState(false)
@@ -1714,25 +1714,15 @@ export default function App(): ReactElement {
    * **EDL-only single media axis** — 타임라인 끝은 **원본 미디어 축**의 길이.
    *
    * 컷/tombstone 으로 압축하지 않는다. 컷 구간은 시각 마킹만 하고 시간 라벨은 원본 그대로.
-   * 우선순위: 원본 Peaks JSON 길이 → 파형 미디어 span → 컨테이너 duration → 자막 끝.
+   * 원본 영상 길이를 우선한다. 파형 끝의 샘플/픽셀 반올림은 재생 길이를 바꾸지 않는다.
    */
   const timelineMediaEndHint = useMemo(() => {
     const subtitleEnd = subtitles.reduce((m, line) => Math.max(m, line.end ?? 0), 0)
-    const durHint = durationSec > 0 ? durationSec : undefined
-    if (waveformPeaksJsonData) {
-      const fromJson = exactTimelineDurationSecFromWaveformJson(waveformPeaksJsonData, durHint)
-      if (fromJson != null && fromJson > 0) return fromJson
-    }
-    if (waveformPeaksJsonLoading) return Math.max(subtitleEnd, 0)
-    if (waveformMediaSpanSec != null && waveformMediaSpanSec > 0) return waveformMediaSpanSec
-    if (!(durationSec > 0)) return Math.max(subtitleEnd, 0)
-    return durationSec
+    return sourceTimelineDuration(durationSec, waveformMediaSpanSec ?? 0, subtitleEnd)
   }, [
     durationSec,
     subtitles,
-    waveformMediaSpanSec,
-    waveformPeaksJsonData,
-    waveformPeaksJsonLoading
+    waveformMediaSpanSec
   ])
 
   /**
@@ -1917,7 +1907,7 @@ export default function App(): ReactElement {
        * 매 RAF tick 이 동일 클로저를 호출 → 하이라이트가 즉시 갱신된다.
        */
       const subsNow = subtitlesRef.current
-      const ai = pickActiveSubtitleIndex(subsNow, editSec)
+      const ai = pickActiveEditorRow(subsNow, editSec)
       activeSubtitleIndexRef.current = ai
 
       const timeEl = previewCurrentTimeRef.current
@@ -1987,7 +1977,7 @@ export default function App(): ReactElement {
           wordHighlightChipsCacheRef.current = cache
         }
         // 목록·번인 내보내기와 같은 규칙: 틈에서는 직전 단어 강조를 잠시 유지한다.
-        const hit = resolveHighlightWordIndex(cache.chips, t)
+        const hit = resolveEditorHighlight(cache.chips, t)
         const nextChip: HTMLElement | null = hit >= 0 ? cache.chips[hit]!.el : null
         const prevChip = wordHighlightActiveChipElRef.current
         if (prevChip !== nextChip) {
@@ -5016,9 +5006,17 @@ export default function App(): ReactElement {
     setWaveformLineIndex(null)
     setWaveformWordId(null)
     setGapFillWhenBuildingVrew(false)
-    applySubtitleChange(prev => confirmExtractedSilence(prev, waveformPeaksJsonData, rawWaveformTimelineDurationSec))
-    setAlignmentNotice('말 단어는 유지하고 실제 저에너지 구간만 무음으로 표시했습니다. Ctrl+Z로 되돌릴 수 있습니다.')
-  }, [waveformPeaksJsonData, rawWaveformTimelineDurationSec, mergedCutRanges, subtitles, applySubtitleChange, pausePlayback])
+    applySubtitleChange(prev => completeMediaCoverage(confirmExtractedSilence(prev, waveformPeaksJsonData, timelineMediaEndHint), timelineMediaEndHint, waveformPeaksJsonData))
+    setAlignmentNotice('확인된 무음은 --, 그 외 누락 구간은 오디오 칩으로 표시했습니다. Ctrl+Z로 되돌릴 수 있습니다.')
+  }, [waveformPeaksJsonData, rawWaveformTimelineDurationSec, timelineMediaEndHint, mergedCutRanges, subtitles, applySubtitleChange, pausePlayback])
+
+  const repairMediaCoverage = useCallback(() => {
+    pausePlayback('repair-media-coverage')
+    setWaveformLineIndex(null)
+    setWaveformWordId(null)
+    applySubtitleChange(prev => completeMediaCoverage(prev, timelineMediaEndHint, waveformPeaksJsonData, mergedWaveformPeaksStitchCuts))
+    setAlignmentNotice('삭제한 구간과 단어 시간은 유지하고 누락된 오디오 구간을 복구했습니다. Ctrl+Z로 되돌릴 수 있습니다.')
+  }, [pausePlayback, applySubtitleChange, timelineMediaEndHint, waveformPeaksJsonData, mergedWaveformPeaksStitchCuts])
 
   /** 긴 자막 줄을 단어 경계에서 자동으로 나눈다(시간·텍스트·단어 ID 유지, 실행 취소 가능). */
   const applyAutoLineBreak = useCallback(() => {
@@ -5098,9 +5096,13 @@ export default function App(): ReactElement {
     setWaveformLineIndex(null)
     setWaveformWordId(null)
     setGapFillWhenBuildingVrew(false)
-    applySubtitleChange(() => nextLines)
+    pendingProjectCoverageRef.current = preparedMedia ? null : videoPath
+    applySubtitleChange(() => completeMediaCoverage(nextLines,
+      preparedMedia?.duration || nextLines.reduce((end, line) => Math.max(end, line.end), 0),
+      preparedMedia ? waveformPeaksJsonData : null))
     setAlignmentNotice(`${summary} Ctrl+Z로 되돌릴 수 있습니다.`)
-  }, [videoPath, isExtracting, projectIoBusy, realigning, scriptSplit, pausePlayback, applySubtitleChange])
+  }, [videoPath, isExtracting, projectIoBusy, realigning, scriptSplit, pausePlayback, applySubtitleChange,
+    preparedMedia, waveformPeaksJsonData])
 
   const applyWordReading = useCallback((id: string, reading: string) => {
     applySubtitleChange(lines => lines.map(line => {
@@ -5167,7 +5169,9 @@ export default function App(): ReactElement {
       }
       // A cancelled/failed batch never leaves a partly realigned project behind.
       applySubtitleChange(prev => prev.length === snapshot.length && prev.every((item, i) => item === snapshot[i])
-        ? next : prev)
+        ? completeMediaCoverage(reconcileRealignedGaps(preserveRealignmentCuts(snapshot, next, mergedWaveformPeaksStitchCuts)),
+          timelineMediaEndHint, waveformPeaksJsonData, mergedWaveformPeaksStitchCuts)
+        : prev)
       setAlignmentNotice(`${total}줄 정렬 완료 · 검토 필요 ${reviewWords}개. 실행 취소로 되돌릴 수 있습니다.`)
     } catch (error) {
       if (alignmentRequestRef.current === requestId) setAlignmentNotice(error instanceof Error ? error.message : String(error))
@@ -5177,7 +5181,8 @@ export default function App(): ReactElement {
         setRealigning(false)
       }
     }
-  }, [videoPath, realigning, isExtracting, projectIoBusy, waveformLineIndex, pausePlayback, applySubtitleChange])
+  }, [videoPath, realigning, isExtracting, projectIoBusy, waveformLineIndex, pausePlayback, applySubtitleChange,
+    timelineMediaEndHint, waveformPeaksJsonData, mergedWaveformPeaksStitchCuts])
 
   /**
    * **재생 세션 perf 초기화 / emit** — isPlaying 만 의존하므로 mid-playback 의 viewWin /
@@ -5790,6 +5795,7 @@ export default function App(): ReactElement {
         return
       }
       projectGenerationRef.current += 1
+      pendingProjectCoverageRef.current = null
       setReadingLineIndex(null)
       projectFilePathRef.current = null
       projectMediaRef.current = { path: absPath, fingerprint: null }
@@ -5816,6 +5822,12 @@ export default function App(): ReactElement {
     },
     [busy, isExtracting, modelReady, alignmentMode]
   )
+
+  const selectVideoForExtraction = useCallback(async () => {
+    if (isExtracting || busy) return
+    const picked = await window.api.openVideoFileDialog()
+    if (!picked.canceled && picked.filePaths[0]) processDroppedVideoPath(picked.filePaths[0])
+  }, [busy, isExtracting, processDroppedVideoPath])
 
   useEffect(() => {
     if (!modelReady || busy || isExtracting) return
@@ -5914,7 +5926,7 @@ export default function App(): ReactElement {
         return cleaned.length === l.words.length ? l : { ...l, words: cleaned }
       })
       const wordCount = lines.reduce((acc, l) => acc + (l.words?.length ?? 0), 0)
-      if (lines.length === 0 || wordCount === 0) {
+      if ((lines.length === 0 || wordCount === 0) && !(Number((raw as {duration?:unknown}).duration) > 0)) {
         acceptTranscriptionRef.current=false
         setExtractAwaitListPaint(false)
         setIsExtracting(false)
@@ -5928,8 +5940,9 @@ export default function App(): ReactElement {
       }
 
       void (async () => {
-        const mediaDur = Number((raw as { duration?: unknown }).duration)
+        const mediaDur = sourceTimelineDuration(videoRef.current?.duration ?? 0, Number((raw as { duration?: unknown }).duration), 0)
         let finalLines = confirmExtractedSilence(lines, null, mediaDur)
+        let waveformPeaksForCoverage: JsonWaveformData | null = null
         const wp = (raw as { waveform_peaks?: { ok?: boolean; path?: string | null } }).waveform_peaks
 
         try {
@@ -5939,6 +5952,7 @@ export default function App(): ReactElement {
             if (!isCurrent()) return
             if (jr.ok && jr.json) {
               const j = jr.json as JsonWaveformData
+              waveformPeaksForCoverage = j
               setWaveformPeaksJsonData(j)
               if (Number.isFinite(mediaDur) && mediaDur > 0) {
                 finalLines = confirmExtractedSilence(lines, j, mediaDur)
@@ -5960,6 +5974,7 @@ export default function App(): ReactElement {
         }
 
         if (!isCurrent()) return
+        finalLines = completeMediaCoverage(finalLines, mediaDur, waveformPeaksForCoverage)
         acceptTranscriptionRef.current=false
         const t0 = performance.now()
         const finalWordCount = finalLines.reduce((acc, l) => acc + (l.words?.length ?? 0), 0)
@@ -6344,6 +6359,16 @@ export default function App(): ReactElement {
     } finally { setProjectIoBusy(false) }
   }, [buildAutosubProjectJson, saveProjectAs, cutRanges, subtitles, virtualTimelineDeleted])
 
+  useEffect(() => {
+    if (!videoPath || pendingProjectCoverageRef.current !== videoPath || !preparedMedia || !(preparedMedia.duration > 0)) return
+    pendingProjectCoverageRef.current = null
+    setSentenceTokenTimeline(current => {
+      const lines = sentenceTokenTimelineToSubtitleLines(current)
+      const excluded = mergeWaveformPeaksStitchCutRanges(cutRangesRef.current, lines, virtualTimelineDeletedRef.current)
+      return subtitleLinesToSentenceTokenTimeline(completeMediaCoverage(lines, preparedMedia.duration, null, excluded))
+    })
+  }, [videoPath, preparedMedia, sentenceTokenTimeline])
+
   const applyAutosubPayload = useCallback(async (projectPath: string | null, parsed: unknown) => {
     const pr = parseAutosubProjectFile(parsed)
     if (!pr.ok) {
@@ -6389,7 +6414,10 @@ export default function App(): ReactElement {
       tombstones = virtualTombstonesFromCutRanges(d.cutRanges)
     }
     setVirtualTimelineDeleted(tombstones)
-    setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline([...d.subtitles].sort((a, b) => a.start - b.start)))
+    pendingProjectCoverageRef.current = d.videoPath
+    const excluded = mergeWaveformPeaksStitchCutRanges(d.cutRanges, d.subtitles, tombstones)
+    const subtitleEnd = d.subtitles.reduce((end, line) => Math.max(end, line.end), 0)
+    setSentenceTokenTimeline(subtitleLinesToSentenceTokenTimeline(completeMediaCoverage(d.subtitles, subtitleEnd, null, excluded)))
     setGapFillWhenBuildingVrew(false)
     undoStackRef.current = []
     redoStackRef.current = []
@@ -6405,7 +6433,7 @@ export default function App(): ReactElement {
     setSubtitleStrokeWidth(st.strokeWidth)
     setSubtitleX(st.x)
     setSubtitleY(clampSubtitleY(st.y))
-    setWordHighlightEnabled(st.wordHighlightEnabled ?? false)
+    setWordHighlightEnabled(st.wordHighlightEnabled ?? true)
     setWordHighlightColor(st.wordHighlightColor ?? '#ffff00')
     commitEditSecToUi(0)
     setIsPlaying(false)
@@ -6429,6 +6457,7 @@ export default function App(): ReactElement {
       }
       projectMediaRef.current = { path, fingerprint: result.fingerprint }
       mediaFingerprintPromiseRef.current = null
+      pendingProjectCoverageRef.current = path
       setVideoPath(path)
       setProjectMediaNotice('원본 영상을 다시 연결했습니다. 변경된 경로를 유지하려면 프로젝트를 저장해 주세요.')
     } catch (e) { setProjectMediaNotice(e instanceof Error ? e.message : String(e)) }
@@ -6735,7 +6764,7 @@ export default function App(): ReactElement {
   }
 
   return (
-    <div className={`app editor-tab-${editorTab}`}>
+    <div className={`app app--subtitle-only editor-tab-${editorTab}`}>
       {projectMediaNotice ? <div className="app-gpu-install-banner" role="status" data-testid="project-media-notice">
         <p className="app-gpu-install-banner-text">{projectMediaNotice}</p>
         {!videoPath && projectMediaRef.current.path ? <button type="button" disabled={projectIoBusy} onClick={relinkProjectMedia}>원본 영상 연결</button> : null}
@@ -6755,19 +6784,14 @@ export default function App(): ReactElement {
       >
         <header className="app-topbar">
           <h1 className="app-title">AutoSubtitle</h1>
-          <nav className="editor-tabs" aria-label="편집 도구">
-            {([['home','홈'],['subtitles','자막'],['format','서식']] as const).map(([tab,label]) =>
+          <nav className="editor-tabs" aria-label="자막 도구">
+            {([['subtitles','자막 추출·수정'],['format','자막 디자인']] as const).map(([tab,label]) =>
               <button key={tab} type="button" aria-pressed={editorTab === tab} onClick={() => setEditorTab(tab)}>{label}</button>)}
           </nav>
           <div className="app-topbar-actions">
-            <label className="preview-export-word-highlight">추출 싱크
-              <select aria-label="추출 싱크 정밀도" value={alignmentMode} disabled={isExtracting || busy}
-                onChange={event => setAlignmentMode(event.target.value as 'accurate' | 'fast')}
-                title="다음 영상 추출에 적용됩니다. 정밀 모드는 음성 모델로 단어 경계를 다시 찾으며 시간이 더 걸립니다.">
-                <option value="accurate">정밀 정렬</option>
-                <option value="fast">빠른 추정</option>
-              </select>
-            </label>
+            <span className="extraction-sync-mode" title="음성 인식 후 발화 구간 안에서 한글 음절과 단어 경계를 정렬합니다.">
+              정밀 싱크 · 음절 경계 분석
+            </span>
             <div className="app-topbar-project-actions">
               <button
                 type="button"
@@ -6815,184 +6839,66 @@ export default function App(): ReactElement {
           </div>
         </header>
 
-        <div className="preview-subtitle-controls-bar" data-waveform-no-dismiss="1">
+        <div className="preview-subtitle-controls-bar" data-waveform-no-dismiss="1"
+          onKeyDown={event => { if (event.code === 'Space') event.stopPropagation() }}>
           <div className="preview-subtitle-controls">
-            <div className="editor-home-tools">
-              <button type="button" onClick={undoSubtitleChange} disabled={!subtitles.length}>↶<span>실행 취소</span></button>
-              <button type="button" onClick={redoSubtitleChange} disabled={!subtitles.length}>↷<span>다시 실행</span></button>
-              <span className="editor-tool-divider" />
-              <button type="button" onClick={() => setEditorTab('subtitles')}>▤<span>자막 편집</span></button>
-              <button type="button" onClick={() => setEditorTab('format')}>Aa<span>자막 서식</span></button>
+            <div className="editor-home-tools" role="group" aria-label="편집 기록">
+              <button type="button" onClick={undoSubtitleChange} disabled={!subtitles.length}><EditorToolIcon name="undo" /><span>실행 취소</span></button>
+              <button type="button" onClick={redoSubtitleChange} disabled={!subtitles.length}><EditorToolIcon name="redo" /><span>다시 실행</span></button>
             </div>
-            <div className="preview-subtitle-controls-rows">
-              <div className="preview-subtitle-controls-line">
-                <label className="preview-subtitle-control-row preview-subtitle-control-row--font">
-                  <span>폰트</span>
-                  <select
-                    className="preview-subtitle-font-input"
-                    value={subtitleFontFamily}
-                    onChange={(e) => setSubtitleFontFamily(e.target.value)}
-                  >
-                    {recentFonts.length > 0 ? (
-                      <optgroup label="최근 사용">
-                        {recentFonts.map((f) => (
-                          <option key={`recent-${f}`} value={f}>
-                            {f}
-                          </option>
-                        ))}
-                      </optgroup>
-                    ) : null}
-                    <optgroup label="전체 폰트">
-                      {availableFonts.map((f) => (
-                        <option key={f} value={f}>
-                          {f}
-                        </option>
-                      ))}
-                    </optgroup>
-                  </select>
-                  <strong />
-                </label>
-                <label className="preview-subtitle-control-row">
-                  <span>글자 크기</span>
-                  <input
-                    type="range"
-                    min={SUBTITLE_FONT_SIZE_MIN}
-                    max={SUBTITLE_FONT_SIZE_MAX}
-                    step={1}
-                    value={subtitleFontSize}
-                    onChange={(e) => setSubtitleFontSize(clampSubtitleFontSize(Number(e.target.value)))}
-                  />
-                  <strong>{subtitleFontSize}px</strong>
-                </label>
-                <label className="preview-subtitle-control-row">
-                  <span>글자 색상</span>
-                  <div className="preview-subtitle-control-main">
-                    <input type="color" value={subtitleTextColor} onChange={(e) => setSubtitleTextColor(e.target.value)} />
-                    <input
-                      type="range"
-                      min={400}
-                      max={900}
-                      step={100}
-                      value={subtitleFontWeight}
-                      onChange={(e) => setSubtitleFontWeight(Number(e.target.value))}
-                    />
-                  </div>
-                  <strong>{subtitleFontWeight}</strong>
-                </label>
-                <label className="preview-subtitle-control-row">
-                  <span>외곽선</span>
-                  <div className="preview-subtitle-control-main">
-                    <input
-                      type="color"
-                      value={subtitleStrokeColor}
-                      onChange={(e) => setSubtitleStrokeColor(e.target.value)}
-                    />
-                    <input
-                      type="range"
-                      min={0}
-                      max={6}
-                      step={1}
-                      value={subtitleStrokeWidth}
-                      onChange={(e) => setSubtitleStrokeWidth(Number(e.target.value))}
-                    />
-                  </div>
-                  <strong>{subtitleStrokeWidth}px</strong>
-                </label>
+            {editorTab === 'subtitles' && <SubtitleActionsToolbar
+              canAlign={!!videoPath && !!subtitles.length && !isExtracting && !projectIoBusy}
+              canRead={!!subtitles.length && !isExtracting && !projectIoBusy && !realigning}
+              canImport={!!videoPath && !isExtracting && !projectIoBusy && !realigning}
+              realigning={realigning} split={scriptSplit} onSplit={setScriptSplit}
+              onAlign={() => void realignCurrentLine()} onAlignAll={() => void realignCurrentLine('all')}
+              onCancel={cancelRealignment}
+              onReading={() => { pausePlayback('reading'); setReadingLineIndex(waveformLineIndex ?? activeSubtitleIndexRef.current ?? 0) }}
+              onImport={() => void importScriptFile()}
+            >
+              <div className="subtitle-visibility-tools" role="group" aria-label="단어 강조">
+                <div className="preview-export-word-highlight"
+                  title="영상으로 내보낼 때 지금 말하는 단어를 선택한 색으로 강조합니다.">
+                  <label><input type="checkbox" checked={wordHighlightEnabled}
+                    onChange={(e) => setWordHighlightEnabled(e.target.checked)} disabled={isExporting || isExtracting} />
+                    <span>단어 강조</span></label>
+                  <input type="color" value={wordHighlightColor} onChange={(e) => setWordHighlightColor(e.target.value)}
+                    disabled={!wordHighlightEnabled || isExporting || isExtracting} aria-label="단어 강조 색" />
+                </div>
               </div>
-              <div className="preview-subtitle-controls-line">
-                <label className="preview-subtitle-control-row">
-                  <span>배경 색상</span>
-                  <div className="preview-subtitle-control-main">
-                    <input type="color" value={subtitleBgColor} onChange={(e) => setSubtitleBgColor(e.target.value)} />
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={subtitleBgOpacity}
-                      onChange={(e) => setSubtitleBgOpacity(Number(e.target.value))}
-                    />
-                  </div>
-                  <strong>{subtitleBgOpacity}%</strong>
-                </label>
-                <label className="preview-subtitle-control-row">
-                  <span>배경 크기</span>
-                  <input
-                    type="range"
-                    min={SUBTITLE_BG_PADDING_PCT_MIN}
-                    max={SUBTITLE_BG_PADDING_PCT_MAX}
-                    step={1}
-                    value={subtitleBgPaddingPct}
-                    onChange={(e) => setSubtitleBgPaddingPct(clampSubtitleBgPaddingPct(Number(e.target.value)))}
-                    title="배경 박스 안쪽 여백 — 낮을수록 글자에 붙고, 높을수록 여유가 커집니다."
-                  />
-                  <strong>{subtitleBgPaddingPct}%</strong>
-                </label>
-                <label className="preview-subtitle-control-row">
-                  <span>좌우 위치</span>
-                  <input type="range" min={5} max={95} step={1} value={subtitleX} onChange={(e) => setSubtitleX(Number(e.target.value))} />
-                  <strong>{subtitleX}%</strong>
-                </label>
-                <label className="preview-subtitle-control-row">
-                  <span>상하 위치</span>
-                  <input
-                    type="range"
-                    min={SUBTITLE_Y_MIN}
-                    max={SUBTITLE_Y_MAX}
-                    step={1}
-                    value={subtitleY}
-                    onChange={(e) => setSubtitleY(clampSubtitleY(Number(e.target.value)))}
-                    title="아래(0%) ~ 위(높은 %). 화면 하단에서 자막 박스 하단까지의 거리(%)"
-                  />
-                  <strong>{subtitleY}%</strong>
-                </label>
-              </div>
-            </div>
-            <div className="preview-subtitle-export-actions">
-                {exportNotice && <p role="status" className="text-xs">{exportNotice}</p>}
-                <select
-                  className="preview-export-format"
-                  value={exportFormat}
+            </SubtitleActionsToolbar>}
+            {editorTab !== 'subtitles' && realigning && <button type="button" className="editor-align-cancel" onClick={cancelRealignment}>
+              <EditorToolIcon name="cancel" />정렬 취소
+            </button>}
+            {editorTab === 'format' && <SubtitleFormatToolbar
+              fontFamily={subtitleFontFamily} fonts={availableFonts} recentFonts={recentFonts}
+              fontSize={subtitleFontSize} fontWeight={subtitleFontWeight} textColor={subtitleTextColor}
+              strokeColor={subtitleStrokeColor} strokeWidth={subtitleStrokeWidth}
+              bgColor={subtitleBgColor} bgOpacity={subtitleBgOpacity} bgPaddingPct={subtitleBgPaddingPct}
+              x={subtitleX} y={subtitleY}
+              onFontFamily={setSubtitleFontFamily} onFontSize={(value) => setSubtitleFontSize(clampSubtitleFontSize(value))}
+              onFontWeight={setSubtitleFontWeight} onTextColor={setSubtitleTextColor}
+              onStrokeColor={setSubtitleStrokeColor} onStrokeWidth={setSubtitleStrokeWidth}
+              onBgColor={setSubtitleBgColor} onBgOpacity={setSubtitleBgOpacity}
+              onBgPaddingPct={(value) => setSubtitleBgPaddingPct(clampSubtitleBgPaddingPct(value))}
+              onX={setSubtitleX} onY={(value) => setSubtitleY(clampSubtitleY(value))}
+            />}
+            <div className="preview-subtitle-export-actions" role="group" aria-label="내보내기">
+              <div className="preview-export-main">
+                <select className="preview-export-format" value={exportFormat}
                   onChange={(e) => setExportFormat(e.target.value as ExportFormat)}
-                  title="내보내기 형식"
-                  disabled={!videoPath || subtitles.length === 0 || isExporting || isExtracting}
-                >
-                  {EXPORT_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
+                  aria-label="내보내기 형식"
+                  disabled={!videoPath || subtitles.length === 0 || isExporting || isExtracting}>
+                  {EXPORT_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                 </select>
-                {exportFormat === 'video' ? (
-                  <label
-                    className="preview-export-word-highlight"
-                    title="영상에 자막을 입힐 때 지금 말하는 단어를 선택한 색으로 강조합니다. 말하지 않는 구간에서는 강조가 꺼집니다."
-                  >
-                    <input
-                      type="checkbox"
-                      checked={wordHighlightEnabled}
-                      onChange={(e) => setWordHighlightEnabled(e.target.checked)}
-                      disabled={isExporting || isExtracting}
-                    />
-                    <span>단어 강조</span>
-                    <input
-                      type="color"
-                      value={wordHighlightColor}
-                      onChange={(e) => setWordHighlightColor(e.target.value)}
-                      disabled={!wordHighlightEnabled || isExporting || isExtracting}
-                      aria-label="단어 강조 색"
-                    />
-                  </label>
-                ) : null}
-                <button
-                  type="button"
-                  className="app-topbar-gpu-btn preview-export-btn"
+                <button type="button" className="app-topbar-gpu-btn preview-export-btn"
                   disabled={!videoPath || subtitles.length === 0 || isExporting || isExtracting}
                   onClick={exportVideo}
-                  title={!videoPath || subtitles.length === 0 ? '영상과 자막이 있어야 내보낼 수 있습니다.' : undefined}
-                >
-                  {isExporting ? '내보내는 중...' : '내보내기'}
+                  title={!videoPath || subtitles.length === 0 ? '영상과 자막이 있어야 내보낼 수 있습니다.' : undefined}>
+                  <EditorToolIcon name="export" /><span>{isExporting ? '내보내는 중...' : '내보내기'}</span>
                 </button>
+              </div>
+              {exportNotice && <p role="status" className="preview-export-notice">{exportNotice}</p>}
             </div>
           </div>
         </div>
@@ -7209,59 +7115,11 @@ export default function App(): ReactElement {
             <div className="subtitle-panel">
               <header className="subtitle-panel-head">
                 <div className="subtitle-panel-head-top">
-                  <h2 className="subtitle-panel-title">자막</h2>
-                  <button type="button" className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
-                    disabled={!videoPath || !subtitles.length || isExtracting || projectIoBusy} onClick={realigning ? cancelRealignment : () => void realignCurrentLine()}>
-                    {realigning ? '정렬 취소' : '현재 줄 싱크 재정렬'}
+                  <h2 className="subtitle-panel-title">자막 추출·수정</h2>
+                  <button type="button" className="app-topbar-gpu-btn preview-project-btn"
+                    disabled={isExtracting || busy} onClick={() => void selectVideoForExtraction()}>
+                    {isExtracting ? '자막 추출 중…' : '영상 선택 · 자막 추출'}
                   </button>
-                  <button type="button" className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
-                    disabled={!videoPath || !subtitles.length || isExtracting || projectIoBusy || realigning}
-                    onClick={() => void realignCurrentLine('all')}>
-                    전체 자막 싱크 재정렬
-                  </button>
-                  <button type="button" className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
-                    disabled={!subtitles.length || isExtracting || projectIoBusy}
-                    onClick={() => { pausePlayback('reading'); setReadingLineIndex(waveformLineIndex ?? activeSubtitleIndexRef.current ?? 0) }}>
-                    발음 입력
-                  </button>
-                  <div className="subtitle-panel-actions" role="group" aria-label="대본·자막 가져오기">
-                    <button
-                      type="button"
-                      className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
-                      disabled={!videoPath || isExtracting || projectIoBusy || realigning}
-                      onClick={() => void importScriptFile()}
-                      title="SRT/VTT 는 큐 시간을 그대로 가져오고, 대본(.txt)은 이미 추출된 자막의 단어 시간과 맞춰 대본 문장에 시간을 입힙니다. 대본은 먼저 자막을 추출해야 합니다."
-                    >
-                      대본/SRT 가져오기
-                    </button>
-                    <details className="subtitle-import-options">
-                      <summary>대본 분할 기준</summary>
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={scriptSplit.atLinebreak}
-                          onChange={e => setScriptSplit(prev => ({ ...prev, atLinebreak: e.target.checked }))}
-                        />
-                        줄바꿈
-                      </label>
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={scriptSplit.atPunctuation}
-                          onChange={e => setScriptSplit(prev => ({ ...prev, atPunctuation: e.target.checked }))}
-                        />
-                        문장부호
-                      </label>
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={scriptSplit.atSlash}
-                          onChange={e => setScriptSplit(prev => ({ ...prev, atSlash: e.target.checked }))}
-                        />
-                        슬래시(/)
-                      </label>
-                    </details>
-                  </div>
                   {subtitles.length > 0 ? (
                     <div className="subtitle-panel-actions" role="group" aria-label="자막 일괄 편집">
                       <span className="subtitle-linebreak-ctl">
@@ -7288,31 +7146,12 @@ export default function App(): ReactElement {
                           자동 줄바꿈
                         </button>
                       </span>
-                      <button
-                        type="button"
-                        className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
-                        onClick={removeAllSilenceWords}
-                        title="isSilence 로 표시된 단어를 모두 제거합니다. 이후 파형 변환 시 단어 사이 무음 더미를 자동 삽입하지 않습니다."
-                      >
-                        무음 일괄 삭제
-                      </button>
-                      <button
-                        type="button"
-                        className="app-topbar-gpu-btn preview-project-btn subtitle-panel-action-btn"
-                        disabled={!waveformPeaksJsonData || isExtracting || projectIoBusy || realigning}
-                        onClick={recheckSilence}
-                        title="말 단어와 시간을 유지하고 오디오를 확인해 무음 표시를 다시 만듭니다. 컷·삭제·무음 경계 편집이 없는 프로젝트에 사용할 수 있습니다."
-                      >
-                        무음 다시 확인
-                      </button>
                     </div>
                   ) : null}
                 </div>
                 <p className="subtitle-panel-sub">
                   <span role="status">{alignmentNotice}</span>
-                  <strong>단어 더블클릭</strong> 해당 줄 단어 아래 파동 편집 · <strong>Enter</strong> 줄바꿈 ·{' '}
-                  <strong>Ctrl+Enter</strong> 자막 분할 · 빈 칸에서 <strong>Backspace</strong> 이전과 병합 ·{' '}
-                  <strong>Tab</strong> / <strong>Shift+Tab</strong> 다른 줄로 이동
+                  재생 중인 단어칩은 노란색으로 표시됩니다. 자막 문구와 싱크를 검토하고 필요하면 다시 정렬하세요.
                 </p>
                 {readingLineIndex !== null && subtitles[readingLineIndex] ? <WordReadingEditor
                   key={`${projectGenerationRef.current}:${readingLineIndex}`} line={subtitles[readingLineIndex]} lineIndex={readingLineIndex}
@@ -7337,16 +7176,7 @@ export default function App(): ReactElement {
                   </p>
                 ) : null}
               </header>
-              <div className="subtitle-selection-toolbar" role="group" aria-label="자막 줄 선택 및 표시">
-                <label><input type="checkbox" aria-label="모든 자막 줄 선택"
-                  checked={visibleRowIndices.length > 0 && selectedSubtitleRows.size === visibleRowIndices.length}
-                  ref={el => { if(el) el.indeterminate = selectedSubtitleRows.size > 0 && selectedSubtitleRows.size < visibleRowIndices.length }}
-                  disabled={!visibleRowIndices.length}
-                  onChange={e => setSelectedSubtitleRows(new Set(e.target.checked ? visibleRowIndices : []))} />전체 선택</label>
-                <span className="subtitle-selection-count" aria-live="polite">{selectedSubtitleRows.size ? `${selectedSubtitleRows.size}줄 선택` : `${visibleRowIndices.length}개의 자막`}</span>
-                <button type="button" disabled={!selectedSubtitleRows.size || isExtracting || projectIoBusy} onClick={() => changeSelectedVisibility(true)}>선택 자막 숨기기</button>
-                <button type="button" disabled={!selectedSubtitleRows.size || isExtracting || projectIoBusy} onClick={() => changeSelectedVisibility(false)}>선택 자막 표시</button>
-              </div>
+              <p className="subtitle-selection-count" aria-live="polite">{visibleRowIndices.length}개의 자막</p>
               <div className="subtitle-panel-body">
                 {subtitles.length === 0 ? (
                   <div className="subtitle-empty-placeholder" aria-live="polite">
@@ -7383,7 +7213,7 @@ export default function App(): ReactElement {
                           mergeEmptySubtitleAt={mergeEmptySubtitleAt}
                           formatTimecode={formatEditedTimecode}
                           onTogglePlayback={dispatchTogglePlayIntent}
-                          waveformEnabled={Boolean(modelReady)}
+                          waveformEnabled={false}
                           registerWaveMount={registerWaveMount}
                           waveformExpandedLineIndex={waveformLineIndex}
                           waveformActiveWordId={waveformWordId}
@@ -7398,39 +7228,6 @@ export default function App(): ReactElement {
                         />
                       </SubtitleDataProvider>
                     </div>
-                    {modelReady && (stitchedWaveformJsonComputed ?? waveformPeaksJsonData) &&
-                    (READ_SUBTITLES_FROM_VIRTUAL_TIMELINE ? subtitlesForList.length > 0 : subtitles.length > 0) ? (
-                      <SubtitleWaveformPeaks
-                        ref={waveformPeaksRef}
-                        rows={vrewRows}
-                        onRowsChange={onVrewRowsChange}
-                        audioUrl={waveformMediaUrl}
-                        localMediaPath={videoPath}
-                        precomputedWaveformJson={(stitchedWaveformJsonComputed ?? waveformPeaksJsonData)!}
-                        precomputedWaveformIsEditAxis={stitchedWaveformJsonComputed != null}
-                        playheadProgramToPeaksSec={waveformPlayheadProgramToPeaksSec}
-                        precomputedPeaksJsonFileUrl={null}
-                        waveMountByLineRef={waveMountByLineRef}
-                        activeLineIndex={waveformLineIndex}
-                        activeWordId={waveformWordId}
-                        waveformCardBounds={waveformLineZoomBounds}
-                        cutRanges={cutRanges}
-                        onZoomViewRange={setPeaksZoomViewRange}
-                        onTimeRangeCut={applyTimeRangeCut}
-                        onSplitActiveWordAtEditSec={splitWordAtEditSecFromWaveform}
-                        onPlayEditRange={dispatchPlayRangeIntentFromWaveform}
-                        onPausePlayback={pausePlayback}
-                        onUndo={undoSubtitleChange}
-                        playheadEditSecRef={playheadEditSecRef}
-                        isPlaying={isPlaying}
-                        suppressAutoFocusSeek={isWaveformFocusSuppressed()}
-                        autoFocusSeekBlockToken={waveformAutoSeekBlockToken}
-                        mediaDurationSec={waveformMediaDurationCapSec ?? waveformUiDurationSec}
-                        onPeaksDurationComparedToMedia={onPeaksDurationComparedToMedia}
-                        wordEdgeSubtitleBridge={wordEdgeSubtitleBridge}
-                        playbackSkipRanges={mergedWaveformPeaksStitchCuts}
-                      />
-                    ) : null}
                   </>
                 )}
               </div>

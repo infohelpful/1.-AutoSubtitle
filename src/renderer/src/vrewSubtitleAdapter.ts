@@ -131,6 +131,7 @@ function buildVrewRowFromLine(
         return {
           id,
           text: w.word,
+          gapKind: w.gapKind,
           start: p.start,
           end: p.end,
           ...(w.isSilence ? ({ isSilence: true } as const) : {})
@@ -181,6 +182,7 @@ function buildVrewRowFromLine(
       return {
         id: makeRowWordBlockId(idx + 1, wi + 1),
         text: w.word,
+        gapKind: w.gapKind,
         start: p.start,
         end: p.end,
         ...(w.isSilence ? ({ isSilence: true } as const) : {})
@@ -317,6 +319,7 @@ export function vrewRowsToSubtitleLines(
         word: w.text
       }
       if (w.isSilence) sw.isSilence = true
+      if (w.gapKind === 'unclassified') sw.gapKind = w.gapKind
       return sw
     })
     const text = row.lineText ?? displayTextFromSubtitleWords(words)

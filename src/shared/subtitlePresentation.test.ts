@@ -89,9 +89,27 @@ describe('continuous subtitle presentation', () => {
       { start: 128.682, end: 134.916, text: '직관적입니다' },
       { start: 135, end: 136, text: '삭제', isDeleted: true }
     ]
-    expect(pickActiveSubtitleIndex(lines, 135.5)).toBe(2)
+    expect(pickActiveSubtitleIndex(lines, 135.5)).toBeNull()
     expect(pickActiveSubtitleIndex(lines, 138.8)).toBe(1)
     expect(pickActiveSubtitleIndex(lines, 139.422)).toBe(0)
-    expect(subtitlePresentationEnd(lines, 2)).toBe(138.733)
+    expect(subtitlePresentationEnd(lines, 2)).toBe(134.916)
+  })
+
+  it('does not hold captions across an intro, even in older projects without gap rows', () => {
+    const lines = [{ start: 67.16, end: 68.98, text: '순서대로 정리해 드리겠습니다' },
+      { start: 72.25, end: 74.29, text: '벤토이 프로그램 다운로드 사이트 정보는' }]
+    expect(pickActiveSubtitleIndex(lines, 68.979)).toBe(0)
+    expect(pickActiveSubtitleIndex(lines, 68.98)).toBeNull()
+    expect(pickActiveSubtitleIndex(lines, 70)).toBeNull()
+    expect(pickActiveSubtitleIndex(lines, 72.25)).toBe(1)
+  })
+
+  it('preserves explicit imported cue ends even for short gaps', () => {
+    const lines = [{ start: 15, end: 17.34, text: '첫 자막', words: [
+      { start: 15, end: 17.34, word: '첫 자막', engine: 'srt-import' }] },
+      { start: 17.4, end: 19, text: '다음 자막' }]
+    expect(pickActiveSubtitleIndex(lines, 14.999)).toBeNull()
+    expect(pickActiveSubtitleIndex(lines, 17.35)).toBeNull()
+    expect(subtitlePresentationEnd(lines, 0)).toBe(17.34)
   })
 })

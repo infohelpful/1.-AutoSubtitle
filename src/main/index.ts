@@ -54,6 +54,7 @@ import { fingerprintMedia, saveProjectDocument } from './projectStorage'
 import { clipPlanFromCuts, mapSourceIntervalToProgram, programDuration, validateClipPlan } from '../shared/clipPlan'
 import { randomUUID } from 'node:crypto'
 import { decodeTextBuffer } from '../shared/scriptImport'
+import { toSrtTimestamp, toWebVttTimestamp, toAssTimestamp } from '../shared/subtitleTimestamp'
 import type {
   CutRange,
   ExportFormat,
@@ -602,15 +603,6 @@ function remapTimeByCuts(sec: number, cuts: CutRange[]): number {
   return Math.max(0, sec - shift)
 }
 
-function toSrtTimestamp(sec: number): string {
-  const s = Math.max(0, Number.isFinite(sec) ? sec : 0)
-  const hh = Math.floor(s / 3600)
-  const mm = Math.floor((s % 3600) / 60)
-  const ss = Math.floor(s % 60)
-  const ms = Math.floor((s - Math.floor(s)) * 1000)
-  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')},${String(ms).padStart(3, '0')}`
-}
-
 function escapeXmlText(value: string): string {
   return value
     .replace(/&/g, '&amp;')
@@ -696,17 +688,6 @@ function buildSrtText(subtitles: MappedSubtitle[], style?: ExportSubtitleStyle):
   return lines.join('\n')
 }
 
-/** WebVTT — PotPlayer 등에서 SRT보다 정렬·위치가 잘 먹는 경우가 많음 */
-function toWebVttTimestamp(sec: number): string {
-  const s = Math.max(0, Number.isFinite(sec) ? sec : 0)
-  const hh = Math.floor(s / 3600)
-  const mm = Math.floor((s % 3600) / 60)
-  const ss = s % 60
-  const whole = Math.floor(ss)
-  const ms = Math.floor((ss - whole) * 1000)
-  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(whole).padStart(2, '0')}.${String(ms).padStart(3, '0')}`
-}
-
 function escapeWebVttText(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
@@ -736,15 +717,6 @@ function buildTxtText(subtitles: MappedSubtitle[]): string {
 
 function escapeSubtitleFilterPath(p: string): string {
   return p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
-}
-
-function toAssTimestamp(sec: number): string {
-  const s = Math.max(0, Number.isFinite(sec) ? sec : 0)
-  const hh = Math.floor(s / 3600)
-  const mm = Math.floor((s % 3600) / 60)
-  const ss = Math.floor(s % 60)
-  const cs = Math.floor((s - Math.floor(s)) * 100)
-  return `${hh}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}.${String(cs).padStart(2, '0')}`
 }
 
 function hexToRgb(hex: string): { r: number; g: number; b: number } {

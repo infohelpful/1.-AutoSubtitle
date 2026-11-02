@@ -26,6 +26,44 @@ function mkLine(start: number, end: number, words: Array<[number, number, string
 }
 
 describe('waveform trim metadata', () => {
+  it('returns absorbed labels exactly once on repeated merge and shrink, even after serialization', () => {
+    let lines = [mkLine(0, 3, [[0, 1, '그렇다고'], [1, 2, '매번'], [2, 3, '매번']])]
+    const drag = (end: number) => {
+      lines = JSON.parse(JSON.stringify(applyWordEdgeDrag({ subtitles: lines, target: { lineIndex: 0, wordIndex: 0 },
+        edge: 'end', newSec: end, commitMode: true }).subtitles))
+    }
+    drag(3)
+    expect(lines[0].words![0].word).toBe('그렇다고 매번 매번')
+    drag(2)
+    expect(lines[0].words!.filter(w => !w.isDeleted).map(w => w.word)).toEqual(['그렇다고 매번', '매번'])
+    drag(1.5)
+    expect(lines[0].words!.filter(w => !w.isDeleted).map(w => w.word)).toEqual(['그렇다고', '매번', '매번'])
+    drag(3)
+    drag(1)
+    expect(lines[0].text).toBe('그렇다고 매번 매번')
+    expect(lines[0].words!.filter(w => !w.isDeleted).map(w => w.word)).toEqual(['그렇다고', '매번', '매번'])
+  })
+
+  it('left-edge shrink removes only the prefix returned to revived words', () => {
+    const lines = [mkLine(0, 3, [[0, 1, '매번'], [1, 2, '매번'], [2, 3, '그렇다고']])]
+    const merge = applyWordEdgeDrag({ subtitles: lines, target: { lineIndex: 0, wordIndex: 2 }, edge: 'start', newSec: 0, commitMode: true }).subtitles
+    const split = applyWordEdgeDrag({ subtitles: merge, target: { lineIndex: 0, wordIndex: 2 }, edge: 'start', newSec: 1, commitMode: true }).subtitles
+    expect(split[0].words!.filter(w => !w.isDeleted).map(w => w.word)).toEqual(['매번', '매번 그렇다고'])
+  })
+
+  it.each([undefined, 'unclassified'] as const)('absorbs and restores adjacent gap rows (%s) without cutting audio or adding labels', gapKind => {
+    const lines: SubtitleLine[] = [mkLine(0, 1, [[0, 1, '그렇다고']]),
+      { start: 1, end: 2, text: '', words: [{ start: 1, end: 2, word: '--', isSilence: true, gapKind }] },
+      mkLine(2, 3, [[2, 3, '매번']])]
+    const merge = applyWordEdgeDrag({ subtitles: lines, target: { lineIndex: 0, wordIndex: 0 }, edge: 'end', newSec: 3, commitMode: true }).subtitles
+    expect(merge[0].words![0]).toMatchObject({ word: '그렇다고', end: 2 })
+    expect(merge[1].words![0]).toMatchObject({ isDeleted: true, mergedByEdgeTrim: true })
+    expect(merge[2]).toEqual(expect.objectContaining({ text: '매번', start: 2, end: 3 }))
+    const split = applyWordEdgeDrag({ subtitles: merge, target: { lineIndex: 0, wordIndex: 0 }, edge: 'end', newSec: 1.4, commitMode: true }).subtitles
+    expect(split[1].isDeleted).toBeFalsy()
+    expect(split[1].words![0]).toMatchObject({ isSilence: true, start: 1.4, end: 2, gapKind })
+    expect(split[0].text).toBe('그렇다고')
+  })
   it('locks committed edges on speech and silence while leaving preview metadata unchanged', () => {
     const subtitles: SubtitleLine[] = [{ start: 0, end: 2, text: '말', words: [
       { id: 'speech', start: 0, end: 1, word: '말', alignmentStatus: 'aligned', sourceStart: 0, sourceEnd: 1 },

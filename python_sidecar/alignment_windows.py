@@ -28,8 +28,12 @@ def plan_alignment_windows(cue: dict, duration: float, max_context: float = 30,
         raise ValueError('Invalid segment source bounds')
     if not words:
         return []
-    if end - start <= max_context:
-        return [AlignmentWindow(start, min(end, duration), 0, len(words), 0, len(words))]
+    # ASR segment edges are estimates, not hard acoustic cuts. In particular the
+    # final Korean syllable can continue after the ASR end. Short cues previously
+    # received NO padding, forcing CTC to squeeze missing syllables into its tail.
+    context_start, context_end = max(0, start - padding), min(duration, end + padding)
+    if context_end - context_start <= max_context:
+        return [AlignmentWindow(context_start, context_end, 0, len(words), 0, len(words))]
     bounds = []
     for word in words:
         a, b = word.get('start'), word.get('end')
@@ -53,8 +57,8 @@ def plan_alignment_windows(cue: dict, duration: float, max_context: float = 30,
             left -= 1
         if right < len(words) and bounds[right][1] - bounds[left][0] <= max_context - 2 * padding:
             right += 1
-        a = max(start, bounds[left][0] - padding)
-        b = min(end, duration, bounds[right - 1][1] + padding)
+        a = max(0, bounds[left][0] - padding)
+        b = min(duration, bounds[right - 1][1] + padding)
         windows.append(AlignmentWindow(a, b, left, right, first, last))
         first = last
     return windows

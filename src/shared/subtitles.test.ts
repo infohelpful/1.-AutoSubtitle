@@ -32,6 +32,13 @@ describe('displayTextFromSubtitleWords', () => {
 })
 
 describe('subtitleLineEditDisplayText', () => {
+  it('removes stored automatic audio labels without removing real speech or custom captions', () => {
+    const words = [{start:0,end:1,word:'오디오'}, {start:1,end:2,word:'설정'},
+      {start:2,end:3,word:'오디오',isSilence:true,gapKind:'unclassified' as const}]
+    expect(subtitleLineEditDisplayText({text:'오디오 설정 오디오',words})).toBe('오디오 설정')
+    expect(subtitleLineEditDisplayText({text:'별도로 수정한 자막',words})).toBe('별도로 수정한 자막')
+    expect(subtitleLineEditDisplayText({text:'오디오',words:[words[2]]})).toBe('')
+  })
   it('omits silence and ellipsis tokens from stored line text when no words', () => {
     expect(subtitleLineEditDisplayText({ text: '-- hello ... -- world' })).toBe('hello world')
   })

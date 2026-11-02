@@ -37,6 +37,7 @@ import {
   type WaveformFillBand
 } from './waveform/waveformCanvasDrawing'
 import { buildEdlSkipMapping, type EdlSkipMapping } from './waveform/edlSkipMapping'
+import { adjacentGapContext } from './waveform/adjacentGapContext'
 import { useWaveformViewWindow } from './waveform/useWaveformViewWindow'
 import { useWordEdgeDrag } from './useWordEdgeDrag'
 import playIconUrl from '@resources/Play.svg'
@@ -406,7 +407,8 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       if (wi >= 0 && words.length > 0 && wid && activeW) {
         /** ±1 컨텍스트(좌1·활성·우1) — 처음 박스에 들어갈 시간 폭의 기준 */
         const ctx = computeWordContextWindow(words, wi, 0, 0, {
-          mediaDurationSec: mediaCap
+          mediaDurationSec: mediaCap,
+          ...adjacentGapContext(rowsRef.current, activeLineIndex, wi)
         })
         if (!ctx) {
           if (viewWinRef.current) return
@@ -533,11 +535,11 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
               { start: nextStart, end: nextEnd },
               playbackSkipRangesRef.current
             )
-            const newWidth = pps * Math.max(newMap.activeSpanSec, 1e-6)
-            const nextLeft =
-              dir === 'end'
-                ? prevLayout.left
-                : prevLayout.left + prevLayout.width - newWidth
+            const mountWidth = getWaveformMountAndArticleEl()?.mount.clientWidth ?? prevLayout.width
+            const newWidth = Math.min(Math.max(1, mountWidth - 8), pps * Math.max(newMap.activeSpanSec, 1e-6))
+            ppsRef.current = newWidth / Math.max(newMap.activeSpanSec, 1e-6)
+            const nextLeft = clampPx(dir === 'end' ? prevLayout.left : prevLayout.left + prevLayout.width - newWidth,
+              0, Math.max(0, mountWidth - newWidth - 8))
             const nextWin = { start: nextStart, end: nextEnd }
             const nextBox = { left: nextLeft, width: newWidth }
             viewWinLockedAnchorRef.current = anchorKey
@@ -950,113 +952,11 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       [pointerToTimeOnStrip]
     )
 
-    /**
-     * `applyWordEdgeDrag` 축(미디어 초) — 현재 viewWin(=V0) 안으로 양방향 클램프.
-     *  트림 핸들은 절대 V0 밖으로 못 나가고 viewWin 도 드래그 중 확장되지 않는다(스크롤 0).
-     *  V0 끝에서 손을 떼면 commit 의 흡수 로직이 이웃 단어를 합치고, 그 결과 활성 단어의 start/end 가
-     *  바뀌면 위쪽 layout effect 의 `anchorKey`(start/end 포함) 가 바뀌어 **±1 V0 를 새 단어 기준으로 재고정**.
-     *  → 흡수된 쪽에 이전엔 보이지 않던 다음/이전 단어 파동이 자연스럽게 한 칸씩 붙는다.
-     *
-     * **카드 95% 흡수 차단** — PPS 가 박제된 상태에서, *다음 흡수가 발생하면* viewWin 시간폭이 늘어
-     *  `pps × span` 으로 계산되는 박스 폭이 단어카드(`<article>`) 폭의 95% 를 넘는 경우,
-     *  해당 방향의 클램프 한계를 흡수 임계점 직전(`±ABSORB_GUARD_SEC`)으로 좁혀
-     *  사용자가 끝까지 끌어도 흡수가 발생하지 않게 한다. `Wwave > 0.95 × Wcard` 가 되는 시점부터는
-     *  새 이웃 파동이 더 이상 추가되지 않으므로 카드 밖 짤림이 발생하지 않는다.
-     */
+    /** The viewport bounds pointer movement; viewport size must never veto a merge. */
     const clampNewSecToViewWinMedia = useCallback((sec: number): number => {
-      const b = wordEdgeBridgeRef.current
       const vw = viewWinRef.current
-      if (!b || !vw) return sec
-      const loE = Math.min(vw.start, vw.end)
-      const hiE = Math.max(vw.start, vw.end)
-      const loM = b.editSecToMediaSec(loE)
-      const hiM = b.editSecToMediaSec(hiE)
-      let minE = Math.min(loM, hiM)
-      let maxE = Math.max(loM, hiM)
-
-      /** 카드 95% 상한 흡수 차단 — 미래 박스 폭 예측 */
-      const pps = ppsRef.current
-      const li = activeLineIndexRef.current
-      const cwi = centerWordIndexRef.current
-      const dir = lastTrimEdgeRef.current
-      const ABSORB_GUARD_SEC = 0.005
-      const MAX_WAVE_TO_CARD_RATIO = 0.95
-      if (pps != null && li != null && cwi >= 0 && dir != null) {
-        const rawMount = waveMountByLineRef.current.get(li)
-        const mount = rawMount && rawMount.isConnected ? rawMount : null
-        let article: HTMLElement | null = mount
-        while (article && article.tagName.toLowerCase() !== 'article') {
-          article = article.parentElement
-        }
-        if (article) {
-          const Wcard = article.getBoundingClientRect().width
-          const words = rowsRef.current[li]?.words ?? []
-          const activeW = cwi >= 0 && cwi < words.length ? words[cwi] : null
-          const mediaCap = metricsRef.current?.durationSec ?? Number.POSITIVE_INFINITY
-          const limit = Wcard * MAX_WAVE_TO_CARD_RATIO
-          if (Wcard > 1 && activeW) {
-            /**
-             * **미래 박스 폭 예측** — EDL skip 표시 압축 적용 후의 실제 시간폭(activeSpan) 으로 계산.
-             *  - 흡수가 발생해도 트림 commit 의 tombstone 은 `mergedByEdgeTrim: true` 라
-             *    `mergeWaveformPeaksStitchCutRanges` 에서 제외되어 *추가* 되지 않는다 (= 기존 컷 리스트 유지).
-             *  - 새 viewWin 안에 들어오는 *기존 컷* 길이만 빼면 그 흡수 직후의 activeSpan 이 정확히 나옴.
-             */
-            const allSkips = playbackSkipRangesRef.current
-            const futureActiveSpan = (ws: number, we: number): number => {
-              if (!(we > ws + 1e-9)) return 0
-              const m = buildEdlSkipMapping({ start: ws, end: we }, allSkips)
-              return m.activeSpanSec
-            }
-            if (dir === 'end' && cwi + 1 < words.length) {
-              const nextW = words[cwi + 1]!
-              const newWords = words.slice()
-              newWords.splice(cwi + 1, 1)
-              const aStart = Math.min(activeW.start, activeW.end)
-              const aEnd = Math.max(activeW.start, activeW.end)
-              const nEnd = Math.max(nextW.start, nextW.end)
-              newWords[cwi] = { ...activeW, start: aStart, end: Math.max(aEnd, nEnd) }
-              const ctx = computeWordContextWindow(newWords, cwi, 0, 0, {
-                mediaDurationSec: mediaCap
-              })
-              if (ctx) {
-                const nextActive = Math.max(futureActiveSpan(ctx.windowStart, ctx.windowEnd), 1e-6)
-                const nextWidth = pps * nextActive
-                if (nextWidth > limit) {
-                  const mediaNextEnd = b.editSecToMediaSec(nEnd)
-                  const restricted = mediaNextEnd - ABSORB_GUARD_SEC
-                  const newMaxE = Math.min(maxE, restricted)
-                  if (newMaxE > minE + 1e-6) maxE = newMaxE
-                }
-              }
-            } else if (dir === 'start' && cwi - 1 >= 0) {
-              const prevW = words[cwi - 1]!
-              const newWords = words.slice()
-              newWords.splice(cwi - 1, 1)
-              const newCwi = cwi - 1
-              const aStart = Math.min(activeW.start, activeW.end)
-              const aEnd = Math.max(activeW.start, activeW.end)
-              const pStart = Math.min(prevW.start, prevW.end)
-              newWords[newCwi] = { ...activeW, start: Math.min(aStart, pStart), end: aEnd }
-              const ctx = computeWordContextWindow(newWords, newCwi, 0, 0, {
-                mediaDurationSec: mediaCap
-              })
-              if (ctx) {
-                const nextActive = Math.max(futureActiveSpan(ctx.windowStart, ctx.windowEnd), 1e-6)
-                const nextWidth = pps * nextActive
-                if (nextWidth > limit) {
-                  const mediaPrevStart = b.editSecToMediaSec(pStart)
-                  const restricted = mediaPrevStart + ABSORB_GUARD_SEC
-                  const newMinE = Math.max(minE, restricted)
-                  if (newMinE < maxE - 1e-6) minE = newMinE
-                }
-              }
-            }
-          }
-        }
-      }
-
-      return clampPx(sec, minE, maxE)
-    }, [waveMountByLineRef])
+      return vw ? clampPx(sec, Math.min(vw.start, vw.end), Math.max(vw.start, vw.end)) : sec
+    }, [])
 
     const onWordEdgePreview = useCallback((result: EdgeDragResult) => {
       const b = wordEdgeBridgeRef.current
@@ -1070,8 +970,9 @@ const SubtitleWaveformPeaksImpl = forwardRef<SubtitleWaveformPeaksHandle, Subtit
       const li = activeLineIndexRef.current
       const cwi = centerWordIndexRef.current
       if (li == null || cwi < 0) return
-      const line = result.subtitles[li]
-      const si = storageWordIndexFromVisibleNonDeletedIndex(line, cwi)
+      const target = result.mutated[0]
+      const line = result.subtitles[target?.lineIndex ?? li]
+      const si = target?.wordIndex ?? storageWordIndexFromVisibleNonDeletedIndex(line, cwi)
       const w = si >= 0 ? line?.words?.[si] : undefined
       if (!w || w.isDeleted) return
       const lo = Math.min(w.start, w.end)

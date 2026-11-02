@@ -1,4 +1,5 @@
 import type { SubtitleLine, SubtitleWord } from './subtitles'
+import { subtitleLineEditDisplayText } from './subtitles'
 import { parseWordAlignmentMeta } from './wordAlignmentMeta'
 
 export type PreparedRealignCue = SubtitleLine & {
@@ -110,6 +111,74 @@ export function mergeRealignedCue(line: SubtitleLine, request: PreparedRealignCu
       throw new Error('선택 단어의 정렬이 이웃 단어와 충돌합니다. 이 줄 전체를 재정렬하거나 경계를 확인해 주세요.')
     }
   }
-  return { ...line, words, start: Math.min(line.start, ...words.map(w => w.start)),
+  return { ...line, text: subtitleLineEditDisplayText(line), words, start: Math.min(line.start, ...words.map(w => w.start)),
     end: Math.max(line.end, ...words.map(w => w.end)) }
+}
+
+/** Realignment may reclaim the audible tail previously labelled as unknown audio.
+ * Subtract speech from automatic gap chips across row boundaries. User cuts and
+ * manually adjusted gaps remain intact, and no media duration is removed.
+ */
+export function reconcileRealignedGaps(lines: readonly SubtitleLine[]): SubtitleLine[] {
+  const speech = lines.filter(line => !line.isDeleted).flatMap(line =>
+    (line.words ?? []).filter(word => !word.isDeleted && !word.isSilence && word.word.trim()))
+    .sort((a, b) => a.start - b.start)
+  return lines.flatMap(line => {
+    if (line.isDeleted || !line.words?.length) return [line]
+    let changed = false
+    const words = line.words.flatMap(word => {
+      if (!word.isSilence || word.isDeleted || word.manualStartLocked || word.manualEndLocked) return [word]
+      let parts = [{ start: word.start, end: word.end }]
+      for (const spoken of speech) {
+        if (spoken.start >= word.end) break
+        if (spoken.end <= word.start) continue
+        parts = parts.flatMap(part => {
+          if (spoken.start >= part.end || spoken.end <= part.start) return [part]
+          return [
+            ...(spoken.start > part.start ? [{ start: part.start, end: spoken.start }] : []),
+            ...(spoken.end < part.end ? [{ start: spoken.end, end: part.end }] : [])
+          ]
+        })
+      }
+      if (parts.length === 1 && parts[0].start === word.start && parts[0].end === word.end) return [word]
+      changed = true
+      return parts.filter(part => part.end - part.start > 1e-6).map((part, index) => ({ ...word, ...part,
+        ...(index > 0 ? { id: undefined } : {}) }))
+    })
+    if (!changed) return [line]
+    if (!words.length) return []
+    return [{ ...line, words, start: Math.min(...words.map(word => word.start)), end: Math.max(...words.map(word => word.end)) }]
+  })
+}
+
+/** Acoustic context may include deleted audio, but a timing update must not
+ * expand a surviving word across an existing user cut or a locked gap. */
+export function preserveRealignmentCuts(before: readonly SubtitleLine[], after: readonly SubtitleLine[],
+  cuts: readonly { start: number; end: number }[]): SubtitleLine[] {
+  const original = new Map(before.flatMap(line => line.words ?? []).filter(word => word.id).map(word => [word.id!, word]))
+  const protectedRanges = [...cuts, ...before.flatMap(line => (line.words ?? []).filter(word =>
+    word.isSilence && (word.manualStartLocked || word.manualEndLocked)))]
+  return after.map(line => {
+    let changed = false
+    const words = line.words?.map(word => {
+      if (word.isDeleted || word.isSilence) return word
+      const old = original.get(word.id ?? '') ?? original.get(word.parentWordId ?? '')
+      if (!old) return word
+      let { start, end } = word
+      for (const cut of protectedRanges) {
+        if (old.end <= cut.start + 1e-6 && end > cut.start) end = Math.min(end, cut.start)
+        if (old.start >= cut.end - 1e-6 && start < cut.end) start = Math.max(start, cut.end)
+      }
+      if (start === word.start && end === word.end) return word
+      changed = true
+      if (end <= start) { start = old.start; end = old.end }
+      return { ...word, start, end,
+        charSpans: word.charSpans?.flatMap(span => {
+          const a = Math.max(span.start, start), b = Math.min(span.end, end)
+          return b > a ? [{...span, start: a, end: b}] : []
+        }), reviewReasons: [...new Set([...(word.reviewReasons ?? []), 'cut_boundary_preserved'])] }
+    })
+    if (!changed || !words?.length) return line
+    return { ...line, words, start: Math.min(...words.map(word => word.start)), end: Math.max(...words.map(word => word.end)) }
+  })
 }

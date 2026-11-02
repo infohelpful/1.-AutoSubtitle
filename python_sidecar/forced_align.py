@@ -10,6 +10,7 @@ from alignment_contract import alignment_summary, apply_character_alignment
 from alignment_text import build_alignment_text
 from alignment_windows import plan_alignment_windows, merge_window_alignments
 from alignment_audio import mapped_alignment_audio
+from alignment_endings import trim_quiet_word_ends
 
 KOREAN_MODEL = "kresnik/wav2vec2-large-xlsr-korean"
 
@@ -90,7 +91,7 @@ def align_korean(cues: list[dict], media_path: str, ffmpeg_path: str, cache_dir:
                     print(f"alignment failed for segment {index} window {window}: {error!r}", file=sys.stderr, flush=True)
                     results.append(_unaligned_cue({'words': window_words}, index, "alignment_exception")['words'])
             next_cue = copy.deepcopy(cue)
-            next_cue["words"] = merge_window_alignments(words, windows, results)
+            next_cue["words"] = trim_quiet_word_ends(merge_window_alignments(words, windows, results), audio)
             output.append(next_cue)
         return {"schemaVersion": 1, "subtitles": output, "raw_subtitles": copy.deepcopy(cues),
                 "alignmentSummary": alignment_summary([w for c in output for w in c["words"]]),

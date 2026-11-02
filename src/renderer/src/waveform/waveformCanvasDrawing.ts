@@ -1,4 +1,4 @@
-import { mediaSecToPeakPixelIndex, type PeaksTimelineMetrics } from './peakPixelMapping'
+import { mediaSecToPeakPixelIndex, peakEnvelopeForMediaInterval, type PeaksTimelineMetrics } from './peakPixelMapping'
 import type { EdlSkipMapping } from './edlSkipMapping'
 
 export function collectDeletedRangesSec(
@@ -99,7 +99,6 @@ export function drawWaveformCanvas(
     skipMapping?: EdlSkipMapping | null
   }
 ): void {
-  const { data } = metrics
   const wPx = Math.max(1, Math.floor(canvas.clientWidth * dpr))
   const hPx = Math.max(1, Math.floor(heightCssPx * dpr))
   if (canvas.width !== wPx || canvas.height !== hPx) {
@@ -144,10 +143,11 @@ export function drawWaveformCanvas(
     const t = skipMapping
       ? skipMapping.pixelToMediaSec(x + 0.5, wPx)
       : winStart + ((x + 0.5) / wPx) * span
-    const pi = mediaSecToPeakPixelIndex(metrics, t)
-    const i = pi * 2
-    const mn = (data[i] ?? 0) / 127
-    const mx = (data[i + 1] ?? 0) / 127
+    const from = skipMapping ? skipMapping.pixelToMediaSec(x, wPx) : winStart + (x / wPx) * span
+    const to = skipMapping ? skipMapping.pixelToMediaSec(x + 1, wPx) : winStart + ((x + 1) / wPx) * span
+    const envelope = peakEnvelopeForMediaInterval(metrics, from, to, skipMapping?.skipsClipped)
+    const mn = envelope.min / 127
+    const mx = envelope.max / 127
     let y1 = midY + Math.min(mn, mx) * ampScale
     let y2 = midY + Math.max(mn, mx) * ampScale
     if (y2 - y1 < minBarPx) {

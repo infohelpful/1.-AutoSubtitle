@@ -35,6 +35,17 @@ class AlignmentContractTests(unittest.TestCase):
         result = self.apply([{"word": "가", "start": 0, "end": 1}], [{"char": "나", "start": 0, "end": .5, "score": 1}])
         self.assertIn("character_mapping_mismatch", result[0]["reviewReasons"])
 
+    def test_collapsed_low_confidence_syllables_are_not_claimed_as_aligned(self):
+        text = '없습니다'
+        chars = [{'char': c, 'start': 1+i*.02, 'end': 1+(i+1)*.02, 'score': score}
+                 for i, (c, score) in enumerate(zip(text, [0, .398, 0, .007]))]
+        result = self.apply([{'word': text+'.', 'start': .9, 'end': 1.5}], chars+[{'char': '.'}],
+                            {c: i for i, c in enumerate(text)})[0]
+        self.assertEqual(result['alignmentStatus'], 'unaligned')
+        self.assertEqual(result['end'], 1.5)
+        self.assertIn('low_character_confidence', result['reviewReasons'])
+        self.assertNotIn('charSpans', result)
+
     def test_punctuation_does_not_extend_speech_and_manual_boundary_is_preserved(self):
         result = self.apply([{"word": "가!", "start": .15, "end": 1, "manualStartLocked": True}],
                             [{"char": "가", "start": .2, "end": .5, "score": .9}, {"char": "!", "end": 1}])

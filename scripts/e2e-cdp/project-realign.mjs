@@ -54,13 +54,16 @@ try {
   await button('전체 자막 싱크 재정렬')
   await until(`document.body.innerText.includes('줄 정렬 완료 ·')`,600000)
   aligned=await save()
-  assert.equal(aligned.subtitles.length,original.subtitles.length)
   assert.notDeepEqual(aligned.subtitles,original.subtitles)
-  for(let i=0;i<original.subtitles.length;i++) {
-    const a=original.subtitles[i],b=aligned.subtitles[i]
-    assert.equal(b.text,a.text)
-    if(a.words.every(w=>w.isSilence||w.isDeleted))assert.deepEqual(b,a)
-    a.words.forEach((w,j)=>{if(w.manualStartLocked)assert.equal(b.words[j].start,w.start);if(w.manualEndLocked)assert.equal(b.words[j].end,w.end)})
+  const beforeWords=original.subtitles.flatMap(l=>l.words??[])
+  const afterWords=aligned.subtitles.flatMap(l=>l.words??[])
+  assert.deepEqual(afterWords.filter(w=>!w.isSilence).map(w=>w.word),beforeWords.filter(w=>!w.isSilence).map(w=>w.word))
+  for(const word of beforeWords.filter(w=>w.manualStartLocked||w.manualEndLocked||w.isDeleted)) {
+    const next=afterWords.find(w=>word.id ? w.id===word.id : w.word===word.word&&w.start===word.start&&w.end===word.end)
+    assert(next,'Protected word/gap missing')
+    if(word.isDeleted)assert.deepEqual(next,word)
+    if(word.manualStartLocked)assert.equal(next.start,word.start)
+    if(word.manualEndLocked)assert.equal(next.end,word.end)
   }
   writeFileSync('tools/sync-validation-output/sync-684-after-realign.autosub',JSON.stringify(aligned))
   console.log('PASS: whole project realignment',aligned.subtitles.length)

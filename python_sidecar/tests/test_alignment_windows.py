@@ -18,7 +18,17 @@ class AlignmentWindowTests(unittest.TestCase):
     def test_short_cue_keeps_full_context(self):
         cue = {'start': 0, 'end': 10, 'words': self.cue['words'][:3]}
         window, = plan_alignment_windows(cue, 80)
-        self.assertEqual((window.start, window.end, window.core_first, window.core_last), (0, 10, 0, 3))
+        self.assertEqual((window.start, window.end, window.core_first, window.core_last), (0, 10.5, 0, 3))
+
+    def test_last_syllable_can_extend_past_asr_segment_without_exceeding_media(self):
+        cue = {'start': 44.94, 'end': 53.7, 'words': [{'start': 53.38, 'end': 53.7, 'word': '없습니다.'}]}
+        window, = plan_alignment_windows(cue, 54.1)
+        self.assertEqual((window.start, window.end), (44.44, 54.1))
+
+    def test_near_limit_context_is_still_bounded_after_padding(self):
+        cue = {'start': 1, 'end': 31, 'words': [{'start': i+1.1, 'end': i+1.5, 'word': '말'} for i in range(30)]}
+        windows = plan_alignment_windows(cue, 40)
+        self.assertTrue(all(w.end-w.start <= 30 for w in windows))
 
     def test_long_cue_covers_every_word_once_with_bounded_overlapping_context(self):
         before = copy.deepcopy(self.cue)

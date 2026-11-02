@@ -8,6 +8,7 @@ export interface Word {
   end: number
   /** true: 타임라인 빈 구간용 무음 더미(예: 텍스트 `--`) */
   isSilence?: boolean
+  gapKind?: 'unclassified'
 }
 
 /** One subtitle line: word rail → (waveform) → text edit — DOM order matches Vrew. */

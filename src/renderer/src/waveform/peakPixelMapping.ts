@@ -65,3 +65,31 @@ export function mediaSecToPeakPixelIndex(metrics: PeaksTimelineMetrics, timeSec:
   const p = Math.floor((t / durationSec) * pixelCount)
   return Math.max(0, Math.min(p, pixelCount - 1))
 }
+
+/** Preserve every peak covered by a display pixel, excluding removed source intervals. */
+export function peakEnvelopeForMediaInterval(
+  metrics: PeaksTimelineMetrics,
+  start: number,
+  end: number,
+  skips: readonly { start: number; end: number }[] = []
+): { min: number; max: number } {
+  let min = 0, max = 0
+  const sample = (a: number, b: number) => {
+    if (b <= a + 1e-9) return
+    const { startPixel, endPixel } = mediaSecondsToPeakPixelRange(metrics, a, b)
+    for (let p = startPixel; p < endPixel; p++) {
+      min = Math.min(min, metrics.data[p * 2] ?? 0)
+      max = Math.max(max, metrics.data[p * 2 + 1] ?? 0)
+    }
+  }
+  let cursor = start
+  for (const skip of skips) {
+    if (skip.end <= cursor) continue
+    if (skip.start >= end) break
+    sample(cursor, Math.min(skip.start, end))
+    cursor = Math.max(cursor, skip.end)
+    if (cursor >= end) break
+  }
+  sample(cursor, end)
+  return { min, max }
+}

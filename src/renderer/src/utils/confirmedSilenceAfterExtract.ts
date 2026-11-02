@@ -26,7 +26,8 @@ export function confirmExtractedSilence(lines: readonly SubtitleLine[], waveform
     const close = (p: number) => {
       if (run < 0) return
       // Keep breath/consonant/quantization edges out of the silence marker.
-      const s = run * step + .02, e = p * step - .02
+      const s = run === first ? start : run * step + .02
+      const e = p === last ? Math.min(end, p * step) : p * step - .02
       if (e - s >= .2 - 1e-9) parts.push({ start: s, end: e, word: '--', isSilence: true })
       run = -1
     }
@@ -56,6 +57,12 @@ export function confirmExtractedSilence(lines: readonly SubtitleLine[], waveform
     if (word.end > end) { end = word.end; previousLine = index }
   }
   add(end, duration, -1)
-  for (const line of speech) line.words?.sort((a,b) => a.start - b.start || a.end - b.end)
+  for (const line of speech) {
+    line.words?.sort((a,b) => a.start - b.start || a.end - b.end)
+    if (line.words?.length) {
+      line.start = Math.min(...line.words.map(word => word.start))
+      line.end = Math.max(...line.words.map(word => word.end))
+    }
+  }
   return [...speech, ...rows].sort((a,b) => a.start - b.start)
 }

@@ -9,8 +9,8 @@
  *     - 왼쪽 핸들이 `prev.start` 까지 도달(`newStart <= prev.start + eps`) → prev 통째 흡수 (`mergedByEdgeTrim`).
  *     - 오른쪽 핸들이 `next.end` 까지 도달(`newEnd >= next.end - eps`) → next 통째 흡수.
  *     - 그 외에는 commit 시에도 흡수가 발생하지 않으며, 이웃 단어는 시간만 줄어든 채로 남는다.
- *  4) **Same-card only** — 다른 카드의 단어와는 어떤 경우에도 상호작용하지 않는다(cross-line clamp).
- *  5) **Revive(de-merge)** — 이전 흡수로 tombstone 된 *같은 줄* 단어가 새 gap 안에 들어오면 자동 부활.
+ *  4) 발화 병합은 같은 줄 안에서만. 인접 줄의 무음·오디오 구간은 흡수/복원할 수 있다.
+ *  5) **Revive(de-merge)** — 흡수했던 칩을 복원하고, commit 때 대상 칩의 중복 글자를 제거한다.
  *  6) **부모 SubtitleLine 동기화** — 카드의 `start/end/text` 를 활성 단어로 재계산.
  *
  * 구현 전략:
@@ -124,6 +124,27 @@ function mergeWordLabels(left: FlatWord, right: FlatWord): { word: string; isSil
   ]) }
 }
 
+/** Remove only the labels returned to revived chips, in storage order. */
+function releaseRevivedLabels(target: ActiveLinkedWord, revived: FlatWord[], edge: WordEdge): void {
+  const returned = joinWords([...revived].sort((a, b) => a.lineIndex - b.lineIndex || a.wordIndex - b.wordIndex)
+    .filter(w => !w.isSilence).map(w => w.word))
+  if (!returned) return
+  const label = target.word.trim()
+  if (label === returned) {
+    target.word = '--'
+    target.isSilence = true
+  } else if (edge === 'end' && label.endsWith(' ' + returned)) {
+    target.word = label.slice(0, -(returned.length + 1))
+  } else if (edge === 'start' && label.startsWith(returned + ' ')) {
+    target.word = label.slice(returned.length + 1)
+  }
+}
+
+/** Speech stays in its row; adjacent non-caption audio can be absorbed across rows. */
+function sharesEditableBoundary(target: FlatWord, neighbor: FlatWord): boolean {
+  return target.lineIndex === neighbor.lineIndex || neighbor.isSilence
+}
+
 /** flat 배열에서 (li, wi) 위치를 직접 찾는다. (`findFlat` 과 동일 의도, 내부 헬퍼) */
 function flatAt(flat: FlatWord[], li: number, wi: number): FlatWord | null {
   for (const fw of flat) {
@@ -164,19 +185,11 @@ function applyEdgeChangeInPlace(
   if (!target) return
 
   /**
-   * **Same-card only 정책** — 다른 카드 단어와는 어떤 경우에도 상호작용하지 않는다.
-   * target 의 새 edge 는 cross-line prev.end / next.start 까지로만 clamp.
+   * 다른 줄의 발화 경계까지는 확장할 수 있으나 그 발화를 흡수하지 않는다.
+   * 중간의 무음·오디오 칩은 줄이 달라도 흡수할 수 있다.
    */
-  const crossPrev = (() => {
-    const i = active.indexOf(target)
-    const p = i > 0 ? active[i - 1] : null
-    return p && p.lineIndex !== target.lineIndex ? p : null
-  })()
-  const crossNext = (() => {
-    const i = active.indexOf(target)
-    const n = i >= 0 && i < active.length - 1 ? active[i + 1] : null
-    return n && n.lineIndex !== target.lineIndex ? n : null
-  })()
+  const crossPrev = active.slice(0, targetActiveIdx).reverse().find(w => !sharesEditableBoundary(target, w))
+  const crossNext = active.slice(targetActiveIdx + 1).find(w => !sharesEditableBoundary(target, w))
 
   if (edge === 'start') {
     const ownEnd = target.end
@@ -194,7 +207,7 @@ function applyEdgeChangeInPlace(
       while (true) {
         const prev = findPrevActive(active, target)
         if (!prev) break
-        if (prev.lineIndex !== target.lineIndex) break
+        if (!sharesEditableBoundary(target, prev)) break
         if (newStart >= prev.end) break
 
         if (newStart > prev.start + 1e-9) {
@@ -220,13 +233,14 @@ function applyEdgeChangeInPlace(
     } else if (newStart > target.start) {
       /**
        * Shrink right — revive 우선, 없으면 prev.end 를 늘려 빈 공간 채움(텍스트 보존).
-       *  revive 된 단어는 원래 텍스트 그대로 살아나므로 target.word 는 손대지 않는다.
+       *  commit 때 복원된 글자를 target.word에서도 빼 중복을 방지한다.
        */
       const revived = reviveTombstonedPrevs(flat, target, newStart, onRevive)
+      if (commitMode) releaseRevivedLabels(target, revived, 'start')
       target.start = newStart
       if (revived.length === 0) {
         const prev = findPrevActive(active, target)
-        if (prev && prev.lineIndex === target.lineIndex) {
+        if (prev && sharesEditableBoundary(target, prev)) {
           prev.end = newStart
         }
       } else {
@@ -253,7 +267,7 @@ function applyEdgeChangeInPlace(
     while (true) {
       const next = findNextActive(active, target)
       if (!next) break
-      if (next.lineIndex !== target.lineIndex) break
+      if (!sharesEditableBoundary(target, next)) break
       if (newEnd <= next.start) break
 
       if (newEnd < next.end - 1e-9) {
@@ -279,10 +293,11 @@ function applyEdgeChangeInPlace(
      * Shrink left — revive 우선, 없으면 next.start 를 당겨 빈 공간 채움(텍스트 보존).
      */
     const revived = reviveTombstonedNexts(flat, target, newEnd, onRevive)
+    if (commitMode) releaseRevivedLabels(target, revived, 'end')
     target.end = newEnd
     if (revived.length === 0) {
       const next = findNextActive(active, target)
-      if (next && next.lineIndex === target.lineIndex) {
+      if (next && sharesEditableBoundary(target, next)) {
         next.start = newEnd
       }
     } else {
@@ -315,12 +330,12 @@ function reviveTombstonedPrevs(
   if (targetFlatIdx < 0) return revived
   for (let i = targetFlatIdx - 1; i >= 0; i--) {
     const fw = flat[i]!
-    /** same-card only — 다른 카드 단어 까지 부활하면 cross-line 변형이 일어난다. */
-    if (fw.lineIndex !== target.lineIndex) break
+    /** 다른 줄에서는 흡수했던 무음·오디오만 복원한다. */
+    if (!sharesEditableBoundary(target, fw)) break
     if (!fw.isDeleted || !fw.mergedByEdgeTrim) break
     const origStart = fw.start
     const origEnd = fw.end
-    if (origStart >= newStart - 1e-9) break
+    if (origStart >= newStart - 1e-9) continue
     fw.isDeleted = false
     /** revive 시 트림 흡수 메타도 함께 해제 — 다시 살아난 단어는 일반 활성 단어로 취급. */
     fw.mergedByEdgeTrim = false
@@ -357,8 +372,8 @@ function reviveTombstonedNexts(
   if (targetFlatIdx < 0) return revived
   for (let i = targetFlatIdx + 1; i < flat.length; i++) {
     const fw = flat[i]!
-    /** same-card only — 다른 카드로 건너가면 cross-line 변형이 일어난다. */
-    if (fw.lineIndex !== target.lineIndex) break
+    /** 다른 줄에서는 흡수했던 무음·오디오만 복원한다. */
+    if (!sharesEditableBoundary(target, fw)) break
     if (!fw.isDeleted || !fw.mergedByEdgeTrim) break
     const origStart = fw.start
     const origEnd = fw.end
@@ -480,7 +495,7 @@ export function unflattenAndSync(
       ...line,
       start: first.start,
       end: last.end,
-      text: joinWords(activeWords.map((w) => w.word)),
+      text: joinWords(activeWords.filter(w => !w.isSilence).map((w) => w.word)),
       words: newWords,
       isDeleted: false
     }

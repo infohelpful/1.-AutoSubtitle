@@ -73,6 +73,13 @@ def apply_character_alignment(words: list[dict], chars: list[dict], dictionary: 
         if not reasons and any(a["start"] > b["start"] or a["end"] > b["end"]
                                for a, b in zip(speech_chars, speech_chars[1:])):
             reasons.append("reversed_character_timing")
+        if not reasons:
+            scores = [c['score'] for c in speech_chars]
+            # A finite CTC path is not necessarily a usable alignment. Missing
+            # audio often produces near-zero scores packed into 20ms frames.
+            if (sum(scores) / len(scores) < .2 or
+                    sum(score < .05 for score in scores) >= max(2, math.ceil(len(scores) / 2))):
+                reasons.append('low_character_confidence')
         word.update(id=word.get("id") or f"{segment_id}:word:{index}", segmentId=segment_id,
                     rawStart=word.get("rawStart", word.get("start")), rawEnd=word.get("rawEnd", word.get("end")),
                     alignmentText=unicodedata.normalize("NFC", input_text["text"]),

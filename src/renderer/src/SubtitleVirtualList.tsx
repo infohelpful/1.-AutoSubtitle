@@ -36,7 +36,8 @@ import {
 import type { SubtitleRow } from './components/vrewPeaksEditor/types'
 import { computeLineZoomWindowFromCardBounds, type LineZoomWindowResult } from './lineZoomWindow'
 import type { PeaksZoomViewRange } from './SubtitleWaveformPeaks'
-import { isTimeInWordSpan, resolveHighlightWordIndex } from '../../shared/activeWordResolver'
+import { isTimeInWordSpan } from '../../shared/activeWordResolver'
+import { isRemovedSubtitleRow, resolveEditorHighlight } from '../../shared/editorPlayback'
 import { displayTextFromSubtitleWords } from '../../shared/subtitles'
 import { SILENCE_PLACEHOLDER_TEXT, scrubTimelineNoiseFromWordPiece } from '../../shared/wordContract'
 import { useSubtitleData } from './subtitleDataContext'
@@ -236,19 +237,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
   const requestFocusCaret = requestFocusWord
   const row = subtitles[index]
   if (!row) return null
-  /**
-   * 모든 단어가 tombstone(`isDeleted`) 된 카드 — UI 에서는 빈 카드로 남지 않도록 0 높이 숨김 행을 렌더.
-   * 배열에서 줄을 실제로 제거하지는 않아 인덱스 기반 콜백 / 캐럿 매핑이 그대로 유지된다.
-   * `useDynamicRowHeight` 의 ResizeObserver 가 0px 을 측정 → 가상 목록에서 자리가 회수된다.
-   */
-  if (row.isDeleted === true) {
-    return (
-      <div
-        style={{ ...style, height: 0, padding: 0, margin: 0, overflow: 'hidden', pointerEvents: 'none' }}
-        aria-hidden="true"
-      />
-    )
-  }
+  // VirtualRowRenderer unmounts deleted rows; storage indices remain stable for undo.
   const [caretIndex, setCaretIndex] = useState(0)
   const [caretVisible, setCaretVisible] = useState(false)
   const [caretBlink, setCaretBlink] = useState(false)
@@ -863,7 +852,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       if (!Number.isFinite(s) || !Number.isFinite(e)) return
       chips.push({ el, start: s, end: e, isSilence: el.classList.contains('subtitle-word-chip--silence') })
     })
-    const hit = playing && activeSubtitleIndexRef.current === index ? resolveHighlightWordIndex(chips, t) : -1
+    const hit = playing && activeSubtitleIndexRef.current === index ? resolveEditorHighlight(chips, t) : -1
     chips.forEach((chip, i) => chip.el.classList.toggle('subtitle-word-chip--active', i === hit))
   }, [wordRail, index, playheadSecRef, isPlaying, activeSubtitleIndexRef])
 
@@ -872,7 +861,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     const id = window.setInterval(() => {
       const playheadSec = playheadSecRef.current
       const words = wordRail
-      const wi = resolveHighlightWordIndex(words, playheadSec)
+      const wi = resolveEditorHighlight(words, playheadSec)
 
       const root = articleRef.current
       const focused = document.activeElement as HTMLElement | null
@@ -1698,8 +1687,6 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       >
         <div className="subtitle-row-index" onKeyDown={e => e.stopPropagation()}>
           <span aria-label={`자막 ${props.rowNumbers[index]}번`}>{props.rowNumbers[index]}</span>
-          <input type="checkbox" aria-label={`${props.rowNumbers[index]}번 자막 선택`}
-            checked={props.selectedRows.has(index)} onChange={e => props.onSelectRow(index, e.target.checked)} />
         </div>
         <div className="subtitle-card-head">
           <span className="subtitle-row-kind">▣ <span>영상 · 자막</span></span>
@@ -1891,7 +1878,8 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                         const absorbMs = isLastChip
                           ? DISPLAY_CROSS_CARD_GAP_ABSORB_MS
                           : DISPLAY_GAP_ABSORB_MS
-                        return `${formatTimecode(rw.start)} ~ ${formatTimecode(
+                        const kind = row.words?.[storageWi]?.gapKind === 'unclassified' ? '자막이 없는 오디오 구간 · ' : rw.isSilence ? '무음 구간 · ' : ''
+                        return `${kind}${formatTimecode(rw.start)} ~ ${formatTimecode(
                           resolveDisplayEndSec(rw.end, nextBoundary, absorbMs)
                         )}`
                       })()}
@@ -2076,6 +2064,9 @@ const subtitleVirtualRowAreEqual = (
 const SubtitleVirtualRow = memo(SubtitleVirtualRowImpl, subtitleVirtualRowAreEqual)
 
 function VirtualRowRenderer(props: RowComponentProps<SubtitleListRowProps>) {
+  if (isRemovedSubtitleRow(props.subtitles[props.index])) {
+    return <div {...props.ariaAttributes} style={{ ...props.style, height: 0, padding: 0, margin: 0, overflow: 'hidden' }} aria-hidden="true" />
+  }
   return <SubtitleVirtualRow {...props} />
 }
 
@@ -2307,7 +2298,7 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
   const tombstoneSig = useMemo(() => {
     let s = ''
     for (let i = 0; i < subtitles.length; i++) {
-      if (subtitles[i]?.isDeleted) s += `${i},`
+      if (isRemovedSubtitleRow(subtitles[i])) s += `${i},`
     }
     return s
   }, [subtitles])
@@ -2323,6 +2314,12 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     defaultRowHeight: SUBTITLE_LIST_ROW_HEIGHT,
     key: dynamicRowHeightKey
   })
+  // react-window's ResizeObserver ignores zero blockSize. Override the lookup,
+  // so deleted rows occupy exactly zero even when offscreen or previously measured.
+  const rowHeight = useMemo(() => ({
+    ...dynamicRowHeight,
+    getRowHeight: (index: number) => isRemovedSubtitleRow(subtitles[index]) ? 0 : dynamicRowHeight.getRowHeight(index)
+  }), [dynamicRowHeight, subtitles])
 
   const waveExpanded =
     props.waveformExpandedLineIndex !== null &&
@@ -2337,7 +2334,7 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
           className="subtitle-virtual-list"
           style={{ height: size.h, width: size.w }}
           rowCount={subtitles.length}
-          rowHeight={dynamicRowHeight}
+          rowHeight={rowHeight}
           rowComponent={VirtualRowRenderer}
           rowProps={rowProps}
           /** 160 은 스크롤 밖까지 수백 행을 마운트해 타이핑 시 전체가 버벅였음 — 파형 줄도 소량 overscan 으로 충분 */

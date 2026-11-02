@@ -676,7 +676,7 @@ def handle(method: str, params: dict[str, Any]) -> Any:
             audio = decode_audio(source)
             if len(audio) != 800:
                 raise RuntimeError('Runtime audio decode sample mismatch')
-        required = ('align_worker.py', 'forced_align.py', 'alignment_audio.py', 'alignment_contract.py', 'alignment_text.py', 'alignment_windows.py')
+        required = ('align_worker.py', 'forced_align.py', 'alignment_audio.py', 'alignment_contract.py', 'alignment_text.py', 'alignment_windows.py', 'alignment_endings.py')
         missing = [name for name in required if not (WORKER.parent / name).is_file()]
         if missing:
             raise RuntimeError(f'Missing alignment worker sources: {missing}')

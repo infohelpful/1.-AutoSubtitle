@@ -21,6 +21,8 @@ type SubtitleWordCore = {
   word: string
   /** true: gap-fill 등으로 삽입된 무음 구간(표시용 `word`는 보통 `??`) */
   isSilence?: boolean
+  /** Non-caption audio interval whose silence has not been confirmed from the waveform. */
+  gapKind?: 'unclassified'
   /** true: 비파괴 삭제(tombstone). 배열·타임스탬프는 유지하되 표시·재생·내보내기에서 제외 */
   isDeleted?: boolean
   /**
@@ -141,6 +143,16 @@ export function subtitleLineEditDisplayText(line: {
 
   if (fromTextSanitized.length === 0) return fromWords
 
+  // Older snapshots joined non-caption chip labels into line.text. Distinguish
+  // that exact token-derived string from a genuinely custom caption; a spoken
+  // word spelled "오디오" is still retained because it is not a silence chip.
+  if (words?.some(word => word.isSilence && !word.isDeleted)) {
+    const withGapLabels = words.filter(word => !word.isDeleted)
+      .map(word => scrubTimelineNoiseFromWordPiece(word.word))
+      .filter(piece => piece.length > 0 && !shouldOmitFromSubtitleEditLineText(piece)).join(' ')
+    if (normSubtitleLineEdit(fromTextSanitized) === normSubtitleLineEdit(withGapLabels)) return fromWords
+  }
+
   if (fromWords.length > 0) {
     if (normSubtitleLineEdit(fromTextSanitized) !== normSubtitleLineEdit(fromWords)) {
       return fromTextSanitized
@@ -174,18 +186,18 @@ export function mergeConsecutiveSilenceWords(words: readonly SubtitleWord[]): Su
       continue
     }
     const prev = out[out.length - 1]
-    if (prev && prev.isDeleted !== true && isSilBlock(prev) &&
+    if (prev && prev.isDeleted !== true && isSilBlock(prev) && prev.gapKind === w.gapKind &&
         !prev.manualStartLocked && !prev.manualEndLocked && !w.manualStartLocked && !w.manualEndLocked &&
         w.start <= prev.end + 1e-9 && prev.start <= w.end + 1e-9) {
       prev.start = Math.min(prev.start, w.start)
       prev.end = Math.max(prev.end, w.end)
-      prev.word = SILENCE_PLACEHOLDER_TEXT
+      prev.word = prev.gapKind === 'unclassified' ? '오디오' : SILENCE_PLACEHOLDER_TEXT
       prev.isSilence = true
       continue
     }
     out.push({
       ...w,
-      word: SILENCE_PLACEHOLDER_TEXT,
+      word: w.gapKind === 'unclassified' ? '오디오' : SILENCE_PLACEHOLDER_TEXT,
       isSilence: true
     })
   }

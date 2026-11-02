@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { displayTextFromSubtitleWords, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
-import { splitLineAtCaretOnWordBoundary, splitSubtitleAtWordBoundary, splitSubtitleLine } from './subtitleEditOps'
+import { displayTextFromSubtitleWords, subtitleLineEditDisplayText, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
+import { mergeEmptySubtitleWithPrevious, mergeSubtitleIntoPrevious, splitLineAtCaretOnWordBoundary, splitSubtitleAtWordBoundary, splitSubtitleLine } from './subtitleEditOps'
+import { sentenceTokenTimelineToSubtitleLines, subtitleLinesToSentenceTokenTimeline } from '../../shared/sentenceTokenTimelineAdapter'
 import { buildExportCueLines } from '../../shared/exportCuePipeline'
 
 function lineWithWords(tokens: Array<[string, number, number]>): SubtitleLine {
@@ -79,5 +80,59 @@ describe('splitSubtitleLine — word boundary snapping', () => {
     expect(out).toHaveLength(4)
     expect(out[0]).toBe(other)
     expect(out[3]).toBe(other)
+  })
+})
+
+describe('edited captions survive structural edits', () => {
+  const src = lineWithWords([['오늘은', 0, 1], ['날씨가', 1, 2], ['좋네요', 2.5, 3], ['그쵸', 3.2, 4]])
+  const edited = (text: string): SubtitleLine => ({ ...src, text, captionText: text })
+
+  it('divides an edited caption at the chip where Enter splits the row', () => {
+    const out = splitSubtitleAtWordBoundary([edited('오늘은 날씨가 정말 좋네요 그렇죠?')], 0, 2)
+    expect(out.map(l => subtitleLineEditDisplayText(l))).toEqual(['오늘은 날씨가', '정말 좋네요 그렇죠?'])
+    expect(out[1]!.captionText).toBe('정말 좋네요 그렇죠?')
+    expect(out[0]!.captionText).toBeUndefined()
+  })
+
+  it('keeps edits of rows that only shift position', () => {
+    const other = edited('다른 줄 수정본')
+    const out = splitSubtitleAtWordBoundary([edited('오늘 날씨 좋네요 그쵸'), other], 0, 2)
+    expect(out[2]).toBe(other)
+    expect(subtitleLineEditDisplayText(out[2]!)).toBe('다른 줄 수정본')
+  })
+
+  it('splits an edited caption at the textarea cursor with Ctrl+Enter', () => {
+    const caption = '오늘은 날씨가 정말 좋네요 그렇죠?'
+    const out = splitSubtitleLine([edited(caption)], 0, caption.indexOf('정말'))
+    expect(out.map(l => subtitleLineEditDisplayText(l))).toEqual(['오늘은 날씨가', '정말 좋네요 그렇죠?'])
+    expect(out[0]!.words!.map(w => w.word)).toEqual(['오늘은', '날씨가'])
+  })
+
+  it('joins both captions when Backspace merges a row into the previous one', () => {
+    const [a, b] = splitSubtitleAtWordBoundary([src], 0, 2)
+    const out = mergeSubtitleIntoPrevious([{ ...a!, text: '오늘 날씨', captionText: '오늘 날씨' }, b!], 1)!
+    expect(out).toHaveLength(1)
+    expect(subtitleLineEditDisplayText(out[0]!)).toBe('오늘 날씨 좋네요 그쵸')
+    expect(out[0]!.words).toHaveLength(4)
+  })
+
+  it('round-trips the merged caption through the timeline', () => {
+    const [a, b] = splitSubtitleAtWordBoundary([src], 0, 2)
+    const out = mergeSubtitleIntoPrevious([a!, { ...b!, text: '좋아요', captionText: '좋아요' }], 1)!
+    const [back] = sentenceTokenTimelineToSubtitleLines(subtitleLinesToSentenceTokenTimeline(out))
+    expect(subtitleLineEditDisplayText(back!)).toBe('오늘은 날씨가 좋아요')
+  })
+
+  it('merges plain rows without creating a caption override', () => {
+    const [a, b] = splitSubtitleAtWordBoundary([src], 0, 2)
+    const out = mergeSubtitleIntoPrevious([a!, b!], 1)!
+    expect(out[0]!.captionText).toBeUndefined()
+    expect(out[0]!.text).toBe('오늘은 날씨가 좋네요 그쵸')
+  })
+
+  it('keeps the previous edited caption when an emptied row is merged', () => {
+    const [a, b] = splitSubtitleAtWordBoundary([src], 0, 2)
+    const out = mergeEmptySubtitleWithPrevious([{ ...a!, text: '수정', captionText: '수정' }, { ...b!, text: '', captionText: '' }], 1)!
+    expect(subtitleLineEditDisplayText(out[0]!)).toBe('수정')
   })
 })

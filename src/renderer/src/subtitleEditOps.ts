@@ -1,17 +1,21 @@
 import { partitionLineAtSpeechBoundaries } from '../../shared/lineBreak'
 import { displayTextFromSubtitleWords, type SubtitleLine, type SubtitleWord } from '../../shared/subtitles'
 import { scrubTimelineNoiseFromWordPiece } from '../../shared/wordContract'
+import {
+  editedCaptionOf, mergedCaption, sourceBoundaryForCaptionOffset, sourcePieces, splitCaptionAtSourceBoundary, withCaption
+} from '../../shared/captionSplit'
 
 const MIN_SEGMENT_SEC = 0.05
 
-/** Move the words after a caret into a new row without copying the old caption to both rows. */
-export function splitSubtitleAtWordBoundary(
-  lines: readonly SubtitleLine[], index: number, wordIndex: number
-): SubtitleLine[] {
-  if (index < 0 || index >= lines.length) return [...lines]
+type CaptionPair = [string | undefined, string | undefined]
+
+function splitRowAtWord(
+  lines: readonly SubtitleLine[], index: number, wordIndex: number, captions?: CaptionPair
+): SubtitleLine[] | null {
+  if (index < 0 || index >= lines.length) return null
   const cur = lines[index]!
   const words = cur.words ?? []
-  if (wordIndex <= 0 || wordIndex >= words.length) return [...lines]
+  if (wordIndex <= 0 || wordIndex >= words.length) return null
   const leftWords = words.slice(0, wordIndex)
   const rightWords = words.slice(wordIndex)
   const leftEnd = leftWords[leftWords.length - 1]!.end
@@ -19,24 +23,63 @@ export function splitSubtitleAtWordBoundary(
   let splitTime = (leftEnd + rightStart) / 2
   if (!Number.isFinite(splitTime)) splitTime = rightStart
   splitTime = Math.max(cur.start + 0.1, Math.min(cur.end - 0.1, splitTime))
-  if (!(splitTime > cur.start && splitTime < cur.end)) return [...lines]
+  if (!(splitTime > cur.start && splitTime < cur.end)) return null
 
-  const leftText = displayTextFromSubtitleWords(leftWords) || cur.text
-  const rightText = displayTextFromSubtitleWords(rightWords) || cur.text
-  const edited = cur.captionText === cur.text ? cur.captionText?.trim() : undefined
-  // Preserve an edited prefix when the moved words still match its suffix.
-  const editedPrefix = edited && rightText && edited.endsWith(rightText)
-    ? edited.slice(0, -rightText.length).trim() : ''
-  const first: SubtitleLine = {
-    ...cur, end: splitTime, words: leftWords,
-    text: editedPrefix || leftText,
-    captionText: editedPrefix || undefined
-  }
-  const second: SubtitleLine = {
-    ...cur, start: splitTime, end: cur.end, words: rightWords,
-    text: rightText, captionText: undefined
+  let first: SubtitleLine = { ...cur, end: splitTime, words: leftWords }
+  let second: SubtitleLine = { ...cur, start: splitTime, end: cur.end, words: rightWords }
+  const caption = editedCaptionOf(cur)
+  const pair: CaptionPair | undefined = captions ?? (caption === undefined ? undefined
+    : splitCaptionAtSourceBoundary(caption, sourcePieces(words), sourcePieces(leftWords).length))
+  if (pair) {
+    first = withCaption(first, pair[0])
+    second = withCaption(second, pair[1])
+  } else {
+    first = withCaption(first, undefined)
+    second = withCaption(second, undefined)
+    if (!first.text) first.text = cur.text
+    if (!second.text) second.text = cur.text
   }
   return [...lines.slice(0, index), first, second, ...lines.slice(index + 1)]
+}
+
+/**
+ * Move the words after a caret into a new row. An edited caption is divided at
+ * the matching spot so neither row falls back to the original transcript.
+ */
+export function splitSubtitleAtWordBoundary(
+  lines: readonly SubtitleLine[], index: number, wordIndex: number
+): SubtitleLine[] {
+  return splitRowAtWord(lines, index, wordIndex) ?? [...lines]
+}
+
+/** Index of the word holding the `count`-th visible label, or -1 past the end. */
+function wordIndexForPieceBoundary(words: readonly SubtitleWord[], count: number): number {
+  let seen = 0
+  for (let i = 0; i < words.length; i++) {
+    const n = sourcePieces([words[i]!]).length
+    if (n > 0 && seen >= count) return i
+    seen += n
+  }
+  return -1
+}
+
+/** Join row `index` onto the previous row, keeping any edited caption text of both rows. */
+export function mergeSubtitleIntoPrevious(lines: readonly SubtitleLine[], index: number): SubtitleLine[] | null {
+  if (index <= 0 || index >= lines.length) return null
+  const up = lines[index - 1]!
+  const cur = lines[index]!
+  const mergedWords = [...(up.words ?? []), ...(cur.words ?? [])]
+  if (mergedWords.length === 0) return null
+  const caption = mergedCaption(up, cur)
+  const base: SubtitleLine = {
+    ...up,
+    start: Math.min(up.start, mergedWords[0]!.start),
+    end: Math.max(mergedWords[mergedWords.length - 1]!.end, up.end),
+    words: mergedWords
+  }
+  const merged = withCaption(base, caption)
+  if (caption === undefined && !merged.text) merged.text = `${up.text} ${cur.text}`.trim()
+  return [...lines.slice(0, index - 1), merged, ...lines.slice(index + 1)]
 }
 
 /**
@@ -100,6 +143,19 @@ export function splitSubtitleLine(
   const dur = end - start
   if (!(dur > 0) || !Number.isFinite(dur)) return [...lines]
 
+  const caption = editedCaptionOf(line)
+  if (caption !== undefined && line.words?.length) {
+    const cursor = Math.max(0, Math.min(Math.floor(cursorPos), caption.length))
+    const pair: CaptionPair = [caption.slice(0, cursor).trim(), caption.slice(cursor).trim()]
+    const pieces = sourcePieces(line.words)
+    const wordIndex = wordIndexForPieceBoundary(line.words, sourceBoundaryForCaptionOffset(caption, pieces, cursor))
+    const byWord = splitRowAtWord(lines, index, wordIndex, pair)
+    if (byWord) return byWord
+    const byRatio = splitSubtitleLine(lines.map((l, i) => i === index ? withCaption(l, undefined) : l), index,
+      Math.round(cursor / Math.max(1, caption.length) * displayTextFromSubtitleWords(line.words).length))
+    return byRatio.map((l, i) => i === index ? withCaption(l, pair[0]) : i === index + 1 ? withCaption(l, pair[1]) : l)
+  }
+
   const snapped = splitLineAtCaretOnWordBoundary(line, cursorPos)
   if (snapped) return [...lines.slice(0, index), ...snapped, ...lines.slice(index + 1)]
 
@@ -162,11 +218,14 @@ export function mergeEmptySubtitleWithPrevious(
     mergedWords && mergedWords.length > 0
       ? displayTextFromSubtitleWords(mergedWords) || prevLine.text
       : prevLine.text
-  const merged: SubtitleLine = {
+  let merged: SubtitleLine = {
     start: prevLine.start,
     end: cur.end,
     text,
-    ...(mergedWords ? { words: mergedWords } : {})
+    ...(mergedWords ? { words: mergedWords } : {}),
+    ...(prevLine.isHidden ? { isHidden: true } : {})
   }
+  const caption = mergedCaption(prevLine, cur)
+  if (caption !== undefined) merged = withCaption(merged, caption)
   return [...lines.slice(0, index - 1), merged, ...lines.slice(index + 1)]
 }

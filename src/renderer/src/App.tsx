@@ -75,7 +75,7 @@ import {
   srtCuesToSubtitleLines,
   type ScriptSplitOptions
 } from '../../shared/scriptImport'
-import { mergeEmptySubtitleWithPrevious, splitSubtitleAtWordBoundary, splitSubtitleLine } from './subtitleEditOps'
+import { mergeEmptySubtitleWithPrevious, mergeSubtitleIntoPrevious, splitSubtitleAtWordBoundary, splitSubtitleLine } from './subtitleEditOps'
 import { SubtitleVirtualList } from './SubtitleVirtualList'
 import { SubtitleDataProvider } from './subtitleDataContext'
 import {
@@ -4078,21 +4078,8 @@ export default function App(): ReactElement {
           return subtitleLinesAfterSoftDeleteWordRange(prev, cardIndex, wordIndex - 1, wordIndex, [])?.lines ?? prev
         }
 
-        // 2) 카드 첫 단어: 이전 카드로 모두 이동 + 현재 카드 삭제
-        if (cardIndex === 0) return prev
-        const up = prev[cardIndex - 1]
-        const upWords = up.words ?? []
-        const movedWords = words
-        const mergedWords = [...upWords, ...movedWords]
-        if (mergedWords.length === 0) return prev
-        const merged: SubtitleLine = {
-          ...up,
-          start: Math.min(up.start, mergedWords[0].start),
-          end: Math.max(mergedWords[mergedWords.length - 1].end, up.end),
-          words: mergedWords,
-          text: textFromWords(mergedWords, `${up.text} ${cur.text}`.trim())
-        }
-        return [...prev.slice(0, cardIndex - 1), merged, ...prev.slice(cardIndex + 1)]
+        // 2) 카드 첫 단어: 이전 카드로 모두 이동 + 현재 카드 삭제 (편집한 자막 문구는 유지)
+        return mergeSubtitleIntoPrevious(prev, cardIndex) ?? prev
       })
     },
     [applySubtitleChange]
@@ -6718,7 +6705,9 @@ export default function App(): ReactElement {
 
   const projectFileUiDisabled = !modelReady || busy || isExtracting || projectIoBusy
 
-  useEffect(() => { setSelectedSubtitleRows(new Set()) }, [subtitles, videoPath])
+  // Row indices only shift when rows are added or removed; keep checks across text/visibility edits.
+  const subtitleRowCount = subtitles.length
+  useEffect(() => { setSelectedSubtitleRows(new Set()) }, [subtitleRowCount, videoPath])
   const toggleSubtitleSelection = useCallback((index: number, checked: boolean) => {
     setSelectedSubtitleRows(prev => {
       const next = new Set(prev)
@@ -6732,6 +6721,13 @@ export default function App(): ReactElement {
   const changeSelectedVisibility = (hidden: boolean) => {
     applySubtitleChange(lines => setSubtitleVisibility(lines, selectedSubtitleRows, hidden))
   }
+  const allSubtitlesHidden = visibleRowIndices.length > 0 && visibleRowIndices.every(i => subtitles[i]?.isHidden)
+  const toggleAllSubtitlesHidden = () => {
+    applySubtitleChange(lines => setSubtitleVisibility(lines, new Set(visibleRowIndices), !allSubtitlesHidden))
+  }
+  const selectionHasHidden = [...selectedSubtitleRows].some(i => subtitles[i]?.isHidden)
+  const selectionHasShown = [...selectedSubtitleRows].some(i => subtitles[i] && !subtitles[i].isHidden)
+  const visibilityEditDisabled = isExtracting || projectIoBusy
 
   return (
     <div className={`app app--subtitle-only editor-tab-${editorTab}`}>
@@ -7146,7 +7142,17 @@ export default function App(): ReactElement {
                   </p>
                 ) : null}
               </header>
-              <p className="subtitle-selection-count" aria-live="polite">{visibleRowIndices.length}개의 자막</p>
+              <div className="subtitle-selection-toolbar" role="group" aria-label="자막 줄 선택 및 표시">
+                <label><input type="checkbox" aria-label="모든 자막 줄 선택"
+                  checked={visibleRowIndices.length > 0 && visibleRowIndices.every(i => selectedSubtitleRows.has(i))}
+                  ref={el => { if (el) el.indeterminate = selectedSubtitleRows.size > 0 && !visibleRowIndices.every(i => selectedSubtitleRows.has(i)) }}
+                  disabled={visibleRowIndices.length === 0}
+                  onChange={e => setSelectedSubtitleRows(new Set(e.target.checked ? visibleRowIndices : []))} />전체 선택</label>
+                <span className="subtitle-selection-count" aria-live="polite">{selectedSubtitleRows.size ? `${selectedSubtitleRows.size}줄 선택` : `${visibleRowIndices.length}개의 자막`}</span>
+                <button type="button" disabled={!selectionHasShown || visibilityEditDisabled} onClick={() => changeSelectedVisibility(true)}>선택 자막 숨기기</button>
+                <button type="button" disabled={!selectionHasHidden || visibilityEditDisabled} onClick={() => changeSelectedVisibility(false)}>선택 자막 표시</button>
+                <button type="button" disabled={visibleRowIndices.length === 0 || visibilityEditDisabled} onClick={toggleAllSubtitlesHidden}>{allSubtitlesHidden ? '전체 자막 표시' : '전체 자막 숨기기'}</button>
+              </div>
               <div className="subtitle-panel-body">
                 {subtitles.length === 0 ? (
                   <div className="subtitle-empty-placeholder" aria-live="polite">

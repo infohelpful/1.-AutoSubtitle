@@ -1690,6 +1690,11 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       >
         <div className="subtitle-row-index" onKeyDown={e => e.stopPropagation()}>
           <span aria-label={`자막 ${props.rowNumbers[index]}번`}>{props.rowNumbers[index]}</span>
+          <input type="checkbox" aria-label={`${props.rowNumbers[index]}번 자막 선택`}
+            checked={props.selectedRows.has(index)}
+            onClick={e => e.stopPropagation()}
+            onMouseDown={e => e.stopPropagation()}
+            onChange={e => props.onSelectRow(index, e.target.checked)} />
         </div>
         <div className="subtitle-card-head">
           <span className="subtitle-row-kind">▣ <span>영상 · 자막</span></span>

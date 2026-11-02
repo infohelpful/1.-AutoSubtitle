@@ -39,6 +39,12 @@ npm run bundle:sidecar
 
 `alignment_audio.py`는 FFmpeg 출력 전체를 stdout bytes/ndarray로 복사하지 않고 자동 삭제되는 임시 파일을 매핑한다. 기존 16kHz mono float32 샘플과 절대 시각은 유지한다. 임시 디스크는 약 64kB/초가 추가로 필요하고, OS 페이지 캐시와 모델 RAM은 별개다. `scripts/alignment-audio-bench.py`로 모델 없는 전체 디코드 메모리와 짧은 실영상의 기존/새 정렬 결과 동일성을 재현할 수 있다. context 외부로 오디오 참조를 보관해 사용하면 안 된다.
 
+## 정렬 runtime·모델 용량 (2026-11-03)
+
+- 정렬 모델은 `model.safetensors`와 JSON 설정만 받는다(`forced_align.MODEL_DOWNLOAD_PATTERNS`). 저장소의 `pytorch_model.bin`(같은 가중치)과 `training_args.bin`은 받지 않는다. 신규 다운로드는 2.53GB에서 1.27GB로 줄었다. 예전에 둘 다 받아 둔 캐시는 다음 정렬 시 `prune_redundant_model_files`가 중복 파일을 지운다. 다른 revision이 같은 blob을 가리키면 blob은 남긴다.
+- torch Windows wheel의 `torch/lib/*.lib`(약 2.58GiB, `dnnl.lib`만 2.3GB)는 C++ 확장 빌드용이며 실행 시 읽지 않는다. torch 설치·업그레이드 후 `python scripts/strip-alignment-runtime.py --venv .venv-alignment --apply`를 실행한다(기본은 dry run). `.venv-alignment`가 4.0GB에서 1.4GB로 줄었다.
+- 검증: 35초 한국어 실영상(`false-silence-source-35s.mp4`, raw 74단어)의 실제 CPU 정렬 결과 JSON이 변경 전 기준값과 완전히 같았다(기준값을 두 번 실행해 결정적임도 확인). Python 80 tests(FFmpeg 통합 포함) 통과.
+
 ## 미완료
 
 정렬 Python/torch runtime와 정렬/ASR 모델의 설치본 배포, 새 PC/GPU/오프라인 첫 설치 검증은 남았다. 현재 정밀 정렬 검사는 개발 가상환경을 명시적으로 지정했으므로, 배포된 앱만으로 정밀 모드가 준비됐다는 뜻이 아니다. 전체 ASR/모델 메모리, 정렬 TEMP 드라이브의 사전 여유 공간 검사·작업 중 디스크 상한도 남았다.

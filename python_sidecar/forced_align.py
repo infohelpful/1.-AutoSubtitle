@@ -5,6 +5,7 @@ import copy
 import contextlib
 import re
 import sys
+from pathlib import Path
 
 from alignment_contract import alignment_summary, apply_character_alignment, reconcile_alignment_word_overlaps
 from alignment_text import build_alignment_text
@@ -13,6 +14,39 @@ from alignment_audio import mapped_alignment_audio
 from alignment_endings import trim_quiet_word_ends
 
 KOREAN_MODEL = "kresnik/wav2vec2-large-xlsr-korean"
+# The repo ships the same weights twice (model.safetensors and pytorch_model.bin, ~1.27GB each)
+# plus training_args.bin; inference needs only the safetensors file and the JSON configs.
+MODEL_DOWNLOAD_PATTERNS = ["*.json", "model.safetensors"]
+REDUNDANT_MODEL_FILES = ("pytorch_model.bin", "training_args.bin")
+
+
+def prune_redundant_model_files(snapshot_dir: str | Path) -> int:
+    """Delete files older installs downloaded but inference never reads. Returns bytes freed.
+
+    Runs only when model.safetensors is present. In a Hugging Face cache the snapshot entry may be
+    a symlink into ``blobs/``; the blob is removed too unless another snapshot still links to it.
+    """
+    snapshot = Path(snapshot_dir)
+    if not (snapshot / "model.safetensors").is_file():
+        return 0
+    snapshots_root = snapshot.parent
+    freed = 0
+    for name in REDUNDANT_MODEL_FILES:
+        entry = snapshot / name
+        if not entry.exists() and not entry.is_symlink():
+            continue
+        target = entry.resolve() if entry.is_symlink() else None
+        size = entry.stat().st_size if entry.exists() else 0
+        entry.unlink()
+        if target is not None and target.is_file():
+            still_used = any(other.is_symlink() and other.resolve() == target
+                             for other in snapshots_root.glob("*/*") if other != entry)
+            if not still_used:
+                target.unlink()
+            else:
+                size = 0
+        freed += size
+    return freed
 
 
 def _unaligned_cue(cue: dict, index: int, reason: str) -> dict:
@@ -50,7 +84,13 @@ def align_korean(cues: list[dict], media_path: str, ffmpeg_path: str, cache_dir:
     with contextlib.ExitStack() as resources, contextlib.redirect_stdout(sys.stderr):
         import whisperx
         model_path = snapshot_download(KOREAN_MODEL, revision=revision, cache_dir=cache_dir,
-                                       allow_patterns=["*.json", "*.bin", "*.safetensors"])
+                                       allow_patterns=MODEL_DOWNLOAD_PATTERNS)
+        try:
+            freed = prune_redundant_model_files(model_path)
+            if freed:
+                print(f"alignment model: removed {freed} bytes of unused weight files", file=sys.stderr, flush=True)
+        except OSError as error:  # cleanup must never block alignment
+            print(f"alignment model: cleanup skipped: {error!r}", file=sys.stderr, flush=True)
         model, metadata = whisperx.load_align_model("ko", device, model_name=model_path)
         audio = resources.enter_context(mapped_alignment_audio(media_path, ffmpeg_path, source_origin_sec))
         duration = len(audio) / 16000

@@ -658,34 +658,24 @@ function normalizeMappedSubtitles(subtitles: MappedSubtitle[]): MappedSubtitle[]
 }
 
 /**
- * 프리뷰(textAlign:center, translateX(-50%), bottom:y%)와 유사하게 SSA 호환 태그 부착.
- * PotPlayer·VLC 등 — {\an2}=하단 기준 가운데, 해상도가 있으면 \pos로 좌우·세로 위치 근사.
+ * Plain SubRip without SSA override tags. Players lay SRT out on a 384x288
+ * script canvas, so a \pos() in video pixels pushed every cue off-screen.
+ * Positioned captions belong in the ASS export.
  */
-function buildSrtSsaAlignmentPrefix(style?: ExportSubtitleStyle): string {
-  const base = '{\\an2}'
-  const w = style?.videoWidth
-  const h = style?.videoHeight
-  if (!w || !h || w < 160 || h < 120) return base
-  const xPct = Math.max(5, Math.min(95, Number(style?.x ?? 50)))
-  const yPct = Math.max(2, Math.min(98, Number(style?.y ?? 10)))
-  const cx = Math.round((w * xPct) / 100)
-  const cy = Math.round(h * (1 - yPct / 100))
-  return `{\\an2\\pos(${cx},${cy})}`
-}
-
-function buildSrtText(subtitles: MappedSubtitle[], style?: ExportSubtitleStyle): string {
-  const prefix = buildSrtSsaAlignmentPrefix(style)
+function buildSrtText(subtitles: MappedSubtitle[]): string {
   const lines: string[] = []
   let cue = 1
   for (const item of subtitles) {
+    const body = item.text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    if (body.length === 0) continue
     lines.push(String(cue))
     lines.push(`${toSrtTimestamp(item.start)} --> ${toSrtTimestamp(item.end)}`)
-    const body = item.text.trim()
-    lines.push(prefix ? `${prefix}${body}` : body)
+    lines.push(...body)
     lines.push('')
     cue += 1
   }
-  return lines.join('\n')
+  // CRLF is the SubRip convention; some Windows players require it.
+  return lines.join('\r\n')
 }
 
 function escapeWebVttText(text: string): string {
@@ -1536,7 +1526,11 @@ if (ownsProfile) app.whenReady().then(async () => {
       wav: 'WAV Audio'
     }
     const ext = defaultExtByFormat[format]
-    const suggested = join(parsedInput.dir, `${parsedInput.name}_AutoSubtitle${ext}`)
+    // Subtitle files take the video's name so players auto-load them; media
+    // outputs keep a suffix so they can never overwrite the source file.
+    const isSubtitleFile = format === 'srt' || format === 'vtt' || format === 'ass' || format === 'txt'
+    const suffix = isSubtitleFile ? '' : '_AutoSubtitle'
+    const suggested = join(parsedInput.dir, `${parsedInput.name}${suffix}${ext}`)
     const saveRes = await dialog.showSaveDialog(win, {
       title: '내보내기',
       defaultPath: suggested,
@@ -1548,7 +1542,7 @@ if (ownsProfile) app.whenReady().then(async () => {
     if (saveRes.canceled || !saveRes.filePath) return { canceled: true as const }
 
     const selected = parse(saveRes.filePath)
-    const outputName = selected.name.endsWith('_AutoSubtitle') ? selected.name : `${selected.name}_AutoSubtitle`
+    const outputName = isSubtitleFile || selected.name.endsWith('_AutoSubtitle') ? selected.name : `${selected.name}_AutoSubtitle`
     const outputPath = join(selected.dir, `${outputName}${selected.ext || ext}`)
     const cuts = normalizeCutRanges(Array.isArray(req.cutRanges) ? req.cutRanges : [])
     const explicitPlan = req.clipPlan ? validateClipPlan(req.clipPlan, Math.max(...req.clipPlan.map((clip) => clip.sourceEnd))) : null
@@ -1558,7 +1552,7 @@ if (ownsProfile) app.whenReady().then(async () => {
       : normalizeMappedSubtitles(buildMappedSubtitles(req.subtitles, cuts))
 
     if (format === 'srt') {
-      writeUtf8TextFile(outputPath, buildSrtText(mappedSubtitles, req.subtitleStyle))
+      writeUtf8TextFile(outputPath, buildSrtText(mappedSubtitles))
       sendExportProgress(win, { percent: 100 })
       return { canceled: false as const, outputPath, format }
     }

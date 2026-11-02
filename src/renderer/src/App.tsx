@@ -118,6 +118,8 @@ import {
 } from './timeline/playbackSchedule'
 import { pickActiveEditorRow, resolveEditorHighlight, sourceTimelineDuration } from '../../shared/editorPlayback'
 import { setSubtitleVisibility, subtitlePreviewText } from '../../shared/subtitleVisibility'
+import { replaceAllSubtitleMatches, replaceSubtitleMatch, type SubtitleSearchMatch } from '../../shared/subtitleSearch'
+import { SubtitleSearchPanel } from './components/SubtitleSearchPanel'
 import { WebAudioMasterPlayback } from './timeline/webAudioMasterPlayback'
 import { videoFollowRate } from './timeline/audioOutputClock'
 import { useVideoSeekUi } from './sync/useVideoSeekUi'
@@ -6729,6 +6731,41 @@ export default function App(): ReactElement {
   const selectionHasShown = [...selectedSubtitleRows].some(i => subtitles[i] && !subtitles[i].isHidden)
   const visibilityEditDisabled = isExtracting || projectIoBusy
 
+  // Ctrl+F: find & replace over caption text. The panel lives in the preview pane
+  // so it never covers the subtitle list.
+  const [search, setSearch] = useState<{ open: boolean; seq: number; initial: string }>({ open: false, seq: 0, initial: '' })
+  const [searchHit, setSearchHit] = useState<SubtitleSearchMatch | null>(null)
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.code !== 'KeyF') return
+      e.preventDefault()
+      e.stopPropagation()
+      const el = document.activeElement
+      const picked = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement
+        ? el.value.slice(el.selectionStart ?? 0, el.selectionEnd ?? 0)
+        : window.getSelection()?.toString() ?? ''
+      const initial = /[\r\n]/.test(picked) ? '' : picked
+      setSearch(prev => ({ open: true, seq: prev.seq + 1, initial }))
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [])
+  const closeSearch = useCallback(() => setSearch(prev => ({ ...prev, open: false })), [])
+  const revealSearchMatch = useCallback((match: SubtitleSearchMatch | null) => setSearchHit(match), [])
+  const replaceSearchMatch = useCallback((match: SubtitleSearchMatch, replacement: string) => {
+    applySubtitleChange(lines => replaceSubtitleMatch(lines, match, replacement))
+  }, [applySubtitleChange])
+  const replaceAllSearchMatches = (query: string, replacement: string, caseSensitive: boolean): number => {
+    const { count } = replaceAllSubtitleMatches(subtitles, query, replacement, { caseSensitive })
+    if (count) applySubtitleChange(lines => replaceAllSubtitleMatches(lines, query, replacement, { caseSensitive }).lines)
+    return count
+  }
+  const searchRowNumbers = useMemo(() => subtitles.reduce<number[]>((numbers, line) => {
+    const last = numbers.at(-1) ?? 0
+    numbers.push(line.isDeleted || (line.words?.length && line.words.every(w => w.isDeleted)) ? last : last + 1)
+    return numbers
+  }, []), [subtitles])
+
   return (
     <div className={`app app--subtitle-only editor-tab-${editorTab}`}>
       {projectMediaNotice ? <div className="app-gpu-install-banner" role="status" data-testid="project-media-notice">
@@ -7060,6 +7097,19 @@ export default function App(): ReactElement {
                 </div>
               </div>
             )}
+            {search.open ? (
+              <SubtitleSearchPanel
+                subtitles={subtitles}
+                rowNumbers={searchRowNumbers}
+                focusSeq={search.seq}
+                initialQuery={search.initial}
+                disabled={isExtracting || projectIoBusy}
+                onClose={closeSearch}
+                onRevealMatch={revealSearchMatch}
+                onReplace={replaceSearchMatch}
+                onReplaceAll={replaceAllSearchMatches}
+              />
+            ) : null}
             {transcribeDiagnostics.length > 0 && (
               <details className="text-xs p-2" aria-label="자막 추출 진단">
                 <summary>자막 추출 정보</summary>
@@ -7167,6 +7217,7 @@ export default function App(): ReactElement {
                       <SubtitleDataProvider subtitles={subtitles}>
                         <SubtitleVirtualList
                           selectedRows={selectedSubtitleRows}
+                          searchHit={searchHit}
                           onSelectRow={toggleSubtitleSelection}
                           subtitles={subtitlesForSubtitleVirtualList}
                           activeSubtitleIndexRef={activeSubtitleIndexRef}

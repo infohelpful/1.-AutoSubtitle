@@ -117,3 +117,24 @@
   .editor-home-tools { gap: 2px; }
   .editor-home-tools button { min-width: 50px; }
 }
+/* Ctrl+F find & replace — docked inside the preview pane so the subtitle list stays visible. */
+.split-preview { position: relative; }
+.subtitle-search-panel { position: absolute; top: 12px; right: 12px; z-index: 40; width: min(320px, calc(100% - 24px)); display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid #4a5558; border-radius: 8px; background: #1b2021; box-shadow: 0 10px 28px #0009; color: #c9d4d6; font-size: 12px; }
+.subtitle-search-head { display: flex; align-items: center; justify-content: space-between; color: #e3ebec; font-size: 13px; }
+.subtitle-search-close { border: 0; background: transparent; color: #9aabae; cursor: pointer; padding: 2px 6px; }
+.subtitle-search-close:hover { color: #fff; }
+.subtitle-search-row { display: flex; align-items: center; gap: 8px; }
+.subtitle-search-row input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid #394346; border-radius: 5px; background: #222829; color: #dae3e5; font: inherit; outline: none; }
+.subtitle-search-row input:focus { border-color: #14b6d3; }
+.subtitle-search-count { min-width: 52px; text-align: right; color: #8a9b9f; font-variant-numeric: tabular-nums; }
+.subtitle-search-actions { display: flex; align-items: center; gap: 6px; }
+.subtitle-search-actions label { display: flex; align-items: center; gap: 6px; cursor: pointer; color: #aab8bb; }
+.subtitle-search-actions button { padding: 5px 9px; font: inherit; cursor: pointer; }
+.subtitle-search-actions button:disabled { opacity: .35; cursor: default; }
+.subtitle-search-spacer { flex: 1; }
+.subtitle-search-snippet { margin: 0; padding: 7px 8px; border-radius: 5px; background: #141819; color: #b8c5c8; line-height: 1.5; word-break: break-all; }
+.subtitle-search-snippet mark { background: #ffd54a; color: #302500; border-radius: 2px; padding: 0 1px; }
+.subtitle-search-row-no { margin-right: 6px; color: #65d7ed; font-variant-numeric: tabular-nums; }
+.subtitle-search-notice { margin: 0; color: #65d7ed; }
+.subtitle-search-hint { margin: 0; color: #6f8185; font-size: 10px; line-height: 1.4; }
+.app .subtitle-card--search-hit { border-color: #ffd54a; box-shadow: 0 0 0 1px #ffd54a66; }

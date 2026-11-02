@@ -81,6 +81,8 @@ function wordChipSlotStyle(w: { start: number; end: number }, tw: LineZoomWindow
 export type SubtitleVirtualListProps = {
   selectedRows: ReadonlySet<number>
   onSelectRow: (index: number, checked: boolean) => void
+  /** Current Ctrl+F match; its row is highlighted and scrolled into view. */
+  searchHit?: { line: number; start: number } | null
   subtitles: SubtitleLine[]
   activeSubtitleIndexRef: MutableRefObject<number | null>
   playheadSecRef: MutableRefObject<number>
@@ -128,6 +130,7 @@ export type SubtitleVirtualListProps = {
 export type SubtitleListRowProps = {
   selectedRows: ReadonlySet<number>
   onSelectRow: SubtitleVirtualListProps['onSelectRow']
+  searchHitLine: number | null
   rowNumbers: readonly number[]
   subtitles: SubtitleLine[]
   activeSubtitleIndexRef: MutableRefObject<number | null>
@@ -1621,7 +1624,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
       <article
         ref={articleRef}
         id={`subtitle-card-${index}`}
-        className={`subtitle-card subtitle-card--virtual ${props.selectedRows.has(index) ? 'subtitle-card--selected' : ''} ${row.isHidden ? 'subtitle-card--hidden-caption' : ''}`}
+        className={`subtitle-card subtitle-card--virtual ${props.selectedRows.has(index) ? 'subtitle-card--selected' : ''} ${row.isHidden ? 'subtitle-card--hidden-caption' : ''} ${props.searchHitLine === index ? 'subtitle-card--search-hit' : ''}`}
         tabIndex={0}
         onMouseDownCapture={(e) => {
           const t = e.target as HTMLElement
@@ -2059,6 +2062,7 @@ const subtitleVirtualRowAreEqual = (
   const otherRowHovered = (p: typeof prev) => p.globalHoveredRowIndex !== null && p.globalHoveredRowIndex !== p.index
   if (otherRowHovered(prev) !== otherRowHovered(next)) return false
   if (prev.selectedRows.has(prev.index) !== next.selectedRows.has(next.index)) return false
+  if ((prev.searchHitLine === prev.index) !== (next.searchHitLine === next.index)) return false
   if (prev.rowNumbers[prev.index] !== next.rowNumbers[next.index]) return false
   // 나머지 prop 은 reference 비교 (subtitles/vrewRows/펼침 관련은 위에서 처리)
   for (const key of Object.keys(next) as Array<keyof typeof next>) {
@@ -2071,6 +2075,7 @@ const subtitleVirtualRowAreEqual = (
       key === 'waveformActiveWordId' ||
       key === 'globalHoveredRowIndex' ||
       key === 'selectedRows' ||
+      key === 'searchHitLine' ||
       key === 'rowNumbers'
     )
       continue
@@ -2220,6 +2225,18 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
     return () => window.removeEventListener('keydown', onGlobalArrow)
   }, [props.activeSubtitleIndexRef, props.playheadSecRef, props.isPlaying, props.onRequestPausePlayback, requestFocusCaret, subtitles])
 
+  const searchHitLine = props.searchHit?.line ?? null
+  const searchHitStart = props.searchHit?.start ?? null
+  // Search results are an explicit jump request, unlike caret navigation.
+  useEffect(() => {
+    if (searchHitLine === null || searchHitLine >= subtitles.length) return
+    try {
+      listRef.current?.scrollToRow({ index: searchHitLine, align: 'smart', behavior: 'instant' })
+    } catch {
+      /* row range changed mid-edit */
+    }
+  }, [searchHitLine, searchHitStart]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const rowNumbers = useMemo(() => subtitles.reduce<number[]>((numbers, line) => {
     const last = numbers.at(-1) ?? 0
     numbers.push(line.isDeleted || (line.words?.length && line.words.every(w => w.isDeleted)) ? last : last + 1)
@@ -2231,6 +2248,7 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       subtitles,
       selectedRows: props.selectedRows,
       onSelectRow: props.onSelectRow,
+      searchHitLine,
       rowNumbers,
       activeSubtitleIndexRef: props.activeSubtitleIndexRef,
       playheadSecRef: props.playheadSecRef,
@@ -2276,6 +2294,7 @@ export function SubtitleVirtualList(props: SubtitleVirtualListProps) {
       subtitles,
       props.selectedRows,
       props.onSelectRow,
+      searchHitLine,
       props.activeSubtitleIndexRef,
       props.playheadSecRef,
       props.isPlaying,

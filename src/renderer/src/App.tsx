@@ -1965,12 +1965,14 @@ export default function App(): ReactElement {
           cache.cardIdx !== ai || cache.chips.length === 0 || !cache.chips[0]!.el.isConnected
         if (cacheStale) {
           const cardEl = document.getElementById(`subtitle-card-${ai}`)
-          const collected: Array<{ el: HTMLElement; s: number; e: number; start: number; end: number; isSilence: boolean }> = []
+          const collected: Array<{ el: HTMLElement; s: number; e: number; start: number; end: number; isSilence: boolean; gapKind?: 'unclassified' }> = []
           if (cardEl) {
             cardEl.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
               const s = parseFloat(el.dataset.wordStart ?? 'NaN')
               const e = parseFloat(el.dataset.wordEnd ?? 'NaN')
-              if (Number.isFinite(s) && Number.isFinite(e)) collected.push({ el, s, e, start: s, end: e, isSilence: el.classList.contains('subtitle-word-chip--silence') })
+              if (Number.isFinite(s) && Number.isFinite(e)) collected.push({ el, s, e, start: s, end: e,
+                isSilence: el.classList.contains('subtitle-word-chip--silence'),
+                gapKind: el.dataset.gapKind === 'unclassified' ? 'unclassified' : undefined })
             })
           }
           cache = { cardIdx: ai, chips: collected }

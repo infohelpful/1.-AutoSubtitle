@@ -26,3 +26,13 @@ it('uses the full video duration despite truncated or padded peaks and early-end
   expect(sourceTimelineDuration(684.8,685,660)).toBe(684.8)
   expect(sourceTimelineDuration(0,680,660)).toBe(680)
 })
+
+it('highlights the preceding spoken chip throughout a trailing audio chip', () => {
+  const words = [
+    { start: 0, end: 1, word: '앞' },
+    { start: 1, end: 2, word: '끝' },
+    { start: 2, end: 4, word: '오디오', isSilence: true, gapKind: 'unclassified' as const }
+  ]
+  expect(resolveEditorHighlight(words, 3.5)).toBe(1)
+  expect(resolveEditorHighlight(words, 4)).toBe(-1)
+})

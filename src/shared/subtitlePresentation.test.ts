@@ -1,7 +1,22 @@
 import { describe, expect, it } from 'vitest'
-import { pickActiveSubtitleIndex, subtitlePresentationEnd } from './subtitlePresentation'
+import { pickActiveSubtitleIndex, subtitlePresentationEnd, subtitlePresentationStart } from './subtitlePresentation'
+import { subtitlePreviewText } from './subtitleVisibility'
 
 describe('continuous subtitle presentation', () => {
+  it('shows the entire previous line through its trailing audio and joins the next row boundary', () => {
+    const lines = [
+      { start: 0, end: 3.623, text: '앞 자막 전체', words: [
+        { start: 0, end: 1.5, word: '앞' },
+        { start: 1.5, end: 3.397, word: '자막 전체' },
+        { start: 3.397, end: 3.623, word: '오디오', isSilence: true, gapKind: 'unclassified' as const }
+      ] },
+      { start: 3.623, end: 6.157, text: '다음 자막', words: [{ start: 3.623, end: 6.157, word: '다음 자막' }] }
+    ]
+    expect(subtitlePreviewText(lines, 3.5)).toBe('앞 자막 전체')
+    expect(subtitlePresentationEnd(lines, 0)).toBe(subtitlePresentationStart(lines, 1))
+    expect(subtitlePresentationEnd(lines, 0)).toBe(3.623)
+    expect(subtitlePreviewText(lines, 3.623)).toBe('다음 자막')
+  })
   it('holds the preceding text throughout the reported 421 ms gap and switches at the boundary', () => {
     const lines = [{ start: 10.021, end: 12.811, text: '컴퓨터 화면을' }, { start: 13.232, end: 15.6, text: '이런 경험' }]
     for (let time = 12.810; time < 13.232; time += 0.001) expect(pickActiveSubtitleIndex(lines, time)).toBe(0)
@@ -95,21 +110,22 @@ describe('continuous subtitle presentation', () => {
     expect(subtitlePresentationEnd(lines, 2)).toBe(134.916)
   })
 
-  it('does not hold captions across an intro, even in older projects without gap rows', () => {
+  it('keeps a started caption visible until the next caption in older projects without gap rows', () => {
     const lines = [{ start: 67.16, end: 68.98, text: '순서대로 정리해 드리겠습니다' },
       { start: 72.25, end: 74.29, text: '벤토이 프로그램 다운로드 사이트 정보는' }]
     expect(pickActiveSubtitleIndex(lines, 68.979)).toBe(0)
-    expect(pickActiveSubtitleIndex(lines, 68.98)).toBeNull()
-    expect(pickActiveSubtitleIndex(lines, 70)).toBeNull()
+    expect(pickActiveSubtitleIndex(lines, 68.98)).toBe(0)
+    expect(pickActiveSubtitleIndex(lines, 70)).toBe(0)
+    expect(subtitlePresentationEnd(lines, 0)).toBe(72.25)
     expect(pickActiveSubtitleIndex(lines, 72.25)).toBe(1)
   })
 
-  it('preserves explicit imported cue ends even for short gaps', () => {
+  it('holds an imported cue until the next cue starts', () => {
     const lines = [{ start: 15, end: 17.34, text: '첫 자막', words: [
       { start: 15, end: 17.34, word: '첫 자막', engine: 'srt-import' }] },
       { start: 17.4, end: 19, text: '다음 자막' }]
     expect(pickActiveSubtitleIndex(lines, 14.999)).toBeNull()
-    expect(pickActiveSubtitleIndex(lines, 17.35)).toBeNull()
-    expect(subtitlePresentationEnd(lines, 0)).toBe(17.34)
+    expect(pickActiveSubtitleIndex(lines, 17.35)).toBe(0)
+    expect(subtitlePresentationEnd(lines, 0)).toBe(17.4)
   })
 })

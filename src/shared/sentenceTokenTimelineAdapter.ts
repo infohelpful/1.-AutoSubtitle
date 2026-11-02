@@ -99,8 +99,10 @@ function buildLineFromSentence(sentence: TimelineSentence): SubtitleLine | null 
   const vis = visibleSubtitleWords(words)
   const start =
     vis.length > 0 ? Math.min(...vis.map((w) => w.start)) : Math.min(...words.map((w) => w.start))
-  const end =
-    vis.length > 0 ? Math.max(...vis.map((w) => w.end)) : Math.max(...words.map((w) => w.end))
+  // A trailing audio chip belongs to this caption row. Keep its full time
+  // range through the timeline round trip, including the final video outro.
+  const liveWords = words.filter(w => !w.isDeleted)
+  const end = Math.max(...(liveWords.length ? liveWords : words).map(w => w.end))
   const text = displayTextFromSubtitleWords(words)
   /**
    * 줄 단위 tombstone(`isDeleted: true`) 은 어레이에서 잘라내지 않는다.

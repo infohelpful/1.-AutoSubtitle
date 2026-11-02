@@ -20,11 +20,18 @@ export function pickActiveEditorRow(lines: readonly SubtitleLine[], time: number
   return speech ?? gap ?? pickActiveSubtitleIndex(lines, time)
 }
 
-/** Gap chips light only within their own interval, never through the speech hold rule. */
+/** A trailing unknown-audio chip keeps the preceding spoken word highlighted. */
 export function resolveEditorHighlight(words: readonly ResolverWord[], time: number): number {
   const exact = resolveActiveWordIndex(words, time, { skipSilence: false })
-  return exact >= 0 && words[exact].isSilence && resolveActiveWordIndex(words, time) < 0
-    ? exact : resolveHighlightWordIndex(words, time)
+  if (exact >= 0 && words[exact].isSilence && resolveActiveWordIndex(words, time) < 0) {
+    if (words[exact].gapKind === 'unclassified') {
+      for (let i = exact - 1; i >= 0; i--) {
+        if (!words[i].isDeleted && !words[i].isSilence) return i
+      }
+    }
+    return exact
+  }
+  return resolveHighlightWordIndex(words, time)
 }
 
 export function sourceTimelineDuration(videoDuration: number, waveformDuration: number, subtitleEnd: number): number {

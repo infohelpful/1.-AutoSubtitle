@@ -35,19 +35,10 @@ export function subtitlePresentationSpans(lines: readonly SubtitleLine[]): Subti
     if (!Number.isFinite(line.start) || !Number.isFinite(line.end)) return []
     const visible = line.words?.filter(word => !word.isDeleted)
     const silenceOnly = isSilenceOnlyRow(line)
-    // A trailing unclassified audio chip belongs in the previous editor row,
-    // but it must not keep that row's caption visible through the audio gap.
-    const lastSpeechEnd = !silenceOnly && visible?.length
-      ? [...visible].reverse().find(word => !word.isSilence)?.end
-      : undefined
-    const captionEnd = lastSpeechEnd !== undefined &&
-      visible?.at(-1)?.isSilence && visible.at(-1)?.gapKind === 'unclassified'
-      ? Math.min(line.end, lastSpeechEnd)
-      : line.end
     // Older projects can keep stale row bounds after a word deletion.
     if (visible?.length && line.words?.some(word => word.isDeleted)) {
       return [{ index, silenceOnly, start: Math.min(...visible.map(word => word.start)),
-        end: Math.min(captionEnd, Math.max(...visible.map(word => word.end))) }]
+        end: Math.max(...visible.map(word => word.end)) }]
     }
     // 줄 시작(Whisper 구간 시작)이 첫 발화 단어보다 훨씬 앞서면, 말하기 전 침묵 동안 다음 문장 자막이 먼저 떠 있게 된다.
     // 첫 발화 단어 바로 앞(SUBTITLE_ROW_LEAD_SEC)부터 보이게 한다.
@@ -59,12 +50,25 @@ export function subtitlePresentationSpans(lines: readonly SubtitleLine[]): Subti
       if (speechStarts?.length) {
         const first = Math.min(...speechStarts)
         if (line.start < first - SUBTITLE_ROW_LEAD_SEC) {
-          return [{ index, silenceOnly, start: first - SUBTITLE_ROW_LEAD_SEC, end: captionEnd }]
+          return [{ index, silenceOnly, start: first - SUBTITLE_ROW_LEAD_SEC, end: line.end }]
         }
       }
     }
-    return [{ index, silenceOnly, start: line.start, end: captionEnd }]
+    return [{ index, silenceOnly, start: line.start, end: line.end }]
   })
+
+  // Once a caption starts, keep the complete line visible until the next
+  // caption starts. Audio-only gaps are part of the preceding editor row.
+  const captionRows = base.filter(row => !row.silenceOnly &&
+    (lines[row.index].words?.some(word => !word.isDeleted && !word.isSilence) || lines[row.index].text.trim()))
+    .sort((a, b) => a.start - b.start || a.index - b.index)
+  for (let i = 0; i + 1 < captionRows.length; i++) {
+    const current = captionRows[i]!
+    const next = captionRows[i + 1]!
+    const blocked = lines.some((line, index) => index !== current.index && index !== next.index &&
+      (line.isDeleted || isSilenceOnlyRow(line)) && line.start < next.start && line.end > current.end)
+    if (!blocked && !lines[next.index].isHidden && next.start > current.start) current.end = next.start
+  }
 
   // 무음 전용 줄은 음성 줄과 시간이 겹칠 수 있다(줄 경계가 단어보다 일찍 시작하는 경우).
   // 겹친 구간에서는 음성 줄이 이긴다 — 그렇지 않으면 말하는 도중 자막·하이라이트가 무음 줄로 넘어가 꺼진다.
@@ -88,12 +92,9 @@ export function subtitlePresentationSpans(lines: readonly SubtitleLine[]): Subti
   for (let i = 0; i + 1 < spans.length; i++) {
     const current = spans[i]
     const next = spans[i + 1]
-    const importedCue = lines[current.index].words?.some(word => word.engine === 'srt-import')
-    const lastWord = lines[current.index].words?.filter(word => !word.isDeleted).at(-1)
-    const hasTrailingAudio = lastWord?.isSilence && lastWord.gapKind === 'unclassified'
-    // Keep explicit cue ends and real pauses. Only smooth short ASR row gaps;
-    // otherwise an intro without captions inherits the preceding sentence.
-    if (next.start <= current.end || (!importedCue && !hasTrailingAudio && next.start - current.end <= SUBTITLE_ROW_LEAD_SEC)) {
+    // Resolve overlaps and short gaps in non-caption rows. Caption rows above
+    // already have exact shared boundaries with their following caption.
+    if (next.start <= current.end || next.start - current.end <= SUBTITLE_ROW_LEAD_SEC) {
       current.end = next.start
     }
   }

@@ -40,6 +40,10 @@ export function buildExportCueLines(
   }
   return cues.map((cue, i) => {
     const pieces = subtitleWordPiecesForExport(kept[i]?.words)
+    const lastWord = kept[i]?.words?.filter(word => !word.isDeleted).at(-1)
+    if (pieces.length > 0 && lastWord?.isSilence && lastWord.gapKind === 'unclassified') {
+      pieces[pieces.length - 1] = { ...pieces[pieces.length - 1], end: cue.end }
+    }
     return pieces.length > 0 ? { ...cue, words: pieces } : cue
   })
 }

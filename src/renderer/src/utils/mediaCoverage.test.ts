@@ -25,10 +25,15 @@ it('preserves SRT intro, short cue gaps and outro through save/reopen without ch
   expect(result.find(l=>l.start===15)?.words?.at(-1)).toMatchObject({start:17.34,end:17.4,word:'오디오'})
   expect(result.at(-1)).toMatchObject({start:72.25,end:80})
   const reopened=sentenceTokenTimelineToSubtitleLines(JSON.parse(JSON.stringify(subtitleLinesToSentenceTokenTimeline(result))))
-  expect(buildExportCueLines(reopened)).toEqual(cues)
-  for(const t of [0,14.99,17.35,68.98,70,72.249,79.99]) {
+  expect(buildExportCueLines(reopened)).toEqual(cues.map((cue,i)=>({
+    ...cue,end:cues[i+1]?.start ?? 80
+  })))
+  for(const t of [0,14.99]) {
     const active = pickActiveSubtitleIndex(reopened,t)
     expect(active === null ? '' : reopened[active].text).toBe('')
+  }
+  for(const [t,index] of [[17.35,1],[68.98,3],[70,3],[72.249,3],[79.99,4]]) {
+    expect(pickActiveSubtitleIndex(reopened,t)).toBe(index)
   }
   expect(completeMediaCoverage(reopened,80,null)).toEqual(reopened)
   expect(buildTimelineClips([],80).at(-1)?.editEnd).toBe(80)

@@ -11,6 +11,7 @@ export type ResolverWord = {
   end: number
   isDeleted?: boolean
   isSilence?: boolean
+  gapKind?: 'unclassified'
 }
 
 export type ResolveActiveWordOptions = {

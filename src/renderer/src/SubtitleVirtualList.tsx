@@ -57,6 +57,7 @@ type WordRailItem = {
   end: number
   label: string
   isSilence?: boolean
+  gapKind?: 'unclassified'
   /** `row.words` 배열 인덱스 — tombstone(`isDeleted`) 은 렌더에서 제외해도 API·캐럿은 스토리지 인덱스 기준 */
   storageIndex: number
 }
@@ -294,6 +295,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
           ? (String(w.word).trim() || '??')
           : scrubTimelineNoiseFromWordPiece(w.word) || w.word,
         isSilence: w.isSilence,
+        gapKind: w.gapKind,
         storageIndex: i
       })
     }
@@ -845,12 +847,13 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
     const mount = articleRef.current
     if (!mount) return
     // App.commitEditSecToUi 와 같은 규칙(틈에서는 직전 단어 유지)으로, 행이 (재)마운트될 때 강조를 맞춘다.
-    const chips: Array<{ el: HTMLElement; start: number; end: number; isSilence: boolean }> = []
+    const chips: Array<{ el: HTMLElement; start: number; end: number; isSilence: boolean; gapKind?: 'unclassified' }> = []
     mount.querySelectorAll<HTMLElement>('.subtitle-word-chip').forEach((el) => {
       const s = parseFloat(el.dataset.wordStart ?? el.getAttribute('data-word-start') ?? 'NaN')
       const e = parseFloat(el.dataset.wordEnd ?? el.getAttribute('data-word-end') ?? 'NaN')
       if (!Number.isFinite(s) || !Number.isFinite(e)) return
-      chips.push({ el, start: s, end: e, isSilence: el.classList.contains('subtitle-word-chip--silence') })
+      chips.push({ el, start: s, end: e, isSilence: el.classList.contains('subtitle-word-chip--silence'),
+        gapKind: el.dataset.gapKind === 'unclassified' ? 'unclassified' : undefined })
     })
     const hit = playing && activeSubtitleIndexRef.current === index ? resolveEditorHighlight(chips, t) : -1
     chips.forEach((chip, i) => chip.el.classList.toggle('subtitle-word-chip--active', i === hit))
@@ -1778,6 +1781,7 @@ function SubtitleVirtualRowImpl(props: RowComponentProps<SubtitleListRowProps>) 
                       data-end={rw.end}
                       data-word-start={rw.start}
                       data-word-end={rw.end}
+                      data-gap-kind={rw.gapKind}
                       {...(chipWordId != null ? ({ 'data-word-id': String(chipWordId) } as const) : {})}
                       data-waveform-active-word-chip={isActiveWaveformChip ? '1' : undefined}
                       data-waveform-expanded-row-chip={waveformExpandedThisRow ? '1' : undefined}

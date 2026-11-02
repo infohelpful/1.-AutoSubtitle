@@ -25,6 +25,27 @@ export type BuildExportCueLinesOptions = {
   includeWords?: boolean
 }
 
+function captionWordPieces(text: string, source: ExportCueWord[]): ExportCueWord[] {
+  const tokens = text.trim().split(/\s+/).filter(Boolean)
+  if (!tokens.length || !source.length || tokens.join(' ') !== text) return source
+  if (source.map(word => word.text).join(' ') === text) return source
+  if (tokens.length === source.length) {
+    return source.map((word, i) => ({ ...word, text: tokens[i]! }))
+  }
+  // Changed word counts have no measured alignment. Keep the original chips
+  // untouched and distribute export-only highlight spans across their range.
+  const start = source[0]!.start
+  const end = source[source.length - 1]!.end
+  const weights = tokens.map(token => Math.max(1, Array.from(token).length))
+  const total = weights.reduce((sum, weight) => sum + weight, 0)
+  let used = 0
+  return tokens.map((token, i) => {
+    const wordStart = start + (end - start) * used / total
+    used += weights[i]!
+    return { start: wordStart, end: start + (end - start) * used / total, text: token }
+  })
+}
+
 /** IPC `ExportRequest.subtitles` 및 메인 `buildMappedSubtitles` 입력 형태와 동일한 플랫 큐 */
 export function buildExportCueLines(
   lines: readonly SubtitleLine[],
@@ -44,6 +65,7 @@ export function buildExportCueLines(
     if (pieces.length > 0 && lastWord?.isSilence && lastWord.gapKind === 'unclassified') {
       pieces[pieces.length - 1] = { ...pieces[pieces.length - 1], end: cue.end }
     }
-    return pieces.length > 0 ? { ...cue, words: pieces } : cue
+    const captionPieces = captionWordPieces(cue.text, pieces)
+    return captionPieces.length > 0 ? { ...cue, words: captionPieces } : cue
   })
 }

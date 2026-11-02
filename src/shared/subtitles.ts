@@ -47,6 +47,8 @@ export type SubtitleLine = {
   start: number
   end: number
   text: string
+  /** User-edited caption text. Source word chips keep their original labels and times. */
+  captionText?: string
   words?: SubtitleWord[]
   /**
    * true: 줄 자체가 tombstone — 줄 안의 모든 단어가 `isDeleted` 가 되었을 때 함께 표시.
@@ -127,8 +129,10 @@ function normSubtitleLineEdit(s: string): string {
  */
 export function subtitleLineEditDisplayText(line: {
   text?: string
+  captionText?: string
   words?: readonly SubtitleWord[] | undefined
 }): string {
+  if (line.captionText !== undefined) return line.captionText
   const words = line.words
   const fromWords =
     words && words.length > 0 ? displayTextFromSubtitleWords(words) : ''
@@ -299,9 +303,9 @@ export function subtitleCueLinesForExport(
     const hasWords = Array.isArray(line.words) && line.words.length > 0
     if (hasWords) {
       const vis = visibleSubtitleWords(line.words)
-      if (vis.length === 0) continue
+      if (vis.length === 0 && line.captionText === undefined) continue
       const { start, end } = span
-      const text = displayTextFromSubtitleWords(line.words) || (line.text ?? '').trim()
+      const text = subtitleLineEditDisplayText(line).trim()
       if (text.length === 0) continue
       out.push({ start, end, text })
     } else {

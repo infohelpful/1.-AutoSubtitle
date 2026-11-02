@@ -38,6 +38,8 @@ const sentenceToLine: WeakMap<TimelineSentence, SubtitleLine> = new WeakMap()
 function buildSentenceFromLine(line: SubtitleLine, li: number): TimelineSentence {
   const words = line.words
   if (words && words.length > 0) {
+    const captionText = line.captionText ??
+      (line.text !== displayTextFromSubtitleWords(words) ? line.text : undefined)
     const tokens: TimelineToken[] = words.map((w, wi) => {
       const t: TimelineToken = {
         id: tokenIdFor(li, wi),
@@ -56,6 +58,7 @@ function buildSentenceFromLine(line: SubtitleLine, li: number): TimelineSentence
     return {
       id: sentenceIdForLineIndex(li),
       isHidden: line.isHidden,
+      captionText,
       tokens,
       is_deleted: line.isDeleted === true ? true : false
     }
@@ -63,6 +66,7 @@ function buildSentenceFromLine(line: SubtitleLine, li: number): TimelineSentence
   return {
     id: sentenceIdForLineIndex(li),
     isHidden: line.isHidden,
+    captionText: line.captionText,
     tokens: [
       {
         id: tokenIdFor(li, 0),
@@ -103,7 +107,7 @@ function buildLineFromSentence(sentence: TimelineSentence): SubtitleLine | null 
   // range through the timeline round trip, including the final video outro.
   const liveWords = words.filter(w => !w.isDeleted)
   const end = Math.max(...(liveWords.length ? liveWords : words).map(w => w.end))
-  const text = displayTextFromSubtitleWords(words)
+  const text = sentence.captionText ?? displayTextFromSubtitleWords(words)
   /**
    * 줄 단위 tombstone(`isDeleted: true`) 은 어레이에서 잘라내지 않는다.
    * - useWordEdgeDrag 의 revive 가 흡수된 단어를 되살리려면 그 라인의 단어들이 flat 입력에 포함되어 있어야 함.
@@ -116,6 +120,7 @@ function buildLineFromSentence(sentence: TimelineSentence): SubtitleLine | null 
     text,
     words
   }
+  if (sentence.captionText !== undefined) line.captionText = sentence.captionText
   if (sentence.is_deleted === true) line.isDeleted = true
   if (sentence.isHidden === true) line.isHidden = true
   return line

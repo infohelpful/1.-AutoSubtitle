@@ -83,7 +83,9 @@ describe('project v2 storage', () => {
     const restored = editSubtitleText(parsed.data.subtitles[0], '다시 입력')
     expect(restored.words?.map(w => w.id)).toEqual(edited.words?.map(w => w.id))
     expect(restored.words?.map(w => [w.start, w.end])).toEqual(edited.words?.map(w => [w.start, w.end]))
-    expect(restored.words?.[0].word).toBe('다시 입력')
+    expect(restored.words?.map(w => w.word)).toEqual(edited.words?.map(w => w.word))
+    expect(restored.captionText).toBe('다시 입력')
+    expect(parsed.data.subtitles[0].captionText).toBe('')
   })
 })
 
